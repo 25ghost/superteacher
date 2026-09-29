@@ -1,0 +1,10 @@
+# Development / test dependencies for the SuperTeacher backend.
+# Runtime dependencies stay in requirements.txt; this file adds tooling only.
+# Install with:  python -m pip install -r requirements-dev.txt
+#
+# Test runner for the unit and integration suites under tests/.
+pytest>=8.4,<9
+# Coverage reporting for the test suite (pytest plugin).
+pytest-cov>=6.0,<7
+# HTTP client required by fastapi.testclient (API integration tests).
+httpx>=0.27,<1
