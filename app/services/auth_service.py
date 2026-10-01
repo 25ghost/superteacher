@@ -25,6 +25,7 @@ persistence, verified on login, never logged, never placed in errors.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 import uuid
@@ -346,40 +347,141 @@ def register_student_account(
 # --- login (Step 21) -----------------------------------------------------------------
 
 
-def login(session: Session, payload: LoginRequest) -> TokenResponse:
+def _register_failed_login(
+    session: Session,
+    user: User,
+    now: datetime,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    """Count one refused attempt; lock the account at the threshold (flush).
+
+    Reaching LOGIN_LOCKOUT_THRESHOLD sets ``locked_until`` to
+    now + LOGIN_LOCKOUT_MINUTES and writes a ``login_locked`` audit event
+    naming the source. The counter is capped at the threshold.
+    """
+    settings = _settings()
+    user.failed_login_count = (user.failed_login_count or 0) + 1
+    if user.failed_login_count >= settings.LOGIN_LOCKOUT_THRESHOLD:
+        user.failed_login_count = settings.LOGIN_LOCKOUT_THRESHOLD
+        user.locked_until = now + timedelta(minutes=settings.LOGIN_LOCKOUT_MINUTES)
+        auth_event_repo.log_event(
+            session,
+            user_id=user.id,
+            event_type="login_locked",
+            ip_address=ip_address,
+            user_agent=user_agent,
+            metadata_json=json.dumps(
+                {"failed_attempts": user.failed_login_count}
+            ),
+        )
+        logger.warning(
+            "account locked after repeated failed logins",
+            extra={"user_id": str(user.id)},
+        )
+    session.flush()
+
+
+def login(
+    session: Session,
+    payload: LoginRequest,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> TokenResponse:
     """Verify email + password and issue a fresh token pair.
 
     Lookup, status check and password verification produce one identical
-    generic error so the endpoint cannot be used to enumerate accounts or
-    infer account status. Never logs the password; never mutates the user.
+    generic error so the endpoint cannot be used to enumerate accounts,
+    infer account state, or even detect a lockout. Never logs the
+    password; never mutates the user except for the lockout bookkeeping
+    (Phase B, slice 7).
 
     A dummy hash is always compared even when the user is not found, so the
     timing is identical for both existing and non-existing emails.
+
+    Lockout: the ``LOGIN_LOCKOUT_THRESHOLD``-th refused attempt locks the
+    account for ``LOGIN_LOCKOUT_MINUTES`` minutes; while locked (even with
+    the correct password) the same generic 401 is returned without
+    verifying the password. An expired lock grants a fresh budget; a
+    successful login clears it.
     """
     email = str(payload.email).strip().lower()
     user = user_repo.get_by_email(session, email)
+    now = datetime.now(timezone.utc)
+
+    if user is not None and user.locked_until is not None:
+        locked_until = _as_aware_utc(user.locked_until)
+        if locked_until > now:
+            # Refused without even comparing the password: identical to a
+            # wrong-password answer, and a correct guess cannot reset it.
+            auth_event_repo.log_event(
+                session,
+                user_id=user.id,
+                event_type="login_failed",
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+            logger.info(
+                "login refused: account is temporarily locked",
+                extra={"user_id": str(user.id)},
+            )
+            raise AuthCredentialsError()
+        # The window elapsed: fresh budget, exactly as after a success.
+        user.failed_login_count = 0
+        user.locked_until = None
+
+    authenticatable = user is not None and user.status in _AUTHENTICATABLE_STATUSES
     password_hash = user.password_hash if user is not None else _DUMMY_HASH
-    if (
-        user is None
-        or user.status not in _AUTHENTICATABLE_STATUSES
-        or not security.verify_password(payload.password, password_hash)
-    ):
+    password_ok = authenticatable and security.verify_password(
+        payload.password, password_hash
+    )
+    if not password_ok:
         logger.info("failed login attempt for an email (result not disclosed)")
         if user is not None:
             auth_event_repo.log_event(
-                session, user_id=user.id, event_type="login_failed"
+                session,
+                user_id=user.id,
+                event_type="login_failed",
+                ip_address=ip_address,
+                user_agent=user_agent,
             )
+            if authenticatable:
+                # Only a wrong password on a usable account counts toward
+                # the lockout budget (a status gate is not password guessing).
+                _register_failed_login(
+                    session,
+                    user,
+                    now,
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                )
         raise AuthCredentialsError()
 
-    auth_event_repo.log_event(session, user_id=user.id, event_type="login")
+    user.failed_login_count = 0
+    user.locked_until = None
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="login",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     logger.info("successful login", extra={"user_id": str(user.id)})
-    return _issue_session(session, user, datetime.now(timezone.utc))
+    return _issue_session(session, user, now)
 
 
 # --- refresh (Step 22) and logout (Step 23) --------------------------------------------
 
 
-def refresh(session: Session, refresh_token_value: str) -> TokenResponse:
+def refresh(
+    session: Session,
+    refresh_token_value: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> TokenResponse:
     """Exchange a valid refresh token for a new pair, rotating the session.
 
     The old session is revoked and a new one issued in the same
@@ -388,16 +490,29 @@ def refresh(session: Session, refresh_token_value: str) -> TokenResponse:
     now = datetime.now(timezone.utc)
     user, old_session = _verify_refresh_credentials(session, refresh_token_value, now)
     auth_session_repo.revoke(session, old_session, now)
-    auth_event_repo.log_event(session, user_id=user.id, event_type="token_refresh")
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="token_refresh",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     logger.info("token refresh", extra={"user_id": str(user.id)})
     return _issue_session(session, user, now)
 
 
-def logout(session: Session, refresh_token_value: str, *, expected_user_id: uuid.UUID) -> None:
+def logout(
+    session: Session,
+    refresh_token_value: str,
+    *,
+    expected_user_id: uuid.UUID,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
     """Revoke the refresh session presented by an authenticated caller.
 
     The presented token must be valid (signature, session state, ownership);
-    logout then revokes *that* session — the caller cannot revoke someone
+    logout then revokes *that* session �?" the caller cannot revoke someone
     else's session. ``expected_user_id`` is the identity from the access
     token; a mismatch (access token for user A used to revoke user B's
     session) is refused. Idempotent: logging out twice is fine.
@@ -410,7 +525,13 @@ def logout(session: Session, refresh_token_value: str, *, expected_user_id: uuid
             "refresh token does not belong to the authenticated user"
         )
     auth_session_repo.revoke(session, auth_session, datetime.now(timezone.utc))
-    auth_event_repo.log_event(session, user_id=expected_user_id, event_type="logout")
+    auth_event_repo.log_event(
+        session,
+        user_id=expected_user_id,
+        event_type="logout",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     logger.info("logout", extra={"user_id": str(expected_user_id)})
 
 
@@ -428,6 +549,9 @@ def change_password(
     session: Session,
     user: User,
     payload: ChangePasswordRequest,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> None:
     """Change the authenticated user's password.
 
@@ -438,16 +562,31 @@ def change_password(
         raise AuthValidationError("this account has no password set")
     if not security.verify_password(payload.current_password, user.password_hash):
         raise AuthCredentialsError()
-    if payload.current_password == payload.new_password:
+
+    # M12: the Pydantic schema enforces the policy for HTTP callers, but the
+    # service is callable directly (scripts, tests, future RPC layers), so the
+    # policy is enforced here too — before the password is ever hashed.
+    try:
+        new_password = security.validate_password_policy(payload.new_password)
+    except security.PasswordPolicyError as exc:
+        raise AuthValidationError(str(exc)) from exc
+
+    if payload.current_password == new_password:
         raise AuthValidationError("new password must differ from current password")
 
     try:
-        new_hash = security.hash_password(payload.new_password)
+        new_hash = security.hash_password(new_password)
     except ValueError as exc:
         raise AuthValidationError(str(exc)) from exc
 
     user.password_hash = new_hash
-    auth_event_repo.log_event(session, user_id=user.id, event_type="password_change")
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="password_change",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     session.flush()
     logger.info("password changed", extra={"user_id": str(user.id)})
 
@@ -455,16 +594,25 @@ def change_password(
 # --- password reset (public, email-based) ---------------------------------------
 
 
-def forgot_password(session: Session, email: str) -> None:
-    """Generate a password reset token and send it via email.
+def forgot_password(session: Session, email: str) -> dict[str, str] | None:
+    """Stage a password-reset token row for an active account (L14).
 
-    Always returns None — the response is identical whether the email exists
-    or not, preventing email enumeration.
+    The row is added and flushed — never committed — so the caller owns the
+    transaction exactly as elsewhere: the endpoint commits first and only
+    then schedules :func:`app.core.email.deliver_password_reset_email` on
+    the request's ``BackgroundTasks``, so a token can never be emailed for a
+    row that later rolls back.
+
+    Returns the delivery payload (recipient, raw token, frontend URL), or
+    ``None`` when no active account matches — the caller must treat both
+    identically to keep enumeration impossible. The raw token is returned
+    exactly once, never logged, never stored in plaintext (only its SHA-256
+    digest reaches the database).
     """
     normalized = str(email).strip().lower()
     user = user_repo.get_by_email(session, normalized)
     if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
-        return
+        return None
 
     # Create a time-limited reset token (single-use, server-side tracked).
     from app.core.security import create_reset_token
@@ -483,26 +631,24 @@ def forgot_password(session: Session, email: str) -> None:
     )
     session.add(reset_record)
     session.flush()
-
-    # Send the reset email (best-effort; failures are logged but not disclosed).
-    try:
-        from app.core.email import send_password_reset_email
-
-        settings = _settings()
-        send_password_reset_email(
-            to_email=normalized,
-            reset_token=raw_token,
-            frontend_url=settings.FRONTEND_URL,
-        )
-        logger.info("password reset email sent", extra={"user_id": str(user.id)})
-    except Exception:
-        logger.exception("failed to send password reset email")
+    logger.info(
+        "password reset token staged",
+        extra={"user_id": str(user.id)},
+    )
+    return {
+        "to_email": normalized,
+        "reset_token": raw_token,
+        "frontend_url": _settings().FRONTEND_URL,
+    }
 
 
 def reset_password(
     session: Session,
     token: str,
     new_password: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> None:
     """Reset a user's password using a valid reset token.
 
@@ -543,25 +689,128 @@ def reset_password(
     if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
         raise AuthCredentialsError()
 
+    # M12: reset_password takes a plain string (the token comes from an email
+    # link, not from a request schema), so the policy has to be enforced here
+    # — a weak password must fail before the token is consumed.
     try:
-        user.password_hash = security.hash_password(new_password)
+        candidate = security.validate_password_policy(new_password)
+    except security.PasswordPolicyError as exc:
+        raise AuthValidationError(str(exc)) from exc
+
+    try:
+        user.password_hash = security.hash_password(candidate)
     except ValueError as exc:
         raise AuthValidationError(str(exc)) from exc
 
     reset_record.used_at = datetime.now(timezone.utc)
     revoke_all_sessions(session, user.id)
-    auth_event_repo.log_event(session, user_id=user.id, event_type="password_reset")
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="password_reset",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     session.flush()
     logger.info("password reset completed", extra={"user_id": str(user.id)})
 
 
-# --- account deactivation (self-service) ----------------------------------------
+# --- invitation acceptance (public, teacher onboarding) -------------------------------
+
+
+def accept_invite(
+    session: Session,
+    token: str,
+    new_password: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> tuple[AuthUserRead, TokenResponse]:
+    """Consume a single-use invitation token: set the password, activate.
+
+    Mirrors :func:`reset_password`'s token discipline (signature + type +
+    stored digest + expiry + single use), with two differences: the account
+    must be a ``pending`` teacher, and success activates it and issues a
+    token pair so the invitee is logged in immediately after choosing a
+    password.
+
+    Every check runs before any mutation, and a rejected password leaves
+    the account exactly as it was (still pending, token still unused). The
+    caller commits.
+    """
+    try:
+        claims = security.decode_token(token, expected_type="invite")
+    except Exception:
+        raise AuthCredentialsError() from None
+
+    try:
+        jwt_user_id = uuid.UUID(claims["sub"])
+    except (KeyError, ValueError):
+        raise AuthCredentialsError() from None
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    from app.models.invite_token import InviteToken
+
+    invite_row = session.scalar(
+        select(InviteToken).where(
+            InviteToken.token_hash == token_hash,
+            InviteToken.user_id == jwt_user_id,
+        )
+    )
+    if (
+        invite_row is None
+        or invite_row.used_at is not None
+        or _as_aware_utc(invite_row.expires_at) <= datetime.now(timezone.utc)
+    ):
+        raise AuthCredentialsError()
+
+    user = session.get(User, jwt_user_id)
+    if (
+        user is None
+        or user.role != UserRole.TEACHER.value
+        or user.status != UserStatus.PENDING.value
+    ):
+        raise AuthCredentialsError()
+
+    # Policy first: a rejected password must leave the account untouched.
+    try:
+        password_hash = security.hash_password(
+            security.validate_password_policy(new_password)
+        )
+    except (PasswordPolicyError, ValueError) as exc:
+        raise AuthValidationError(str(exc)) from exc
+
+    now = datetime.now(timezone.utc)
+    user.password_hash = password_hash
+    user.status = UserStatus.ACTIVE.value
+    invite_row.used_at = now
+    revoke_all_sessions(session, user.id)
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="invite_accepted",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    session.flush()
+    logger.info("teacher invitation accepted", extra={"user_id": str(user.id)})
+
+    identity = _read_user(user, None)
+    tokens = _issue_session(session, user, now)
+    return identity, tokens
+
+
+# --- account deactivation (self-service) --------------------------------------------
 
 
 def deactivate_account(
     session: Session,
     user: User,
     payload: DeactivateAccountRequest,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> None:
     """Deactivate the authenticated user's account.
 
@@ -575,7 +824,13 @@ def deactivate_account(
 
     user.status = UserStatus.DISABLED.value
     revoke_all_sessions(session, user.id)
-    auth_event_repo.log_event(session, user_id=user.id, event_type="account_deactivated")
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="account_deactivated",
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     session.flush()
     logger.info("account deactivated", extra={"user_id": str(user.id)})
 

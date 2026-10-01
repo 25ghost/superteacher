@@ -13,7 +13,7 @@ Safety model:
 Integration fixtures:
 
 - ``pg_engine``: session-scoped engine bound to the guarded test DB URL.
-- ``clean_db``: function-scoped; truncates all 16 application tables
+- ``clean_db``: function-scoped; truncates all application tables
   (RESTART IDENTITY CASCADE) before the test and verifies zero rows after.
 - ``db_session``: a session wrapped in an outer transaction that is always
   rolled back — temporary inserts never persist.
@@ -31,7 +31,14 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-# The 16 application tables, children first for TRUNCATE CASCADE simplicity.
+# app.main refuses to import when ENVIRONMENT is not set explicitly (startup
+# fail-fast, Phase B2). A fresh checkout has no .env yet, so the suite states
+# its own stage here instead of inheriting the development class default.
+# An externally provided value (e.g. ENVIRONMENT=testing for integration
+# runs) is never overridden.
+os.environ.setdefault("ENVIRONMENT", "development")
+
+# The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
     "student_subjects",
     "student_enrollments",
@@ -49,6 +56,13 @@ APPLICATION_TABLES: tuple[str, ...] = (
     "pathways",
     "academic_years",
     "students",
+    "teachers",
+    "invite_tokens",
+    # auth children of users — truncated too, so an audit/session row can
+    # never leak from one integration test into the next.
+    "auth_events",
+    "password_reset_tokens",
+    "auth_sessions",
     "users",
 )
 
@@ -144,7 +158,13 @@ def db_session(pg_engine: Engine) -> Iterator[Session]:
     """
     connection = pg_engine.connect()
     transaction = connection.begin()
-    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    # autoflush=False matches app.core.database.SessionLocal: production code
+    # must not depend on SQLAlchemy silently pushing pending rows mid-query.
+    session = Session(
+        bind=connection,
+        join_transaction_mode="create_savepoint",
+        autoflush=False,
+    )
     try:
         yield session
     finally:

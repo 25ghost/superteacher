@@ -11,6 +11,32 @@ import pytest
 from scripts.seed_reference_data import main
 
 
+@pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch: pytest.MonkeyPatch):
+    """Keep these unit tests away from PostgreSQL.
+
+    The guard tests run ``main()`` past the environment gate (development,
+    testing, production dry-run), which reaches ``SessionLocal()``; the
+    factory is replaced with an in-memory SQLite session so no unit test can
+    ever open a real database connection.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.database import Base
+    import app.models  # noqa: F401  (registers every table)
+
+    engine = create_engine("sqlite+pysqlite://")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        "scripts.seed_reference_data.SessionLocal", sessionmaker(bind=engine)
+    )
+    try:
+        yield
+    finally:
+        engine.dispose()
+
+
 class _FakeSettings:
     """Minimal settings object for controlling the seeder guard."""
 

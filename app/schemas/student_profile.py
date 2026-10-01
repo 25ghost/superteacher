@@ -148,7 +148,13 @@ class StudentProfileCreate(BaseModel):
     phone remains an optional secondary contact. Phone-only identities are
     refused because login and password reset are email-based and such an
     account could never authenticate.
+
+    ``extra="forbid"`` — an administrative create cannot smuggle extra
+    keys (``role``, ``status``, ...) past the identity fields the service
+    derives itself; consistent with the other write schemas.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     # Identity (users row) — email required (see class docstring).
     email: EmailStr = Field(max_length=255)

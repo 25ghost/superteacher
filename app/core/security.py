@@ -34,7 +34,7 @@ from app.core.config import get_settings
 # stateless/thread-safe for hashing and verification.
 _password_hasher = PasswordHasher()
 
-TokenType = Literal["access", "refresh"]
+TokenType = Literal["access", "refresh", "reset", "invite"]
 
 
 def hash_password(password: str) -> str:
@@ -204,6 +204,26 @@ def create_reset_token(user_id: uuid.UUID, expires_minutes: int = 60) -> str:
     return jwt.encode(claims, settings.jwt_secret, algorithm="HS256")
 
 
+def create_invite_token(user_id: uuid.UUID, expires_minutes: int = 72 * 60) -> str:
+    """Issue a teacher-invitation token for one pending account.
+
+    Claims: sub (user UUID), typ="invite", jti, iat, exp (72 hours default).
+    The raw token goes to the invitation email only; the server keeps its
+    SHA-256 digest in ``invite_tokens`` for single-use enforcement — the
+    raw value is never logged, stored or returned by any API response.
+    """
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    claims: dict[str, Any] = {
+        "sub": str(user_id),
+        "typ": "invite",
+        "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + timedelta(minutes=expires_minutes),
+    }
+    return jwt.encode(claims, settings.jwt_secret, algorithm="HS256")
+
+
 __all__ = [
     "PasswordPolicyError",
     "TokenType",
@@ -214,5 +234,6 @@ __all__ = [
     "create_refresh_token",
     "decode_token",
     "create_reset_token",
+    "create_invite_token",
     "InvalidTokenError",
 ]

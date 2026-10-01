@@ -40,7 +40,12 @@ class StudentAccountCreate(BaseModel):
     validation reuses the exact ``student_profile`` helper validators
     (name charset, gender vocabulary, country pattern) so the two flows
     can never drift.
+
+    ``extra="forbid"`` rejects unknown keys with a 422 — a caller cannot
+    smuggle a ``role``/``status`` field past the role forcing below.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     # Identity — email is the authentication identifier (Step 4) and is
     # therefore REQUIRED for account creation (unlike the dev-stage profile
@@ -84,6 +89,8 @@ class StudentAccountCreate(BaseModel):
 class ChangePasswordRequest(BaseModel):
     """Authenticated password change (self-service)."""
 
+    model_config = ConfigDict(extra="forbid")
+
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(max_length=128)
 
@@ -101,11 +108,42 @@ class ChangePasswordRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     """Request a password reset email (public, rate-limited)."""
 
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr = Field(max_length=255)
 
 
 class ResetPasswordRequest(BaseModel):
     """Reset password with a valid reset token (public, rate-limited)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=4096)
+    new_password: str = Field(max_length=128)
+
+    @field_validator("new_password", mode="after")
+    @classmethod
+    def _new_password_policy(cls, value: str) -> str:
+        from app.core.security import PasswordPolicyError, validate_password_policy
+
+        try:
+            return validate_password_policy(value)
+        except PasswordPolicyError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class AcceptInviteRequest(BaseModel):
+    """Accept a teacher invitation (public, rate-limited).
+
+    The     token comes from the invitation email link; it is single-use and
+    expires after 72 hours. Accepting sets the password, activates the
+    account and issues a token pair — the same shape as ``reset-password``
+    plus the login that follows.
+
+    ``extra="forbid"`` — same strictness as the reset flow.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     token: str = Field(min_length=1, max_length=4096)
     new_password: str = Field(max_length=128)
@@ -124,18 +162,24 @@ class ResetPasswordRequest(BaseModel):
 class DeactivateAccountRequest(BaseModel):
     """Self-service account deactivation (requires password confirmation)."""
 
+    model_config = ConfigDict(extra="forbid")
+
     password: str = Field(min_length=1, max_length=128)
 
 
 class LoginRequest(BaseModel):
     """Email + password login (Step 21)."""
 
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr = Field(max_length=255)
     password: str = Field(min_length=1, max_length=128)
 
 
 class RefreshTokenRequest(BaseModel):
-    """Refresh-token exchange (Step 22)."""
+    """Refresh-token exchange (Step 22) and the ``/auth/logout`` body."""
+
+    model_config = ConfigDict(extra="forbid")
 
     refresh_token: str = Field(min_length=1, max_length=4096)
 

@@ -587,13 +587,22 @@ def test_enrollment_of_another_student_refused(api_client, two_students) -> None
     assert created.status_code == 201
     enrollment_id = created.json()["enrollment_id"]
 
-    # Owner can read it; the other student cannot.
+    # Owner can read it; another student gets the unknown-id answer (L6):
+    # 404 with the identical detail template — never a 403 that would
+    # confirm the row exists.
     own = api_client.get(f"/api/v1/me/registrations/{enrollment_id}", headers=two_students.header_a())
     assert own.status_code == 200
     other = api_client.get(
         f"/api/v1/me/registrations/{enrollment_id}", headers=two_students.header_b()
     )
-    assert other.status_code == 403
+    missing_id = "00000000-0000-0000-0000-000000000000"
+    unknown = api_client.get(
+        f"/api/v1/me/registrations/{missing_id}", headers=two_students.header_b()
+    )
+    assert other.status_code == 404
+    assert unknown.status_code == 404
+    assert other.json() == {"detail": f"no enrollment with id {enrollment_id}"}
+    assert unknown.json() == {"detail": f"no enrollment with id {missing_id}"}
 
 
 def test_me_registrations_returns_own_history(api_client, two_students) -> None:

@@ -35,7 +35,16 @@ class UserRole(str, enum.Enum):
 
 
 class UserStatus(str, enum.Enum):
+    """Account lifecycle, enforced by ``users_status_check``.
+
+    ``pending`` was added for the teacher invite flow: an account created by
+    an administrator exists but cannot authenticate until the invite is
+    accepted (or an administrator activates it). Only ``active`` passes the
+    status gate in :mod:`app.core.auth_dependencies`.
+    """
+
     ACTIVE = "active"
+    PENDING = "pending"
     SUSPENDED = "suspended"
     DISABLED = "disabled"
 

@@ -10,6 +10,7 @@ from app.models.auth_event import AuthEvent
 from app.models.auth_session import AuthSession
 from app.models.education_level import EducationLevel
 from app.models.enrollment import StudentEnrollment
+from app.models.invite_token import InviteToken
 from app.models.password_reset_token import PasswordResetToken
 from app.models.pathway import Pathway
 from app.models.pathway_level import PathwayLevel
@@ -22,6 +23,7 @@ from app.models.student import Student
 from app.models.student_profile_history import StudentProfileHistory
 from app.models.student_subject import StudentSubject
 from app.models.subject import Subject
+from app.models.teacher import Teacher
 from app.models.tvet_program import TVETProgram
 from app.models.tvet_sector import TVETSector
 from app.models.user import User
@@ -32,6 +34,7 @@ __all__ = [
     "AuthEvent",
     "AuthSession",
     "EducationLevel",
+    "InviteToken",
     "PasswordResetToken",
     "StudentEnrollment",
     "Pathway",
@@ -45,6 +48,7 @@ __all__ = [
     "StudentProfileHistory",
     "StudentSubject",
     "Subject",
+    "Teacher",
     "TVETProgram",
     "TVETSector",
     "User",

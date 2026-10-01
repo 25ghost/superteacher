@@ -1,7 +1,8 @@
 """users table — system identity with password authentication (Phase 5G)."""
 import uuid
+from datetime import datetime
 
-from sqlalchemy import CheckConstraint, Index, String, func
+from sqlalchemy import CheckConstraint, DateTime, Index, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -36,6 +37,17 @@ class User(TimestampMixin, Base):
     )
     # PHC-format Argon2id hash (argon2-cffi). Nullable: see migration 0002.
     password_hash: Mapped[str | None] = mapped_column(String(255))
+
+    # Login lockout (Phase B, slice 7): consecutive refused attempts and
+    # the instant until which the account may not authenticate. Both are
+    # cleared by a successful login, by an expired window, or by an
+    # administrator (POST /admin/users/{id}/unlock).
+    failed_login_count: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint(f"role IN ({sql_in_list(UserRole)})", name="users_role_check"),

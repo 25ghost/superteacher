@@ -55,3 +55,70 @@ def send_password_reset_email(
         "password reset email sent",
         extra={"to": to_email, "message_id": result.get("id", "unknown")},
     )
+
+
+def deliver_password_reset_email(
+    to_email: str,
+    reset_token: str,
+    frontend_url: str,
+) -> None:
+    """Send a password reset email as a FastAPI ``BackgroundTasks`` job (L14).
+
+    Scheduled by ``POST /auth/forgot-password`` only *after* the reset-token
+    row has been committed, so a send failure can never leave an emailed
+    token pointing at a rolled-back row — and, symmetrically, a failed send
+    never rolls back a committed token.
+
+    Never raises (the response, always 204, is already on its way) and never
+    logs the token itself, only the recipient.
+    """
+    try:
+        send_password_reset_email(
+            to_email=to_email,
+            reset_token=reset_token,
+            frontend_url=frontend_url,
+        )
+    except Exception:
+        logger.exception(
+            "failed to send password reset email",
+            extra={"to": to_email},
+        )
+
+
+def send_teacher_invite_email(
+    to_email: str,
+    invite_token: str,
+    frontend_url: str,
+) -> None:
+    """Send a teacher invitation email with a time-limited link.
+
+    The link format: ``{frontend_url}/accept-invite?token={invite_token}``.
+    The raw token appears only in this email (and in the link the recipient
+    clicks) — never in logs, API responses or database rows. Raises on
+    failure so the caller can log it.
+    """
+    settings = get_settings()
+    invite_url = f"{frontend_url}/accept-invite?token={invite_token}"
+
+    html_content = f"""
+    <h2>You're invited to SuperTeacher</h2>
+    <p>An administrator created a teacher account for you.</p>
+    <p>Click the link below to set your password and activate the account.
+       This link expires in 72 hours.</p>
+    <p><a href="{invite_url}">Accept the invitation</a></p>
+    <p>If you were not expecting this, you can safely ignore this email.</p>
+    """
+
+    params: resend.Emails.SendParams = {
+        "from": settings.RESEND_FROM_EMAIL,
+        "to": [to_email],
+        "subject": "SuperTeacher — Accept your teacher invitation",
+        "html": html_content,
+    }
+
+    client = _get_client()
+    result = client.send(params)
+    logger.info(
+        "teacher invitation email sent",
+        extra={"to": to_email, "message_id": result.get("id", "unknown")},
+    )

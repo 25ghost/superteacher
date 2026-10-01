@@ -9,8 +9,15 @@ Usage (from backend/):
     python scripts/cleanup_auth_sessions.py --dry-run    # report only, no deletes
     python scripts/cleanup_auth_sessions.py              # delete old rows
 
+In ``ENVIRONMENT=production`` a live run is refused — only ``--dry-run``
+is allowed there (same guard as ``scripts/seed_reference_data.py``).
+
 Deletions are committed in a single transaction. Active (non-expired,
 non-revoked) sessions are never touched.
+
+Transaction rule (explicit exception): this script owns its own
+``commit()``/``rollback()``, because there is no endpoint to own it —
+repositories still only flush.
 """
 from __future__ import annotations
 
@@ -59,6 +66,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Database:  {settings.DB_NAME} on {settings.DB_HOST}:{settings.DB_PORT}")
     print(f"Retention: {args.retention_days} days after expiry/revocation")
     print()
+
+    # Production safety (H5): refuse LIVE deletes in production; --dry-run
+    # stays available for read-only inspection. Same guard, same wording and
+    # the same configuration source as scripts/seed_reference_data.py — no
+    # hard-coded environment detection anywhere else.
+    if settings.ENVIRONMENT.lower() == "production" and not args.dry_run:
+        print(
+            "\nREFUSED: production LIVE run is not permitted. "
+            "Use --dry-run for read-only inspection, or run in "
+            "development/testing environment."
+        )
+        return 1
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
 

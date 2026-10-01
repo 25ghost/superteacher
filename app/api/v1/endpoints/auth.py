@@ -15,7 +15,11 @@ Role-split routers — every endpoint lives under exactly one guard:
   ``Student Self-Service``) — role=student only:
   ``GET /me/student`` (403 + remedy pointer when no profile),
   ``POST /me/student`` (self-service profile attach),
-  ``PATCH /me/student`` (self-service profile update).
+  ``PATCH /me/student`` (self-service profile update),
+- ``teacher_me_router`` (prefix ``/me/teacher``, tag
+  ``Teacher Self-Service``) — role=teacher only:
+  ``GET /me/teacher`` / ``PATCH /me/teacher`` (own profile; 404 when the
+  account has no profile yet).
 
 Administration endpoints live under ``/admin/*`` (``admin_students`` /
 ``registrations`` modules, tag ``Administration``) and never mix with the
@@ -30,17 +34,24 @@ writes are throttled via slowapi to prevent brute-force and account-spam
 attacks.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 
-from app.core.auth_dependencies import get_current_student, get_current_user, require_student
+from app.core.auth_dependencies import (
+    get_current_student,
+    get_current_user,
+    require_student,
+    require_teacher,
+)
 from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.email import deliver_password_reset_email
 from app.core.rate_limit import limiter
 from app.models.student import Student
 from app.models.user import User
 from app.schemas.auth import (
+    AcceptInviteRequest,
     AuthUserRead,
     ChangePasswordRequest,
     DeactivateAccountRequest,
@@ -56,13 +67,16 @@ from app.schemas.student_profile import (
     StudentProfileSelfCreate,
     StudentProfileUpdate,
 )
+from app.schemas.teacher_admin import TeacherMeRead, TeacherMeUpdate
 from app.services import auth_service
 from app.services import student_service
+from app.services import teacher_service
 from app.services.student_service import read_profile
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 me_router = APIRouter(prefix="/me", tags=["Self-Service"])
 student_me_router = APIRouter(prefix="/me/student", tags=["Student Self-Service"])
+teacher_me_router = APIRouter(prefix="/me/teacher", tags=["Teacher Self-Service"])
 
 # Advertised in OpenAPI so protected endpoints document the Bearer scheme
 # (Step 37). auto_error=False keeps our own 401 contract for missing headers.
@@ -80,6 +94,22 @@ _settings = get_settings()
 
 def _http_error(exc: auth_service.AuthError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+def _request_meta(request: Request) -> dict:
+    """Source metadata for the audit trail (slice 7), clamped to columns.
+
+    Never includes credentials — only the caller's address and the
+    ``User-Agent`` header, truncated to the ``auth_events`` widths
+    (45/255) so an overlong header cannot fail the insert.
+    """
+    client = request.client
+    ip_address = client.host if client else None
+    user_agent = request.headers.get("user-agent")
+    return {
+        "ip_address": ip_address[:45] if ip_address else None,
+        "user_agent": user_agent[:255] if user_agent else None,
+    }
 
 
 @router.post(
@@ -141,9 +171,12 @@ def login(
     session: Session = Depends(get_db),
 ) -> TokenResponse:
     try:
-        tokens = auth_service.login(session, payload)
+        tokens = auth_service.login(session, payload, **_request_meta(request))
     except auth_service.AuthError as exc:
-        session.rollback()
+        # The refusal IS the audit record: keep the login_failed event and
+        # the lockout bookkeeping (counter / lock) instead of rolling them
+        # back, then answer with the same generic 401.
+        session.commit()
         raise _http_error(exc) from exc
     session.commit()
     return tokens
@@ -174,7 +207,9 @@ def refresh(
     session: Session = Depends(get_db),
 ) -> TokenResponse:
     try:
-        tokens = auth_service.refresh(session, payload.refresh_token)
+        tokens = auth_service.refresh(
+            session, payload.refresh_token, **_request_meta(request)
+        )
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -206,7 +241,12 @@ def logout(
     user: User = Depends(get_current_user),
 ) -> None:
     try:
-        auth_service.logout(session, payload.refresh_token, expected_user_id=user.id)
+        auth_service.logout(
+            session,
+            payload.refresh_token,
+            expected_user_id=user.id,
+            **_request_meta(request),
+        )
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -384,7 +424,7 @@ def patch_me_student(
         422: {"description": "New password violates policy"},
     },
 )
-@limiter.limit("10/minute")
+@limiter.limit(_settings.RATE_LIMIT_CHANGE_PASSWORD)
 def change_password(
     request: Request,
     payload: ChangePasswordRequest,
@@ -392,7 +432,9 @@ def change_password(
     user: User = Depends(get_current_user),
 ) -> None:
     try:
-        auth_service.change_password(session, user, payload)
+        auth_service.change_password(
+            session, user, payload, **_request_meta(request)
+        )
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -416,14 +458,27 @@ def change_password(
         429: {"description": "Rate limit exceeded"},
     },
 )
-@limiter.limit("5/minute")
+@limiter.limit(_settings.RATE_LIMIT_FORGOT_PASSWORD)
 def forgot_password(
     request: Request,
     payload: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_db),
 ) -> None:
-    auth_service.forgot_password(session, payload.email)
+    try:
+        delivery = auth_service.forgot_password(session, payload.email)
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
+    # Commit the token row first; only then queue the email. FastAPI runs
+    # background tasks after the response, so the always-204 body (and its
+    # timing) is unaffected whether an account matched or not (L14).
     session.commit()
+    if delivery is not None:
+        background_tasks.add_task(deliver_password_reset_email, **delivery)
 
 
 @router.post(
@@ -442,18 +497,60 @@ def forgot_password(
         429: {"description": "Rate limit exceeded"},
     },
 )
-@limiter.limit("5/minute")
+@limiter.limit(_settings.RATE_LIMIT_RESET_PASSWORD)
 def reset_password(
     request: Request,
     payload: ResetPasswordRequest,
     session: Session = Depends(get_db),
 ) -> None:
     try:
-        auth_service.reset_password(session, payload.token, payload.new_password)
+        auth_service.reset_password(
+            session, payload.token, payload.new_password, **_request_meta(request)
+        )
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc
     session.commit()
+
+
+@router.post(
+    "/accept-invite",
+    response_model=TokenResponse,
+    summary="Accept a teacher invitation and set the password",
+    description=(
+        "Consumes the single-use invitation token from the email link "
+        "(valid 72 hours), sets the password (policy enforced) and "
+        "activates the account (pending → active), then issues a token "
+        "pair so the invitee is logged in immediately. Invalid, expired "
+        "or already-used tokens → 401; a policy-violating password → 422 "
+        "(the account stays pending and the token stays unused). "
+        "Rate-limited; public — no credentials are required or accepted."
+    ),
+    responses={
+        200: {"description": "Invitation accepted, account active, tokens issued"},
+        401: {"description": "Invalid, expired or already-used token"},
+        422: {"description": "Password violates the password policy"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_REGISTER)
+def accept_invite(
+    request: Request,
+    payload: AcceptInviteRequest,
+    session: Session = Depends(get_db),
+) -> TokenResponse:
+    try:
+        _, tokens = auth_service.accept_invite(
+            session,
+            payload.token,
+            payload.new_password,
+            **_request_meta(request),
+        )
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    session.commit()
+    return tokens
 
 
 # --- Account deactivation (self-service) -----------------------------------------
@@ -473,7 +570,7 @@ def reset_password(
         401: {"description": "Password is incorrect"},
     },
 )
-@limiter.limit("5/minute")
+@limiter.limit(_settings.RATE_LIMIT_DEACTIVATE_ACCOUNT)
 def deactivate_account(
     request: Request,
     payload: DeactivateAccountRequest,
@@ -481,7 +578,72 @@ def deactivate_account(
     user: User = Depends(get_current_user),
 ) -> None:
     try:
-        auth_service.deactivate_account(session, user, payload)
+        auth_service.deactivate_account(
+            session, user, payload, **_request_meta(request)
+        )
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    session.commit()
+
+
+# --- Teacher self-service (Phase B, slice 5) ------------------------------------------
+
+
+@teacher_me_router.get(
+    "",
+    response_model=TeacherMeRead,
+    summary="Current authenticated teacher profile",
+    description=(
+        "The authenticated teacher's own profile. The identity comes from "
+        "the access token (role must be 'teacher'); there is no id in the "
+        "path. Non-teachers → 403. 404 when the account has no profile "
+        "row yet (an administrator creates it with POST /admin/teachers)."
+    ),
+    responses={**_UNAUTHORIZED, **_FORBIDDEN, 404: {"description": "No teacher profile"}},
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def read_me_teacher(
+    request: Request,
+    session: Session = Depends(get_db),
+    user: User = Depends(require_teacher),
+) -> TeacherMeRead:
+    try:
+        return teacher_service.read_teacher_profile(session, user)
+    except auth_service.AuthError as exc:
+        raise _http_error(exc) from exc
+
+
+@teacher_me_router.patch(
+    "",
+    response_model=TeacherMeRead,
+    summary="Update the authenticated teacher's profile",
+    description=(
+        "Updates full_name / phone / subject on the caller's own profile. "
+        "Only supplied fields change; an explicit null clears phone or "
+        "subject (full_name cannot be cleared). Unknown keys — including "
+        "school_id and anything role-shaped — are rejected with 422 "
+        "(extra=forbid). Role and status are never writable here: role "
+        "changes are PATCH /admin/users/{id}/role, status changes are the "
+        "admin activate/deactivate endpoints."
+    ),
+    responses={
+        **_UNAUTHORIZED,
+        **_FORBIDDEN,
+        404: {"description": "No teacher profile"},
+        422: {"description": "Validation error (unknown key, blank name)"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def patch_me_teacher(
+    request: Request,
+    payload: TeacherMeUpdate,
+    session: Session = Depends(get_db),
+    user: User = Depends(require_teacher),
+) -> TeacherMeRead:
+    try:
+        return teacher_service.update_teacher_profile(session, user, payload)
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc

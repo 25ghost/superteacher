@@ -150,7 +150,10 @@ def require_role(*roles: UserRole, detail: str | None = None):
 
 #: One reusable guard per allowed role.
 require_student = require_role(UserRole.STUDENT)
-require_teacher = require_role(UserRole.TEACHER)
+require_teacher = require_role(
+    UserRole.TEACHER,
+    detail="teacher role required for this operation",
+)
 #: Administrators (the ``/admin/*`` routes); the 403 message names the role.
 require_admin = require_role(
     UserRole.ADMIN,

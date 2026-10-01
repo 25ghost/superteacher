@@ -32,6 +32,30 @@ if seed_cli is None:
     _spec.loader.exec_module(seed_cli)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch: pytest.MonkeyPatch):
+    """Keep this unit test away from PostgreSQL.
+
+    ``seed_reference_data.main()`` opens ``SessionLocal()`` on every run
+    (dry-run included), so the factory is replaced with an in-memory SQLite
+    session that is schema-identical and empty — projections read 0s and no
+    real connection can be reached.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.database import Base
+    import app.models  # noqa: F401  (registers every table)
+
+    engine = create_engine("sqlite+pysqlite://")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(seed_cli, "SessionLocal", sessionmaker(bind=engine))
+    try:
+        yield
+    finally:
+        engine.dispose()
+
+
 def test_dry_run_report_is_internally_consistent(capsys) -> None:
     """Dry-run projects what a live run would do; zero statements execute.
 

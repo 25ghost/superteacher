@@ -49,3 +49,33 @@ def create_student_user(
     session.add(user)
     session.flush()  # assign the PK so the caller can link the profile
     return user
+
+
+def create_admin_user(
+    session: Session,
+    *,
+    email: str,
+    password_hash: str,
+    status: str = "active",
+) -> User:
+    """Insert a user row with the ``admin`` role (not committed).
+
+    Deliberately separate from :func:`create_student_user`, whose role is
+    hard-coded to ``student`` by design: the bootstrap path must not share
+    a helper that silently forces a role, and the student path must not
+    grow a role parameter. No student profile row is created — an
+    administrator has no profile, and ``role``/``status`` are decided here,
+    never by a request payload.
+
+    ``password_hash`` is an already-hashed PHC Argon2id string; callers
+    validate the plaintext against the password policy before hashing.
+    """
+    user = User(
+        email=email,
+        role=UserRole.ADMIN.value,
+        status=status,
+        password_hash=password_hash,
+    )
+    session.add(user)
+    session.flush()  # assign the PK so the caller can log the audit event
+    return user

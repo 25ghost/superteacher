@@ -9,6 +9,7 @@ __pycache__/
 # Test and tooling caches
 .pytest_cache/
 .mypy_cache/
+.coverage
 
 # Virtual environments
 .venv/

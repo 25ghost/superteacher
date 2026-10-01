@@ -405,7 +405,16 @@ def test_enrollment_of_another_student_refused(api_client, registration_db) -> N
     other = api_client.get(
         f"/api/v1/me/registrations/{enrollment_id}", headers=attacker_header
     )
-    assert other.status_code == 403
+    # L6 existence leak: a foreign enrollment answers with exactly the
+    # response an unknown id gets — 404, same detail template, never 403.
+    missing_id = "00000000-0000-0000-0000-000000000000"
+    unknown = api_client.get(
+        f"/api/v1/me/registrations/{missing_id}", headers=attacker_header
+    )
+    assert other.status_code == 404
+    assert unknown.status_code == 404
+    assert other.json() == {"detail": f"no enrollment with id {enrollment_id}"}
+    assert unknown.json() == {"detail": f"no enrollment with id {missing_id}"}
     own = api_client.get(f"/api/v1/me/registrations/{enrollment_id}", headers=owner_header)
     assert own.status_code == 200
 

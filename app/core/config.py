@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "superteacher-api"
     ENVIRONMENT: str = "development"
 
+    # Logging (M9): level applied by ``app.core.logging.configure_logging()``
+    # exactly once at startup. One of DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    LOG_LEVEL: str = "INFO"
+
     # Database (PostgreSQL) — combined into a SQLAlchemy URL; never hard-coded.
     DB_NAME: str = "super_teacher_db"
     DB_HOST: str = "127.0.0.1"
@@ -87,6 +91,31 @@ class Settings(BaseSettings):
     RATE_LIMIT_STUDENT_READ: str = "30/minute"
     RATE_LIMIT_STUDENT_WRITE: str = "10/minute"
     RATE_LIMIT_STUDENT_HISTORY: str = "30/minute"
+    #: Liveness probe throttle — generous for real probes, hostile to storms.
+    RATE_LIMIT_HEALTH: str = "120/minute"
+    #: Password self-service and account-lifecycle writes.
+    RATE_LIMIT_CHANGE_PASSWORD: str = "10/minute"
+    RATE_LIMIT_FORGOT_PASSWORD: str = "5/minute"
+    RATE_LIMIT_RESET_PASSWORD: str = "5/minute"
+    RATE_LIMIT_DEACTIVATE_ACCOUNT: str = "5/minute"
+    #: Registration portal: readiness/catalog reads vs. enrollment writes.
+    RATE_LIMIT_REGISTRATION_READ: str = "30/minute"
+    RATE_LIMIT_REGISTRATION_WRITE: str = "10/minute"
+
+    # slowapi storage backend. "memory://" (default) is per-process: limits
+    # are not shared between workers, so each worker allows its own budget.
+    # Multi-worker deployments must point this at a shared store (e.g. a
+    # Redis URL). No Redis client is bundled — supplying the URI is enough
+    # for slowapi/limits to load the matching backend.
+    RATE_LIMIT_STORAGE_URI: str = "memory://"
+
+    # Login lockout (Phase B, slice 7): after this many refused login
+    # attempts the account is locked for LOGIN_LOCKOUT_MINUTES. The lock
+    # answer is the same generic 401 as a wrong password — the response
+    # never discloses it. A successful login or an administrator
+    # (POST /admin/users/{id}/unlock) clears it early.
+    LOGIN_LOCKOUT_THRESHOLD: int = 5
+    LOGIN_LOCKOUT_MINUTES: int = 15
 
     # Maximum active refresh sessions per user. When exceeded, the oldest
     # session is revoked before creating a new one.
@@ -134,6 +163,42 @@ class Settings(BaseSettings):
                     "is not a development stage."
                 )
         return secret
+
+    def validate_startup(self) -> None:
+        """Fail fast on configuration that must never serve traffic (Phase B2).
+
+        Two silent defaults could otherwise boot an insecure server:
+
+        - ``ENVIRONMENT`` falls back to ``"development"``, so a deployment
+          that forgets to set it would silently accept the placeholder
+          ``SECRET_KEY`` and development CORS/seed guards;
+        - ``SECRET_KEY`` validation lives in the ``jwt_secret`` property,
+          which only fires when a token is first signed — after the server
+          is already up.
+
+        Called at import time by ``app.main``, so ``uvicorn app.main:app``
+        refuses to boot instead of starting insecurely. Every check here
+        reuses the property logic above (single source of truth), and
+        nothing in this method may log a secret value.
+        """
+        if "ENVIRONMENT" not in self.model_fields_set:
+            raise RuntimeError(
+                "REFUSING to start: ENVIRONMENT is not set. It must be set "
+                "explicitly (development | testing | production) — the "
+                "development default is never applied implicitly at startup."
+            )
+        if not self.ENVIRONMENT.strip():
+            raise RuntimeError(
+                "REFUSING to start: ENVIRONMENT is blank. "
+                "Use development, testing or production."
+            )
+        # Raises for a placeholder/empty/too-short secret outside the
+        # development stages — one source of truth for the rules.
+        _ = self.jwt_secret
+        # Forces the production CORS rules (no wildcard, no inherited
+        # localhost origins) to run before the first request.
+        _ = self.cors_origins
+        return None
 
     @property
     def cors_origins(self) -> list[str]:

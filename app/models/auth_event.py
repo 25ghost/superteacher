@@ -1,8 +1,13 @@
 """auth_events table — audit trail for authentication events.
 
 Logs every significant authentication event: login, logout, password
-change, password reset, token refresh, and account deactivation. Supports
-security auditing, incident investigation, and compliance requirements.
+change, password reset, token refresh, account deactivation, and the
+administrative actions of slice 4 (teacher creation, invitation,
+activation, deactivation, role change).
+
+``user_id`` is the *subject* of the event; ``actor_user_id`` (nullable) is
+the *acting administrator* when the two differ — without it an audit row
+cannot answer "who suspended this account?" (Phase B, G10).
 """
 import uuid
 from datetime import datetime
@@ -27,9 +32,15 @@ class AuthEvent(TimestampMixin, Base):
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The administrator who performed the action (NULL when the subject and
+    # the actor are the same account, e.g. a self-service password change).
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     __table_args__ = (
         Index("auth_events_user_id_idx", "user_id"),
         Index("auth_events_event_type_idx", "event_type"),
         Index("auth_events_created_at_idx", "created_at"),
+        Index("auth_events_actor_user_id_idx", "actor_user_id"),
     )

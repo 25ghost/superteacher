@@ -45,7 +45,7 @@ CATALOG_TABLES: tuple[str, ...] = (
 
 
 def capture_row_counts(engine: Engine) -> dict[str, int]:
-    """Row counts for all 16 application tables, children-first order."""
+    """Row counts for all 22 application tables, children-first order."""
     from tests.conftest import APPLICATION_TABLES
 
     with engine.connect() as connection:

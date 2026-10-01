@@ -3,7 +3,7 @@
 Three levels:
 
 1. STRUCTURAL (always runs, no database needed):
-   - all 16 expected application tables exist in the ORM metadata, with the
+   - all 22 expected application tables exist in the ORM metadata, with the
      plural ``students`` name and no singular ``student`` table;
    - every table that has ``created_at`` also has ``updated_at``;
    - the ``users_role_check`` vocabulary equals ``UserRole``, and the
@@ -19,7 +19,7 @@ Three levels:
 2. LIVE (read-only, ``--live``):
    - connects to PostgreSQL using the configured DB_* settings;
    - checks the live ``alembic_version`` equals the expected revision;
-   - checks every one of the 16 tables exists (and singular ``student`` does
+   - checks every one of the 22 tables exists (and singular ``student`` does
      not);
    - compares the LIVE schema against the ORM metadata with the same
      column/constraint/index comparison used for drift detection, so live
@@ -31,7 +31,7 @@ Three levels:
    - refuses to run when any application table contains rows (this is what
      keeps it from destroying data);
    - then ``alembic downgrade base`` -> verify empty -> ``alembic upgrade
-     head`` -> verify all 16 tables and the expected revision again.
+     head`` -> verify all 22 tables and the expected revision again.
    Use it only on a disposable development database.
 
 Usage (from ``backend/``):
@@ -68,9 +68,14 @@ EXPECTED_TABLES = {
     "school_programs",
     "student_enrollments",
     "student_subjects",
+    "teachers",
+    "invite_tokens",
+    "auth_events",
+    "password_reset_tokens",
+    "student_profile_history",
 }
 
-EXPECTED_REVISION = "0005"
+EXPECTED_REVISION = "0009"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -233,6 +238,9 @@ def schema_from_migration(path: Path) -> dict[str, dict]:
         if type_name not in _AST_TYPES:
             return _norm_type(type_name)
         kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+        if not kwargs and node.args and type_name == "String":
+            # ``sa.String(32)`` — length given positionally (migration 0003).
+            kwargs["length"] = ast.unparse(node.args[0])
         return _AST_TYPES[type_name](kwargs)
 
     for node in ast.walk(tree):
@@ -255,10 +263,44 @@ def schema_from_migration(path: Path) -> dict[str, dict]:
             )
             if kind == "Column":
                 nullable = True
+                primary_key = False
+                unique = False
+                explicit_nullable = False
+                inline_fk: str | None = None
                 for kw in arg.keywords:
                     if kw.arg == "nullable":
                         nullable = ast.unparse(kw.value) == "True"
-                columns[arg.args[0].value] = (_type_of(arg.args[1]), nullable)
+                        explicit_nullable = True
+                    elif kw.arg == "primary_key":
+                        primary_key = ast.unparse(kw.value) == "True"
+                    elif kw.arg == "unique":
+                        unique = ast.unparse(kw.value) == "True"
+                # Positional args after (name, type) — migration 0003 writes
+                # ``sa.Column("user_id", sa.Uuid(), sa.ForeignKey("users.id"))``.
+                for extra in arg.args[2:]:
+                    if (
+                        isinstance(extra, ast.Call)
+                        and getattr(extra.func, "attr", "") == "ForeignKey"
+                        and extra.args
+                        and isinstance(extra.args[0], ast.Constant)
+                    ):
+                        inline_fk = extra.args[0].value
+                if primary_key and not explicit_nullable:
+                    # A primary key column is implicitly NOT NULL.
+                    nullable = False
+                column = arg.args[0].value
+                columns[column] = (_type_of(arg.args[1]), nullable)
+                if primary_key:
+                    pk = pk + (column,)
+                if inline_fk is not None:
+                    # Naming convention: "%(table_name)s_%(column_0_name)s_fkey"
+                    fks[f"{table}_{column}_fkey"] = (
+                        (column,),
+                        (inline_fk.split(".")[0],),
+                    )
+                if unique:
+                    # Naming convention: "uq_%(table_name)s_%(column_0_name)s_key"
+                    uqs[f"uq_{table}_{column}_key"] = (column,)
             elif kind == "PrimaryKeyConstraint":
                 pk = tuple(item.value for item in arg.args)
             elif kind == "ForeignKeyConstraint":
@@ -287,11 +329,149 @@ def schema_from_migration(path: Path) -> dict[str, dict]:
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "create_index":
+            # Only literal calls are compared; a computed name cannot be
+            # resolved offline (and would otherwise crash the scan).
+            if (
+                len(node.args) < 3
+                or not isinstance(node.args[0], ast.Constant)
+                or not isinstance(node.args[1], ast.Constant)
+                or not isinstance(node.args[2], (ast.List, ast.Tuple))
+            ):
+                continue
             index_name, table = node.args[0].value, node.args[1].value
             columns = tuple(_index_column(item) for item in node.args[2].elts)
             schema.setdefault(table, {}).setdefault("indexes", {})[index_name] = columns
 
     return schema
+
+
+def _module_namespace(tree: ast.Module) -> dict:
+    """Evaluate this migration's module-level constant expressions.
+
+    Migration CHECK texts are often built from module-level constants (0004
+    builds ``students_gender_check`` from ``_GENDER_VOCAB`` through an
+    f-string). Literal strings are already covered by ``module_strings``;
+    this resolves the *derived* constants so the produced SQL text — not the
+    f-string source — is what gets compared with the model. Evaluation is
+    sandboxed (no builtins, no imports, no attribute access) and any
+    expression that cannot be resolved is skipped.
+    """
+    namespace: dict = {}
+    for node in tree.body:
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        try:
+            namespace[node.targets[0].id] = eval(
+                compile(ast.Expression(node.value), "<migration>", "eval"),
+                {"__builtins__": {}},
+                namespace,
+            )
+        except Exception:
+            continue
+    return namespace
+
+
+def _namespace_for_upgrade(upgrade_node: ast.AST, base: dict) -> dict:
+    """``base`` plus the simple assignments made inside ``upgrade()``.
+
+    0004 builds its CHECK text from ``_gender_list``, a name assigned *inside*
+    ``upgrade()`` from the module-level ``_GENDER_VOCAB``. Collecting those
+    assignments in source order lets the f-string be evaluated to the SQL it
+    actually produces instead of being compared as source text.
+    """
+    namespace = dict(base)
+
+    def visit(body: list) -> None:
+        for stmt in body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                try:
+                    namespace[stmt.targets[0].id] = eval(
+                        compile(ast.Expression(stmt.value), "<migration>", "eval"),
+                        {"__builtins__": {}},
+                        namespace,
+                    )
+                except Exception:
+                    continue
+            for attr in ("body", "orelse", "finalbody"):
+                child_body = getattr(stmt, attr, None)
+                if isinstance(child_body, list):
+                    visit(child_body)
+
+    visit(upgrade_node.body)
+    return namespace
+
+
+def _resolve_condition(
+    condition: ast.AST, module_strings: dict, namespace: dict
+) -> str:
+    """The literal SQL text of a ``create_check_constraint`` condition."""
+    if isinstance(condition, ast.Constant):
+        return str(condition.value)
+    if isinstance(condition, ast.Name) and condition.id in module_strings:
+        return module_strings[condition.id]
+    try:
+        value = eval(
+            compile(ast.Expression(condition), "<migration>", "eval"),
+            {"__builtins__": {}},
+            namespace,
+        )
+    except Exception:
+        return ast.unparse(condition)
+    return str(value)
+
+
+def _upgrade_node(tree: ast.Module) -> ast.AST | None:
+    return next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "upgrade"
+        ),
+        None,
+    )
+
+
+def _apply_upgrade_index_drops(schema: dict[str, dict], path: Path) -> None:
+    """Apply ``op.drop_index`` from upgrade() to the accumulated schema.
+
+    Index *creations* are collected from the whole file (upgrade and
+    downgrade) by :func:`schema_from_migration`, so a rename written as
+    "drop old + create new" also picks up the name its ``downgrade()``
+    re-creates. Only ``upgrade()`` runs under ``alembic upgrade head``, so
+    its ``drop_index`` calls must remove those names from the accumulated
+    schema — otherwise the index a migration deliberately renames away would
+    still be reported as present (and as drift against the models).
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    upgrade_node = _upgrade_node(tree)
+    if upgrade_node is None:
+        return
+    for node in ast.walk(upgrade_node):
+        if not (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "drop_index"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            continue
+        name = node.args[0].value
+        table = None
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            table = node.args[1].value
+        for kw in node.keywords:
+            if kw.arg == "table_name" and isinstance(kw.value, ast.Constant):
+                table = kw.value.value
+        if table and table in schema:
+            schema[table]["indexes"].pop(name, None)
 
 
 def _apply_check_swaps(schema: dict[str, dict], path: Path) -> None:
@@ -324,6 +504,7 @@ def _apply_check_swaps(schema: dict[str, dict], path: Path) -> None:
     )
     if upgrade_node is None:
         return
+    namespace = _namespace_for_upgrade(upgrade_node, _module_namespace(tree))
     for node in ast.walk(upgrade_node):
         if not isinstance(node, ast.Call):
             continue
@@ -336,13 +517,7 @@ def _apply_check_swaps(schema: dict[str, dict], path: Path) -> None:
         elif attr == "create_check_constraint" and len(node.args) >= 3:
             name = node.args[0].value
             table = node.args[1].value
-            condition = node.args[2]
-            if isinstance(condition, ast.Constant):
-                text = str(condition.value)
-            elif isinstance(condition, ast.Name) and condition.id in module_strings:
-                text = module_strings[condition.id]
-            else:
-                text = ast.unparse(condition)
+            text = _resolve_condition(node.args[2], module_strings, namespace)
             schema.setdefault(table, {
                 "columns": {}, "pk": (), "fks": {}, "uqs": {},
                 "checks": {}, "indexes": {},
@@ -372,6 +547,8 @@ def schema_from_live(inspector) -> dict[str, dict]:
     """Describe the live PostgreSQL schema (read-only inspection)."""
     schema: dict[str, dict] = {}
     for table in sorted(EXPECTED_TABLES):
+        column_rows = list(inspector.get_columns(table))
+        column_names = {row["name"] for row in column_rows}
         uqs = {
             row["name"]: tuple(row["column_names"] or ())
             for row in inspector.get_unique_constraints(table)
@@ -385,11 +562,26 @@ def schema_from_live(inspector) -> dict[str, dict]:
             # constraints; comparing them again would report false drift.
             if not name or name in uqs or name == pk_name:
                 continue
-            indexes[name] = tuple(row["column_names"] or ())
+            columns = tuple(row["column_names"] or ())
+            if not columns or columns == (None,):
+                # Functional index (e.g. uq_users_email_ci_key on
+                # lower(email)): PostgreSQL reports no column name. Reduce
+                # the expression to the columns it references so it compares
+                # with the ORM descriptor and the migration DDL, which
+                # normalize the same way (see _index_column).
+                columns = tuple(
+                    dict.fromkeys(
+                        token
+                        for expression in row.get("expressions") or ()
+                        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(expression))
+                        if token in column_names
+                    )
+                )
+            indexes[name] = columns
         schema[table] = {
             "columns": {
                 row["name"]: (_norm_type(row["type"]), bool(row["nullable"]))
-                for row in inspector.get_columns(table)
+                for row in column_rows
             },
             "pk": tuple(pk_constraint.get("constrained_columns") or ()),
             "fks": {
@@ -497,6 +689,26 @@ def _report_problems(title: str, problems: list[str]) -> bool:
     return not problems
 
 
+def _declared_revisions(paths: list[Path]) -> list[str]:
+    """The ``revision`` value declared by each migration file, in file order.
+
+    Both ``revision: str = "0009"`` (AnnAssign) and ``revision = "0009"``
+    (Assign) spellings are accepted so a hand-written migration cannot slip
+    past the chain checks.
+    """
+    declared: list[str] = []
+    for path in paths:
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            target = None
+            if isinstance(node, ast.AnnAssign):
+                target = node.target
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == "revision":
+                declared.append(ast.literal_eval(node.value))
+    return declared
+
+
 def _migration_files() -> list[Path]:
     return sorted(p for p in MIGRATION_DIR.glob("*.py") if p.name != "__init__.py")
 
@@ -504,7 +716,15 @@ def _migration_files() -> list[Path]:
 # Tables created by later (non-initial) migrations — the initial migration's
 # drift check deliberately excludes them; they are checked against their own
 # migration file below.
-LATER_MIGRATION_TABLES = {"auth_sessions"}
+LATER_MIGRATION_TABLES = {
+    "auth_sessions",
+    "teachers",
+    "invite_tokens",
+    # created by 0003 (password reset tokens + audit tables)
+    "auth_events",
+    "password_reset_tokens",
+    "student_profile_history",
+}
 
 
 def _later_dropped_checks(paths: list[Path]) -> set[tuple[str, str]]:
@@ -512,15 +732,7 @@ def _later_dropped_checks(paths: list[Path]) -> set[tuple[str, str]]:
     dropped: set[tuple[str, str]] = set()
     for path in paths[1:]:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        upgrade_node = next(
-            (
-                node
-                for node in tree.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == "upgrade"
-            ),
-            None,
-        )
+        upgrade_node = _upgrade_node(tree)
         if upgrade_node is None:
             continue
         for node in ast.walk(upgrade_node):
@@ -531,6 +743,56 @@ def _later_dropped_checks(paths: list[Path]) -> set[tuple[str, str]]:
             ):
                 dropped.add((node.args[1].value, node.args[0].value))
     return dropped
+
+
+def _later_created_checks(paths: list[Path]) -> set[tuple[str, str]]:
+    """(table, constraint) CHECK pairs created by a non-initial upgrade().
+
+    The 0001-only comparison is against the *initial* migration, so checks a
+    later migration introduces (0004 adds ``students_gender_check`` and the
+    date-of-birth range, 0005/0006 recreate the role/status vocabulary) are
+    excluded from both sides rather than reported as drift.
+    """
+    created: set[tuple[str, str]] = set()
+    for path in paths[1:]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        upgrade_node = _upgrade_node(tree)
+        if upgrade_node is None:
+            continue
+        for node in ast.walk(upgrade_node):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "create_check_constraint"
+                and len(node.args) >= 2
+            ):
+                created.add((node.args[1].value, node.args[0].value))
+    return created
+
+
+def _later_created_indexes(paths: list[Path]) -> set[tuple[str, str]]:
+    """(table, index) pairs created by a non-initial upgrade().
+
+    Same rationale as :func:`_later_created_checks`: 0004 creates
+    ``uq_users_email_ci_key`` (a functional index the models declare, but
+    which did not exist in 0001), so it is dropped from both sides of the
+    0001 comparison.
+    """
+    created: set[tuple[str, str]] = set()
+    for path in paths[1:]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        upgrade_node = _upgrade_node(tree)
+        if upgrade_node is None:
+            continue
+        for node in ast.walk(upgrade_node):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "create_index"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                created.add((node.args[1].value, node.args[0].value))
+    return created
 
 
 def _combined_migration_schema(paths: list[Path]) -> dict[str, dict]:
@@ -549,8 +811,10 @@ def _combined_migration_schema(paths: list[Path]) -> dict[str, dict]:
                 combined[table] = spec
         # Constraint swaps apply to the accumulated schema in file order:
         # 0004 drops the date-of-birth check created by 0001, 0005 replaces
-        # the role vocabulary check created by 0001.
+        # the role vocabulary check created by 0001. Index drops apply the
+        # same way (0009 renames five indexes the models no longer declare).
         _apply_check_swaps(combined, path)
+        _apply_upgrade_index_drops(combined, path)
 
     # op.add_column calls add columns to a table created by an earlier
     # migration (e.g. users.password_hash in 0002).
@@ -560,7 +824,52 @@ def _combined_migration_schema(paths: list[Path]) -> dict[str, dict]:
             "checks": {}, "indexes": {},
         })
         combined[table]["columns"][column] = (type_text, nullable)
+
+    # op.create_foreign_key attaches a FK to a table added to (or altered
+    # by) an earlier migration — migration 0007's auth_events.actor_user_id
+    # is the first such case, and it must be compared with the model.
+    for table, name, columns, referred in _iter_created_foreign_keys(paths):
+        combined.setdefault(table, {
+            "columns": {}, "pk": (), "fks": {}, "uqs": {},
+            "checks": {}, "indexes": {},
+        })
+        combined[table]["fks"][name] = (columns, referred)
     return combined
+
+
+def _iter_created_foreign_keys(paths: list[Path]):
+    """Yield (table, constraint_name, columns, referred_table) per FK.
+
+    Only ``upgrade()`` is considered, mirroring the CHECK-swap handling
+    above (``downgrade()`` is never run by ``alembic upgrade head``).
+    """
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        upgrade_node = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "upgrade"
+            ),
+            None,
+        )
+        if upgrade_node is None:
+            continue
+        for node in ast.walk(upgrade_node):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "create_foreign_key"
+                and len(node.args) >= 5
+            ):
+                name = node.args[0].value
+                table = node.args[1].value
+                # Signature: (name, source_table, referent_table,
+                # local_cols, remote_cols, ...) — the referred table is the
+                # third argument, and models compare by table name.
+                referred = (node.args[2].value,)
+                columns = tuple(item.value for item in node.args[3].elts)
+                yield table, name, columns, referred
 
 
 def _iter_add_columns(paths: list[Path]):
@@ -642,11 +951,7 @@ def structural_checks() -> bool:
 
     # --- migrations -----------------------------------------------------------
     migration_files = _migration_files()
-    revisions: list[str] = []
-    for path in migration_files:
-        for node in ast.parse(path.read_text(encoding="utf-8")).body:
-            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "revision":
-                revisions.append(ast.literal_eval(node.value))
+    revisions = _declared_revisions(migration_files)
     print(f"migration files: {[p.name for p in migration_files]}")
     # The chain's head must be the expected revision; duplicates are
     # reported (a later live-check guard also validates the chain).
@@ -684,6 +989,18 @@ def structural_checks() -> bool:
                 initial_expected[table]["checks"].pop(name, None)
             if table in initial:
                 initial[table]["checks"].pop(name, None)
+        # ...and checks/indexes a later migration *adds* exist only in the
+        # models, never in 0001 — remove them from both sides too.
+        for table, name in _later_created_checks(migration_files):
+            if table in initial_expected:
+                initial_expected[table]["checks"].pop(name, None)
+            if table in initial:
+                initial[table]["checks"].pop(name, None)
+        for table, name in _later_created_indexes(migration_files):
+            if table in initial_expected:
+                initial_expected[table]["indexes"].pop(name, None)
+            if table in initial:
+                initial[table]["indexes"].pop(name, None)
         ok = _report_problems(
             "model <-> initial migration drift (0001)",
             diff_schemas(initial_expected, initial, "models", "migration 0001"),
@@ -799,11 +1116,7 @@ def live_checks(db_url: str, header: str = "2. LIVE CHECKS (PostgreSQL, read-onl
 
     # Every declared migration must form a single linear chain ending at the
     # expected head (guards against accidentally edited history).
-    declared: list[str] = []
-    for path in _migration_files():
-        for node in ast.parse(path.read_text(encoding="utf-8")).body:
-            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "revision":
-                declared.append(ast.literal_eval(node.value))
+    declared = _declared_revisions(_migration_files())
     if sorted(declared) != sorted(set(declared)):
         ok = False
         print(f"  PROBLEM: duplicate migration revisions {sorted(declared)}")
@@ -889,12 +1202,12 @@ def rebuild_schema(db_url: str) -> bool:
             print(f"REFUSED: {rows} application row(s) exist — refusing to drop data.")
             engine.dispose()
             return False
-        print("target database contains no application data (0 rows in all 16 tables)")
+        print("target database contains no application data (0 rows in all 22 tables)")
 
     alembic_cfg = Config(str(BACKEND_DIR / "alembic.ini"))
     alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
 
-    print("'alembic downgrade base': dropping the 16 registration tables...")
+    print("'alembic downgrade base': dropping the 22 registration tables...")
     command.downgrade(alembic_cfg, "base")
     remaining = set(inspect(engine).get_table_names()) & EXPECTED_TABLES
     print(f"  registration tables remaining after downgrade: {len(remaining)}")
@@ -903,7 +1216,7 @@ def rebuild_schema(db_url: str) -> bool:
     command.upgrade(alembic_cfg, "head")
     recreated = set(inspect(engine).get_table_names())
     recreated_ok = (EXPECTED_TABLES & recreated) == EXPECTED_TABLES
-    print(f"  all 16 tables recreated: {recreated_ok}")
+    print(f"  all 22 tables recreated: {recreated_ok}")
 
     engine.dispose()
     ok = not remaining and recreated_ok

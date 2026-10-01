@@ -40,6 +40,7 @@ from app.core.auth_dependencies import (
     get_current_student,
     require_admin,
 )
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.student import Student
@@ -52,7 +53,9 @@ from app.schemas.registration import (
     RegistrationReadiness,
 )
 from app.services import registration_service
-from app.services.registration_service import RegistrationError
+from app.services.registration_service import RegistrationError, RegistrationNotFoundError
+
+_settings = get_settings()
 
 # Public readiness report — the only endpoint left on /registrations.
 router = APIRouter(prefix="/registrations", tags=["registrations"])
@@ -82,12 +85,21 @@ def _http_error(exc: RegistrationError) -> HTTPException:
         "pre-login by the portal); creates nothing."
     ),
 )
-@limiter.limit("30/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
 def read_registration_readiness(
     request: Request,
     session: Session = Depends(get_db),
 ) -> RegistrationReadiness:
-    return RegistrationReadiness(**registration_service.registration_readiness(session))
+    try:
+        return RegistrationReadiness(
+            **registration_service.registration_readiness(session)
+        )
+    except registration_service.RegistrationError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 # --- student self-service ------------------------------------------------------------
@@ -120,7 +132,7 @@ def read_registration_readiness(
         503: {"description": "Registration not possible right now (closed/archived year, missing TVET profile)"},
     },
 )
-@limiter.limit("10/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_WRITE)
 def create_my_registration(
     request: Request,
     payload: RegistrationCreateSelf,
@@ -158,7 +170,7 @@ def create_my_registration(
         403: {"description": "Authenticated but not a student account"},
     },
 )
-@limiter.limit("30/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
 def list_my_registrations(
     request: Request,
     session: Session = Depends(get_db),
@@ -176,18 +188,18 @@ def list_my_registrations(
     summary="Retrieve one of your registrations",
     description=(
         "Full registration summary for one of YOUR enrollment ids "
-        "(identity from the Bearer token). Another student's enrollment "
-        "id is a 403 — the UUID is an identifier, not authorization. "
-        "Administrators read any enrollment via "
+        "(identity from the Bearer token). An enrollment that exists but "
+        "belongs to another student returns the SAME 404 as an unknown id "
+        "(L6 existence leak): a foreign UUID must not be distinguishable "
+        "from a non-existent one. Administrators read any enrollment via "
         "GET /admin/registrations/{enrollment_id}."
     ),
     responses={
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Not the enrollment owner"},
-        404: {"description": "Unknown enrollment id"},
+        404: {"description": "Unknown enrollment id, or not one of yours"},
     },
 )
-@limiter.limit("30/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
 def read_my_registration(
     request: Request,
     enrollment_id: uuid.UUID,
@@ -199,9 +211,11 @@ def read_my_registration(
     except RegistrationError as exc:
         raise _http_error(exc) from exc
     if registration.student_id != student.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="you may only access your own registration data",
+        # Not owned: answer with the exact error the unknown-id path raises,
+        # so status, detail and echo of the id are byte-identical and no
+        # observer can probe for the existence of another student's row.
+        raise _http_error(
+            RegistrationNotFoundError(f"no enrollment with id {enrollment_id}")
         )
     return registration
 
@@ -234,7 +248,7 @@ def read_my_registration(
         503: {"description": "Registration not possible right now (closed/archived year, missing TVET profile)"},
     },
 )
-@limiter.limit("10/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_WRITE)
 def create_registration_for_student(
     request: Request,
     payload: RegistrationCreateAdmin,
@@ -267,7 +281,7 @@ def create_registration_for_student(
         404: {"description": "Unknown enrollment id"},
     },
 )
-@limiter.limit("30/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
 def read_registration(
     request: Request,
     enrollment_id: uuid.UUID,
@@ -295,7 +309,7 @@ def read_registration(
         404: {"description": "Unknown student id"},
     },
 )
-@limiter.limit("30/minute")
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
 def list_registrations_for_student(
     request: Request,
     student_id: uuid.UUID,
