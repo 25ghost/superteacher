@@ -274,7 +274,14 @@ def read_auth_me(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ) -> AuthUserRead:
-    return auth_service.identity_for_user(session, user)
+    try:
+        return auth_service.identity_for_user(session, user)
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 @me_router.get(
@@ -295,7 +302,14 @@ def read_me(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ) -> AuthUserRead:
-    return auth_service.identity_for_user(session, user)
+    try:
+        return auth_service.identity_for_user(session, user)
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 @student_me_router.get(
@@ -316,8 +330,15 @@ def read_me_student(
     student: Student = Depends(get_current_student),
     session: Session = Depends(get_db),
 ) -> StudentProfileRead:
-    user = session.get(User, student.user_id)
-    return read_profile(user, student)
+    try:
+        user = session.get(User, student.user_id)
+        return read_profile(user, student)
+    except student_service.ProfileError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 @student_me_router.post(
@@ -611,7 +632,11 @@ def read_me_teacher(
     try:
         return teacher_service.read_teacher_profile(session, user)
     except auth_service.AuthError as exc:
+        session.rollback()
         raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 @teacher_me_router.patch(
