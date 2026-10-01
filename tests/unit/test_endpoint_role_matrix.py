@@ -90,6 +90,7 @@ ANY_ROLE_ROUTES: list[tuple[str, str, dict | None]] = [
 
 PUBLIC_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/health", None),
+    ("GET", "/api/v1/health/ready", None),
     ("POST", "/api/v1/auth/register", {}),
     ("POST", "/api/v1/auth/login", {}),
     ("POST", "/api/v1/auth/refresh", {}),
