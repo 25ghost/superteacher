@@ -16,8 +16,9 @@ and other applications are not modified by this backend.
 Serves the SuperTeacher backend as a whole. Current module: the Student
 Registration Portal — student accounts, schools, education levels and
 pathways (O-Level, A-Level, TVET), programs and their versions, subjects,
-and enrollment. Future modules (authentication, tutoring, etc.) will live
-in the same backend.
+and enrollment. Authentication is implemented in this backend (registration,
+login, refresh sessions, invitations, password recovery, deactivation, audit
+trail); future modules (tutoring, etc.) will live in the same backend.
 
 ## Current technology stack
 
@@ -108,9 +109,13 @@ route serves both a student and an administrator:
   so registering "as someone else" is not even expressible
   (`POST /me/registrations` has no `student_id` field — supplying one is
   422);
-- **Administration** (`/admin/students`, `/admin/registrations`) —
-  `role=admin` only (reusable `require_admin` guard; cross-role calls are
-  403 before any handler runs).
+- **Teacher Self-Service** (`/me/teacher`) — `role=teacher` only; the
+  profile body is `extra="forbid"`, so `role`, `status` and `school_id`
+  cannot be smuggled in (422), and the identity comes from the token;
+- **Administration** (`/admin/students`, `/admin/registrations`,
+  `/admin/teachers`, `/admin/users`) — `role=admin` only (reusable
+  `require_admin` guard; cross-role calls are 403 before any handler
+  runs).
 
 A student's data access is token-derived: `GET /me/registrations`
 returns only the caller's own rows, and another student's enrollment id
@@ -122,29 +127,38 @@ self-service remedy (`POST /api/v1/me/student`) — never an implicit
 profile creation.
 
 Role authorization is reusable infrastructure (`require_student`,
-`require_teacher`, `require_admin`); all three paths are implemented.
+`require_teacher`, `require_admin`); all three guards now protect real
+routes, and the cross-role matrix test drives every protected endpoint
+with all four principals (anonymous / student / teacher / admin).
 
 ### Error contract
 
 `401` missing/invalid/expired credentials (generic detail, no JWT
-internals) · `403` wrong role for the namespace (`require_admin` answers
-with `"administrator role required for this operation"`; student-only
-routes refuse non-students), wrong
+internals — a lockout answers exactly like a wrong password) · `403`
+wrong role for the namespace (`require_admin` and `require_teacher`
+answer with `"administrator role required for this operation"` /
+`"teacher role required for this operation"`; student-only routes refuse
+non-students), wrong
 object ownership on `/me/*`, or a missing student profile · `404` unknown
 id for an authorized caller (an application-wide exception handler maps
 `ProfileError` statuses, so an unknown student id is a clean 404 on
 admin read **and** PATCH, never a 500 — students get 403 from the role
-guard first) · `409` duplicate account/enrollment · `422` invalid request
-(including implausible dates of birth, spoofed/unknown body keys and
-failed name/phone/country validation) · `503` catalog/year unavailability.
+guard first) · `409` duplicate account/enrollment, an invalid status
+transition, or unlocking an account that is not locked · `422` invalid
+request (including implausible dates of birth, spoofed/unknown body keys
+and failed name/phone/country validation) · `429` rate limit exceeded ·
+`503` catalog/year unavailability.
 
 ### Configuration (authentication)
 
 ```
 SECRET_KEY=<generated secret>            # REQUIRED in production; placeholder refused
 ACCESS_TOKEN_EXPIRE_MINUTES=30
-REFRESH_TOKEN_EXPIRE_DAYS=30
+REFRESH_TOKEN_EXPIRE_DAYS=14
 PASSWORD_MIN_LENGTH=8
+LOGIN_LOCKOUT_THRESHOLD=5               # refused attempts before a lock
+LOGIN_LOCKOUT_MINUTES=15                # lock duration
+RATE_LIMIT_HEALTH=120/minute            # liveness probe throttle
 ```
 
 ### Password recovery
@@ -160,23 +174,69 @@ never disclosed. `POST /api/v1/auth/reset-password` consumes the token
 audit event). Signed-in users change their password via
 `POST /api/v1/me/change-password`.
 
-## Current endpoints (Phases 5B–5G, role-split)
+### Teacher invitation (onboarding)
+
+`POST /api/v1/admin/teachers` creates a `pending` account (role fixed to
+`teacher`, no password) plus its `teachers` profile row and emails a
+single-use invitation link (`{FRONTEND_URL}/accept-invite?token=...`,
+valid 72 hours; only the SHA-256 digest is stored, the raw token exists
+only in the email). A `pending` account cannot log in.
+
+`POST /api/v1/auth/accept-invite` consumes the token: it sets the
+password (policy enforced), activates the account (`pending` →
+`active`), revokes any stale sessions and returns a token pair, so the
+invitee is logged in immediately. Invalid, expired or already-used
+tokens → 401; a policy-violating password → 422 with the account left
+pending. Administrators can rotate the link
+(`POST /admin/teachers/{user_id}/invite`), activate
+(`…/activate`) or suspend (`…/deactivate`, revoking sessions) directly.
+No public endpoint ever grants the `teacher` or `admin` role: teachers
+are created by administrators (or by the `admin` CLI bootstrap below),
+and the only role-choosing route is the admin-only
+`PATCH /admin/users/{user_id}/role`.
+
+### Login lockout (slice 7)
+
+The 5th refused login attempt (`LOGIN_LOCKOUT_THRESHOLD`) locks the
+account for 15 minutes (`LOGIN_LOCKOUT_MINUTES`). While locked — even
+with the correct password — the answer is the same generic
+`401 invalid email or password`; the response never discloses the lock,
+and a correct guess cannot reset the counter. The budget is cleared by a
+successful login, by an elapsed window, or by an administrator
+(`POST /api/v1/admin/users/{user_id}/unlock`, 409 when the account is
+not locked). Only wrong passwords on authenticatable accounts count; each
+lock and unlock writes an audit event.
+
+### Audit trail (`auth_events`)
+
+`login`, `login_failed`, `login_locked`, `logout`, `token_refresh`,
+`password_change`, `password_reset`, `invite_accepted`,
+`account_deactivated` and every administrative mutation
+(`teacher_created`, `teacher_invite_sent`, `teacher_activated`,
+`teacher_deactivated`, `user_role_changed`, `user_unlocked`) write an
+`auth_events` row: the subject (`user_id`), the acting administrator
+(`actor_user_id`) when that is someone else, and — on login and logout —
+the caller's `ip_address` and `user_agent` (truncated to the column
+widths). Tokens and passwords are never stored in the trail.
+
+## Current endpoints (Phases 5B–5G + Phase B, role-split)
 
 ```
 # --- public (no token) ---------------------------------------------------------
-GET    /api/v1/health
-POST   /api/v1/auth/register                     (student account + tokens)
-POST   /api/v1/auth/login
-POST   /api/v1/auth/refresh                      (refresh token required)
-POST   /api/v1/auth/forgot-password              (204 always)
-POST   /api/v1/auth/reset-password               (reset token)
+GET    /api/v1/health                                (rate-limited: RATE_LIMIT_HEALTH)
+POST   /api/v1/auth/register                         (student account + tokens)
+POST   /api/v1/auth/login                            (lockout: 5 refused attempts)
+POST   /api/v1/auth/refresh                          (refresh token required)
+POST   /api/v1/auth/forgot-password                  (204 always)
+POST   /api/v1/auth/reset-password                   (reset token)
+POST   /api/v1/auth/accept-invite                    (teacher invite token → active + tokens)
 GET    /api/v1/registrations/readiness
 GET    /api/v1/catalog/academic-years|pathways|education-levels|subjects
 GET    /api/v1/catalog/programs|program-versions|tvet/sectors|tvet/programs
 GET    /api/v1/catalog/schools | /catalog/schools/{school_code}/programs
 
 # --- self-service (any role, Bearer) ------------------------------------------
-POST   /api/v1/auth/logout                       (Bearer + refresh token)
+POST   /api/v1/auth/logout                       (Bearer + refresh token; audited)
 GET    /api/v1/me
 GET    /api/v1/auth/me                           (identity: id, role, student link)
 POST   /api/v1/me/change-password
@@ -190,6 +250,10 @@ GET    /api/v1/me/registrations
 POST   /api/v1/me/registrations                  (no student_id field — 422 if sent)
 GET    /api/v1/me/registrations/{enrollment_id}  (owner only, else 403)
 
+# --- teacher self-service (Bearer, role=teacher) ------------------------------
+GET    /api/v1/me/teacher                        (own profile; 404 when none exists)
+PATCH  /api/v1/me/teacher                        (full_name|phone|subject; extra=forbid)
+
 # --- administration (Bearer, role=admin) --------------------------------------
 POST   /api/v1/admin/students                    (create profile pair)
 GET    /api/v1/admin/students/{student_id}
@@ -198,6 +262,13 @@ GET    /api/v1/admin/students/{student_id}/history (paginated audit trail)
 POST   /api/v1/admin/registrations               (student_id REQUIRED)
 GET    /api/v1/admin/registrations/{enrollment_id}
 GET    /api/v1/admin/students/{student_id}/registrations
+POST   /api/v1/admin/teachers                    (pending account + invitation email)
+GET    /api/v1/admin/teachers                    (paginated)
+POST   /api/v1/admin/teachers/{user_id}/invite   (rotates the token)
+POST   /api/v1/admin/teachers/{user_id}/activate
+POST   /api/v1/admin/teachers/{user_id}/deactivate
+PATCH  /api/v1/admin/users/{user_id}/role        (sole role-choosing route; self → 403)
+POST   /api/v1/admin/users/{user_id}/unlock      (clear a lockout; 409 when not locked)
 ```
 
 **Migration note (role split).** The former dual-role routes were
@@ -208,12 +279,18 @@ removed, not aliased: `GET/PATCH /students/{id}` (split into
 `/admin/registrations/{id}`) and `GET /students/{id}/registrations`
 (replaced by `/me/registrations` for the owner and
 `/admin/students/{id}/registrations` for administrators). Swagger groups
-the namespaces under the tags *Self-Service*, *Student Self-Service* and
-*Administration*.
+the namespaces under the tags *Self-Service*, *Student Self-Service*,
+*Teacher Self-Service* and *Administration*.
 
-`GET /health` needs no database. Catalog endpoints are read-only and
+`GET /health` needs no database (and is rate-limited so a probe storm
+cannot pin the event loop). Catalog endpoints are read-only and
 public. Interactive documentation: `/docs` (Swagger UI, with the Bearer
 scheme available under "Authorize") and `/redoc`.
+
+Every protected route in the matrix is pinned by
+`tests/unit/test_endpoint_role_matrix.py`: anonymous → 401 everywhere,
+wrong-role callers → 403 from the guard before the handler runs, and
+each role can reach exactly its own namespace.
 
 ### Student profile rules (validation, PATCH semantics, audit)
 
@@ -352,20 +429,28 @@ back every transaction it opens. The development database
 PostgreSQL database: **`super_teacher_db`** (configured via the `DB_*`
 variables in `.env`; nothing is hard-coded).
 
-The schema (19 tables) is created by Alembic migrations
+The schema (22 tables) is created by Alembic migrations
 `0001_initial_schema.py` (the whole-system foundation),
 `0002_authentication.py` (`users.password_hash` + `auth_sessions`),
 `0003_password_reset_and_audit.py`
-(`password_reset_tokens` + `student_profile_history`),
-`0004_student_profile_hardening.py` (validation backstops — see below) and
-`0005_role_vocabulary.py` (the three-role vocabulary — see below):
+(`password_reset_tokens`, `auth_events` + `student_profile_history`),
+`0004_student_profile_hardening.py` (validation backstops — see below),
+`0005_role_vocabulary.py` (the three-role vocabulary — see below),
+`0006_teachers_and_pending_status.py` (the `teachers` profile table and
+the `pending` account status), `0007_invite_tokens_and_audit_actor.py`
+(`invite_tokens` + `auth_events.actor_user_id`) and
+`0008_users_lockout_columns.py` (`users.failed_login_count` +
+`users.locked_until`):
 
-`users` (with `password_hash`), `students`, `academic_years`, `pathways`,
+`users` (with `password_hash`, `failed_login_count`, `locked_until`),
+`students`, `teachers`, `academic_years`, `pathways`,
 `education_levels`, `pathway_levels`, `schools`, `programs`,
 `program_versions`, `subjects`, `program_subjects`, `tvet_sectors`,
 `tvet_programs`, `school_programs`, `student_enrollments`,
 `student_subjects`, `auth_sessions` (revocable refresh sessions),
-`password_reset_tokens`, `student_profile_history` (profile audit trail)
+`password_reset_tokens`, `invite_tokens` (single-use teacher
+invitations), `auth_events` (authentication audit trail),
+`student_profile_history` (profile audit trail)
 
 Migration `0004` (student-profile hardening) additionally:
 
@@ -388,6 +473,18 @@ Migration `0005` (role vocabulary) additionally:
 - drops and recreates `users_role_check` for exactly
   `('student', 'teacher', 'admin')`.
 
+Phase B migrations additionally:
+
+- `0006` adds the `teachers` profile table (one row per teacher account,
+  `user_id` UNIQUE) and extends `users_status_check` with `pending`
+  (downgrade disables pending accounts first);
+- `0007` adds `invite_tokens` (SHA-256 digests only, user cascade, expiry
+  and usage columns) and `auth_events.actor_user_id` (the acting
+  administrator, `ON DELETE SET NULL`);
+- `0008` adds the lockout bookkeeping `users.failed_login_count`
+  (NOT NULL, zero default) and `users.locked_until` (nullable,
+  timezone-aware).
+
 Highlights:
 
 - UUID primary keys (generated by the application), timezone-aware
@@ -408,15 +505,20 @@ Highlights:
 `app.models.enums.UserRole` and enforced by `users_role_check`:
 `student`, `teacher`, `admin`. Role authorization dependencies live in
 `app/core/auth_dependencies.py` (`require_student`, `require_teacher`,
-`require_admin`) and guard the role-split routes: `/me/*` self-service is
-student-only, administrative profile creation is admin-only, and
-teacher/admin guards are exercised by a test-only probe router. Teacher
-and admin accounts are provisioned by direct database seeding — there is
-no public endpoint that grants them.
+`require_admin`) and guard every role-split route: student self-service
+is student-only, `/me/teacher` is teacher-only, everything under
+`/admin` is administrator-only — cross-role calls are 403 before any
+handler runs, pinned route by route by
+`tests/unit/test_endpoint_role_matrix.py`. There is no public endpoint
+that grants `teacher` or `admin`: administrators bootstrap offline with
+`scripts/create_admin.py`, and teachers are created by an administrator
+(`POST /admin/teachers` → invitation email → `POST /auth/accept-invite`).
 
 **Status vocabulary.** Enrollment/account tables have their own lifecycles
 (`EnrollmentStatus`, `UserStatus`, `AcademicYearStatus`, `StudentSubjectStatus`).
-The reference/catalog tables — pathways, education_levels, programs,
+`UserStatus` is `active` | `suspended` | `disabled` | `pending`; only
+`active` passes the authentication status gate (`pending` = invited
+teacher awaiting `accept-invite`). The reference/catalog tables — pathways, education_levels, programs,
 program_versions, subjects, tvet_sectors, schools, school_programs — share the
 minimal `RecordStatus` vocabulary (`active`, `inactive`), enforced by a
 CHECK constraint on each table.
@@ -522,6 +624,25 @@ Expected response:
 
 You can also open the interactive API docs at `http://127.0.0.1:8000/docs`.
 
+### 5. Bootstrap the first administrator
+
+There is deliberately no HTTP endpoint that creates an administrator.
+Mint the first one from the CLI (it needs database access):
+
+```bash
+python scripts/create_admin.py --email admin@school.rw
+# non-interactive (no TTY, e.g. a server bootstrap):
+ADMIN_PASSWORD=... python scripts/create_admin.py --email admin@school.rw
+```
+
+The password is read from the terminal (confirmed twice) or from the
+`ADMIN_PASSWORD` environment variable — never echoed, never accepted as an
+argument — and checked against the shared password policy; an existing email
+is **refused**, never overwritten. In `ENVIRONMENT=production` the script
+refuses to run unless `--allow-production` is passed. The account is created
+active and an `admin_created` audit row is written alongside it. From then on
+administrators manage teachers through `POST /api/v1/admin/teachers`.
+
 ## Project layout
 
 ```
@@ -536,12 +657,14 @@ backend/
 │   │   └── time_mixin.py     created_at / updated_at columns
 │   ├── data/              shared reference datasets + validator + seed loader core
 │   ├── models/            SQLAlchemy models (one logical model per file)
-│   ├── schemas/           Pydantic schemas (later phase)
-│   ├── api/v1/            versioned router + endpoints/
-│   ├── services/          business logic (later phases)
-│   └── repositories/      data access (later phases)
-├── alembic/               migrations (env.py + versions/0001_initial_schema.py)
+│   ├── schemas/           Pydantic request/response schemas
+│   ├── api/v1/            versioned router + endpoints/ (public / student / teacher / admin)
+│   ├── services/          business logic (auth, profiles, registrations, admin)
+│   └── repositories/      data access (users, students, sessions, audit events)
+├── alembic/               migrations (env.py + versions/0001 … 0009)
 ├── scripts/
+│   ├── create_admin.py        offline administrator bootstrap (--email, password via TTY/ADMIN_PASSWORD)
+│   ├── cleanup_auth_sessions.py  auth-session retention cleanup (--dry-run supported)
 │   ├── seed_reference_data.py   idempotent reference-data seeder (--dry-run supported)
 │   └── verify_database.py       structural + live database verification
 ├── tests/                 unit/ (no DB) + integration/ (PostgreSQL test DB, opt-in)
