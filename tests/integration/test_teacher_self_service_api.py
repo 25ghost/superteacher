@@ -287,3 +287,38 @@ def test_me_teacher_serves_the_teacher(
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["subject"] == "Physics"
+
+
+def test_me_teacher_update_persists_across_sessions(
+    accounts, teacher_session: dict, api_client: TestClient
+) -> None:
+    """PATCH /me/teacher must COMMIT: a fresh session sees the new row.
+
+    The endpoint commits after the service flush, so the change outlives the
+    request-scoped session. Reading the row back through a separate
+    ``SessionLocal`` (its own pooled connection, outside the API's
+    transaction) proves the commit really happened — a handler that returns
+    without committing would still answer 200 (the response is built from the
+    in-session profile) while the database silently keeps the old value.
+    """
+    from app.core.database import SessionLocal
+    from app.models.teacher import Teacher
+
+    header = teacher_session["teacher_header"]
+    patched = api_client.patch(
+        "/api/v1/me/teacher", json={"subject": "Chemistry"}, headers=header
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["subject"] == "Chemistry"
+
+    fresh = SessionLocal(bind=accounts)
+    try:
+        profile = fresh.query(Teacher).filter(
+            Teacher.user_id == uuid.UUID(teacher_session["user_id"])
+        ).one()
+        assert profile.subject == "Chemistry", (
+            "PATCH /me/teacher returned 200 but never committed: "
+            f"fresh session still sees subject={profile.subject!r}"
+        )
+    finally:
+        fresh.close()

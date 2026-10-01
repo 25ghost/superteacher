@@ -668,8 +668,12 @@ def patch_me_teacher(
     user: User = Depends(require_teacher),
 ) -> TeacherMeRead:
     try:
-        return teacher_service.update_teacher_profile(session, user, payload)
+        updated = teacher_service.update_teacher_profile(session, user, payload)
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
     session.commit()
+    return updated
