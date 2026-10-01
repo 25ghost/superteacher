@@ -1,0 +1,64 @@
+# Local development stack: API + PostgreSQL.
+# Requires .env (cp .env.example .env); it supplies credentials and settings.
+#
+#   docker compose up --build
+#
+# Migrations/seeding/first admin are explicit steps, never automatic:
+#   docker compose exec api python -m alembic upgrade head
+#   docker compose exec api python scripts/seed_reference_data.py
+#   docker compose exec api python scripts/create_admin.py --email you@example.com
+#
+# FORWARDED_ALLOW_IPS: must be the REVERSE PROXY's address in production
+# (comma separated for several proxies). The 127.0.0.1 default is only
+# correct with no proxy in front of the container. If it is wrong behind a
+# proxy, uvicorn reports every request as originating from the proxy IP and
+# ALL users share a single rate-limit bucket.
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # On the compose network the database is the `db` service, not 127.0.0.1.
+      DB_HOST: db
+      # Set to your proxy's address when running behind one (see header note).
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  db:
+    image: postgres:16-alpine
+    # Same DB_USER/DB_PASSWORD/DB_NAME the API reads from .env.
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    # Host port 5433: a PostgreSQL already listening on the host's 5432
+    # (e.g. the local development database) must not be shadowed.
+    ports:
+      - "5433:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db-data:

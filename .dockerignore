@@ -1,0 +1,16 @@
+# VCS, local env and caches are never part of the image.
+.git
+.venv
+venv/
+.env
+
+# Python caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Tests run in CI, not inside the image.
+tests/
