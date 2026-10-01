@@ -38,4 +38,4 @@ EXPOSE 8000
 # default) keeps rate-limit counters per process, so extra workers would
 # multiply every configured limit. Shell form expands ${FORWARDED_ALLOW_IPS}
 # at container start.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips ${FORWARDED_ALLOW_IPS}"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips ${FORWARDED_ALLOW_IPS}"]
