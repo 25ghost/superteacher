@@ -322,3 +322,85 @@ def test_me_teacher_update_persists_across_sessions(
         )
     finally:
         fresh.close()
+
+
+def test_me_teacher_service_failure_returns_500_and_rolls_back(
+    accounts,
+    teacher_session: dict,
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-``AuthError`` from the service: generic 500, transaction rolled back.
+
+    ``auth.py`` looks the service up as an attribute on the imported
+    ``teacher_service`` module at call time, so the module attribute is the
+    patch point. The fake records that it ran, flushes a mutation (the UPDATE
+    now sits inside the open transaction) and then raises ``RuntimeError`` —
+    exercising the handler's generic ``except Exception`` branch. Asserted:
+
+    - the fake really executed (exactly once);
+    - ``Session.rollback()`` ran exactly once during the PATCH (spy wrapping
+      the real method — one request, one rollback);
+    - the response is the global handler's envelope only
+      (``500 {"detail": "Internal server error"}``), with the exception
+      message and traceback never leaked;
+    - a fresh session still sees the seeded subject: nothing persisted.
+    """
+    import sqlalchemy.orm
+
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.main import app
+    from app.models.teacher import Teacher
+    from app.services import teacher_service
+
+    fake_calls: list[object] = []
+
+    def _exploding_update(session, user, payload):
+        fake_calls.append(payload)
+        profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+        profile.subject = "MustNotPersist"
+        session.flush()
+        raise RuntimeError("simulated service failure that must never leak")
+
+    monkeypatch.setattr(teacher_service, "update_teacher_profile", _exploding_update)
+
+    original_rollback = sqlalchemy.orm.Session.rollback
+    rollback_calls = {"count": 0}
+
+    def _counting_rollback(self, *args, **kwargs):
+        rollback_calls["count"] += 1
+        return original_rollback(self, *args, **kwargs)
+
+    monkeypatch.setattr(sqlalchemy.orm.Session, "rollback", _counting_rollback)
+
+    header = teacher_session["teacher_header"]
+    client = TestClient(app, raise_server_exceptions=False)
+    before = rollback_calls["count"]
+    response = client.patch(
+        "/api/v1/me/teacher", json={"subject": "Chemistry"}, headers=header
+    )
+    rollbacks_during_patch = rollback_calls["count"] - before
+
+    assert len(fake_calls) == 1, "the patched teacher_service must have run"
+    assert response.status_code == 500, response.text
+    assert response.json() == {"detail": "Internal server error"}
+    assert "simulated service failure" not in response.text
+    assert "Traceback" not in response.text
+    assert rollbacks_during_patch == 1, (
+        "expected exactly one Session.rollback() during the PATCH, "
+        f"saw {rollbacks_during_patch}"
+    )
+
+    fresh = SessionLocal(bind=accounts)
+    try:
+        profile = fresh.query(Teacher).filter(
+            Teacher.user_id == uuid.UUID(teacher_session["user_id"])
+        ).one()
+        assert profile.subject == "Biology", (
+            "the flushed UPDATE survived the failure — transaction not "
+            f"rolled back: subject={profile.subject!r}"
+        )
+    finally:
+        fresh.close()
