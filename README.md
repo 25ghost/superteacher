@@ -643,6 +643,96 @@ refuses to run unless `--allow-production` is passed. The account is created
 active and an `admin_created` audit row is written alongside it. From then on
 administrators manage teachers through `POST /api/v1/admin/teachers`.
 
+## Deploy
+
+### Required configuration
+
+Settings are read from environment variables and/or a local `.env` file (see
+`.env.example`). For a production deployment:
+
+| Variable | Rule |
+| --- | --- |
+| `ENVIRONMENT` | Must be set explicitly to `production`. A missing or blank value refuses to start — the development default is never applied implicitly (`app/core/config.py:184`). |
+| `SECRET_KEY` | A real random secret of at least 32 characters. Placeholders (`change-me`, `secret`, …) and shorter keys are hard configuration errors outside development/testing (`app/core/config.py:150-164`). Generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
+| `DB_NAME`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | Production PostgreSQL. Alternatively set a single `DATABASE_URL`, which overrides all `DB_*` values (`app/core/config.py:226`). |
+| `CORS_ORIGINS` | Explicit, comma-separated origins (e.g. `https://portal.school.rw`). A `*` wildcard is refused and localhost origins are dropped in production, so CORS closes rather than trusting dev-machine origins (`app/core/config.py:217`). |
+| `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | Transactional email (invitations, password resets). |
+| `FRONTEND_URL` | Base URL that outgoing email links point to. |
+| `LOG_LEVEL` | `INFO` (default) or stricter. |
+| `FORWARDED_ALLOW_IPS` | **Must be your reverse proxy's address** (comma-separated when there are several). The `127.0.0.1` default is only correct when the API is reached directly with **no** proxy in front. With the wrong value behind a proxy, uvicorn reports every request as coming from the proxy, so all users share a single rate-limit bucket. |
+
+Startup is fail-fast: missing `ENVIRONMENT`, an unsafe or too-short
+`SECRET_KEY`, or unsafe CORS all refuse to boot before the first request
+(`app/main.py:57`).
+
+### Ordered bootstrap commands
+
+```bash
+# 1. apply all migrations
+python -m alembic upgrade head
+
+# 2. seed shared reference data (academic years, pathways, programs, …)
+python scripts/seed_reference_data.py
+
+# 3. mint the first administrator (there is no HTTP endpoint for this)
+python scripts/create_admin.py --email admin@school.rw
+```
+
+Existing guards, by design:
+
+- `seed_reference_data.py` **refuses to apply when `ENVIRONMENT=production`**
+  (`scripts/seed_reference_data.py:62`); `--dry-run` produces a read-only
+  report. Seed the database while preparing the release — before the app is
+  switched to `production` — or inspect with `--dry-run` afterwards.
+- `create_admin.py` requires `--allow-production` to run when
+  `ENVIRONMENT=production` (`scripts/create_admin.py:149`); the password is
+  read from the terminal or `ADMIN_PASSWORD`, never as an argument.
+
+### Run the API
+
+Exactly **one** worker: rate-limit counters live in process memory
+(`RATE_LIMIT_STORAGE_URI=memory://`, `app/core/config.py:110`), so every
+additional worker multiplies every configured limit. uvicorn's default is
+one worker — do not pass `--workers`.
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 \
+  --proxy-headers --forwarded-allow-ips "$FORWARDED_ALLOW_IPS"
+```
+
+### Health endpoints
+
+- `GET /api/v1/health` — liveness only, no database, rate-limited.
+- `GET /api/v1/health/ready` — readiness: `200 {"status": "ready"}` while
+  `SELECT 1` succeeds, generic `503` when the database is unreachable.
+  Point load balancers and orchestrator probes here; the route is
+  deliberately not rate-limited.
+
+### Docker
+
+```bash
+cp .env.example .env        # fill in real values; ENVIRONMENT=production
+docker compose up --build -d
+docker compose exec api python -m alembic upgrade head
+docker compose exec api python scripts/seed_reference_data.py
+docker compose exec api python scripts/create_admin.py --email admin@school.rw
+```
+
+`docker-compose.yml` sets `DB_HOST=db` (the compose service name) and
+publishes PostgreSQL on host port `5433` so it cannot clash with an existing
+local PostgreSQL on `5432`. Set `FORWARDED_ALLOW_IPS` in `.env` to your
+reverse proxy's address (see the table above). The image never runs
+migrations or seeding on start — those are the explicit steps above.
+
+### Production guards already built in
+
+- API docs (`/docs`, `/redoc`, `/openapi.json`) are disabled when
+  `ENVIRONMENT=production` (`app/main.py:69`).
+- The `Strict-Transport-Security` header is added only in production
+  (`app/main.py:161`).
+- Startup validation refuses insecure configuration before serving traffic
+  (`app/main.py:57`, rules above).
+
 ## Project layout
 
 ```
