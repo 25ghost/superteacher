@@ -33,6 +33,7 @@ from app.core.database import SessionLocal  # noqa: E402
 from app.data.loader import PROTECTED_TABLES, ValidationError, run_load  # noqa: E402
 from app.data.registry import load_registry  # noqa: E402
 from app.data.validation import validate_datasets  # noqa: E402
+from scripts.apply_guard import production_apply_refusal  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,15 +58,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Database: {settings.DB_NAME} on {settings.DB_HOST}:{settings.DB_PORT}")
 
     # Production safety: refuse APPLY in production. Dry-run remains
-    # available for read-only inspection. This guard uses the existing
-    # configuration system — no hard-coded environment detection.
-    if settings.ENVIRONMENT.lower() == "production" and not args.dry_run:
-        print(
-            "\nREFUSED: production APPLY is not permitted. "
-            "Use --dry-run for read-only inspection, or run in "
-            "development/testing environment."
-        )
-        return 1
+    # available for read-only inspection. The predicate and the wording
+    # live in scripts/apply_guard.py, shared with load_catalog.py.
+    if not args.dry_run:
+        refusal = production_apply_refusal(settings.ENVIRONMENT)
+        if refusal:
+            print("\n" + refusal)
+            return 1
 
     datasets = load_registry()
 
