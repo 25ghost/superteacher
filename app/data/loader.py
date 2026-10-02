@@ -14,8 +14,16 @@ Design contract (Phases 3C / 4A):
   enrollment data belongs to the registration module, never to the seeder.
 - program_versions identity is the four-column offering tuple; the
   ``code`` column is a label, never identity.
-- One transaction per dataset; a failing dataset aborts its own transaction
-  and stops the run before later datasets are attempted.
+- Default: one transaction per dataset; a failing dataset aborts its own
+  transaction and stops the run before later datasets are attempted.
+- ``single_transaction=True``: flush-only for the whole run — this module
+  never commits; the caller owns the single ``commit()``/``rollback()``
+  (the same explicit transaction exception scripts/create_admin.py and
+  scripts/load_catalog.py document). A record-level failure is re-raised
+  instead of downgraded to a warning, because the session may open a fresh
+  transaction after the failed flush and continue — which would let a
+  partially-loaded catalog commit. Propagation makes the caller roll the
+  whole run back.
 - ``dry_run`` issues SELECTs only — zero INSERT/UPDATE/DELETE statements.
 
 Datasets are intentionally EMPTY in Phase 4A: this is the foundation the
@@ -174,8 +182,16 @@ def load_dataset(
     dataset: Dataset,
     datasets_by_name: dict[str, Dataset],
     dry_run: bool = False,
+    *,
+    fail_fast: bool = False,
 ) -> LoadReport:
-    """Load one dataset idempotently inside the caller's transaction."""
+    """Load one dataset idempotently inside the caller's transaction.
+
+    With ``fail_fast=True`` a record-level failure is re-raised instead of
+    being downgraded to a report warning — used by the single-transaction
+    mode of :func:`run_load`, where swallowing the error could commit a
+    partially-loaded catalog.
+    """
     spec = dataset.spec
     report = LoadReport(dataset=spec.name, table=spec.table, records=len(dataset.records))
 
@@ -260,6 +276,8 @@ def load_dataset(
             else:
                 report.unchanged += 1
         except Exception as exc:
+            if fail_fast:
+                raise
             report.warnings.append(f"{label}: {exc}")
 
     return report
@@ -269,13 +287,24 @@ def run_load(
     session: Session,
     datasets: Iterable[Dataset],
     dry_run: bool = False,
+    *,
+    single_transaction: bool = False,
 ) -> list[LoadReport]:
-    """Load every dataset in declared order, one transaction per dataset.
+    """Load every dataset in declared order.
 
     Structural validation is a hard pre-write gate: any problem raises
-    :class:`ValidationError` before the first database statement. A dataset
-    whose transaction fails aborts its own transaction and stops the run;
-    later datasets are reported as ``skipped`` rather than silently omitted.
+    :class:`ValidationError` before the first database statement.
+
+    Default (``single_transaction=False``): one transaction per dataset.
+    A dataset whose transaction fails aborts its own transaction and stops
+    the run; later datasets are reported as ``skipped`` rather than
+    silently omitted.
+
+    ``single_transaction=True``: flush-only for the entire run — no
+    ``commit()`` here. The caller owns the single commit (or rollback) of
+    the whole run; a record-level failure propagates so the caller can
+    roll everything back. See the module docstring for why the failure
+    must not be downgraded to a warning in this mode.
     """
     from app.data.validation import validate_datasets
 
@@ -295,6 +324,19 @@ def run_load(
                 records=len(dataset.records),
             )
             report.skipped = True
+            reports.append(report)
+            continue
+        if single_transaction:
+            # Flush-only inside the caller's transaction; any failure must
+            # abort the whole run (fail_fast) so a partial catalog can
+            # never reach a commit.
+            report = load_dataset(
+                session,
+                dataset,
+                datasets_by_name,
+                dry_run=dry_run,
+                fail_fast=True,
+            )
             reports.append(report)
             continue
         try:

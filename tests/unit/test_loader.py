@@ -102,3 +102,118 @@ def test_verify_policy_reports_drift_without_mutating(monkeypatch) -> None:
     assert report.updated == 0
     assert report.unchanged == 1
     assert any("not rewritten" in w for w in report.warnings)
+
+
+# --- single-transaction mode (flush-only, caller owns the commit) -------------
+
+
+def _registry_with(records_by_name: dict[str, list[dict]]) -> list[Dataset]:
+    """Full 12-dataset registry with explicit (default: empty) records."""
+    return [
+        Dataset(dataset.spec, list(records_by_name.get(dataset.name, ())))
+        for dataset in load_registry()
+    ]
+
+
+def _sqlite_session():
+    from sqlalchemy.orm import Session
+
+    from app.core.database import Base
+    import app.models  # noqa: F401  (registers every table)
+
+    engine = create_engine("sqlite+pysqlite://")
+    Base.metadata.create_all(engine)
+    return Session(bind=engine), engine
+
+
+def _count(session, model) -> int:
+    from sqlalchemy import func, select
+
+    return session.execute(select(func.count()).select_from(model)).scalar_one()
+
+
+def test_single_transaction_flushes_but_never_commits() -> None:
+    """The engine is flush-only in this mode: a rollback discards the run."""
+    from app.models.pathway import Pathway
+
+    session, engine = _sqlite_session()
+    try:
+        datasets = _registry_with({"pathways": [{"code": "P1", "name": "Path 1"}]})
+        reports = run_load(session, datasets, single_transaction=True)
+        assert sum(r.writes for r in reports) == 1
+        # Flushed: visible inside the caller's still-open transaction...
+        assert _count(session, Pathway) == 1
+        # ...but never committed: the caller's rollback erases everything.
+        session.rollback()
+        assert _count(session, Pathway) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_single_transaction_failure_propagates_and_rolls_back_everything() -> None:
+    """A record-level failure aborts the WHOLE run, not just its dataset.
+
+    The bad row (invalid ``status`` — passes structural validation, fails
+    the DB CHECK) sits in dataset 4; the valid ``pathways`` insert from
+    dataset 2 must be rolled back with it.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.models.education_level import EducationLevel
+    from app.models.pathway import Pathway
+
+    session, engine = _sqlite_session()
+    try:
+        datasets = _registry_with({
+            "pathways": [{"code": "P1", "name": "Path 1"}],
+            "education_levels": [
+                {"code": "L1", "name": "Level 1", "level_number": 1, "status": "bogus"},
+            ],
+        })
+        with pytest.raises(IntegrityError):
+            run_load(session, datasets, single_transaction=True)
+        session.rollback()
+        assert _count(session, Pathway) == 0
+        assert _count(session, EducationLevel) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_default_mode_still_downgrades_record_errors_to_warnings() -> None:
+    """Default behavior unchanged: no raise, error becomes a warning."""
+    from app.models.education_level import EducationLevel
+    from app.models.pathway import Pathway
+
+    session, engine = _sqlite_session()
+    try:
+        datasets = _registry_with({
+            "pathways": [{"code": "P1", "name": "Path 1"}],
+            "education_levels": [
+                {"code": "L1", "name": "Level 1", "level_number": 1, "status": "bogus"},
+            ],
+        })
+        reports = run_load(session, datasets)  # default mode — must not raise
+        by_name = {report.dataset: report for report in reports}
+        assert by_name["pathways"].inserted == 1
+        assert by_name["education_levels"].inserted == 0
+        assert by_name["education_levels"].warnings, "record error must be reported"
+        assert _count(session, EducationLevel) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_single_transaction_dry_run_writes_nothing() -> None:
+    from app.models.pathway import Pathway
+
+    session, engine = _sqlite_session()
+    try:
+        datasets = _registry_with({"pathways": [{"code": "P1", "name": "Path 1"}]})
+        reports = run_load(session, datasets, dry_run=True, single_transaction=True)
+        assert sum(r.writes for r in reports) == 1  # projected...
+        assert _count(session, Pathway) == 0  # ...but zero rows
+    finally:
+        session.close()
+        engine.dispose()
