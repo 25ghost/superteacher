@@ -70,8 +70,13 @@ def _load_teacher_user(session: Session, user_id: uuid.UUID) -> User:
     return user
 
 
-def _read_teacher(session: Session, user: User) -> TeacherRead:
-    profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+def _build_teacher_read(user: User, profile: Teacher | None) -> TeacherRead:
+    """Map an account + its profile row onto ``TeacherRead``.
+
+    The profile is mandatory data — the API always creates both rows
+    together — so its absence means the rows were edited outside the
+    API, exactly like the single-row read has always treated it.
+    """
     if profile is None:  # pragma: no cover - only reachable on hand-edited data
         raise AuthNotFoundError("teacher profile not found")
     return TeacherRead(
@@ -87,6 +92,11 @@ def _read_teacher(session: Session, user: User) -> TeacherRead:
         created_at=user.created_at,
         updated_at=user.updated_at,
     )
+
+
+def _read_teacher(session: Session, user: User) -> TeacherRead:
+    profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+    return _build_teacher_read(user, profile)
 
 
 def _read_user(user: User) -> AdminUserRead:
@@ -207,15 +217,24 @@ def create_teacher(
 def list_teachers(
     session: Session, *, limit: int = 50, offset: int = 0
 ) -> list[TeacherRead]:
-    """All teacher accounts, newest first (administrative read)."""
-    users = session.scalars(
-        select(User)
+    """All teacher accounts, newest first (administrative read).
+
+    One joined statement fetches account and profile together — the
+    per-row profile lookup of :func:`_read_teacher` used to cost one
+    extra query per teacher, so the list grew linearly. The
+    ``outerjoin`` preserves the single-row contract: a teacher account
+    whose profile row is missing (hand-edited data) is an error, never
+    a silently skipped row.
+    """
+    rows = session.execute(
+        select(User, Teacher)
+        .outerjoin(Teacher, Teacher.user_id == User.id)
         .where(User.role == UserRole.TEACHER.value)
         .order_by(User.created_at.desc(), User.id)
         .limit(limit)
         .offset(offset)
     ).all()
-    return [_read_teacher(session, user) for user in users]
+    return [_build_teacher_read(user, profile) for user, profile in rows]
 
 
 # --- invite / activate / deactivate --------------------------------------------------

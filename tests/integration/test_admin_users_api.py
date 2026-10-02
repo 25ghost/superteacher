@@ -188,6 +188,98 @@ def test_pending_teacher_cannot_log_in(accounts, api_client: TestClient) -> None
     assert response.status_code == 401, response.text
 
 
+# --- teacher list (one joined query, no N+1) ----------------------------------------------
+
+
+def _seed_teachers(engine, count: int) -> None:
+    """Direct ORM teacher accounts + profiles (no invitation emails)."""
+    from app.core.database import SessionLocal
+    from app.models.teacher import Teacher
+    from app.models.user import User
+
+    session = SessionLocal(bind=engine)
+    try:
+        for index in range(count):
+            user = User(
+                email=f"list-{uuid.uuid4().hex[:8]}@test.example",
+                role="teacher",
+                status="active",
+                password_hash=None,
+            )
+            session.add(user)
+            session.flush()
+            session.add(Teacher(user_id=user.id, full_name=f"List Teacher {index}"))
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_teacher_list_query_count_constant_and_profile_complete(
+    accounts, api_client: TestClient
+) -> None:
+    """Account and profile come from ONE joined statement.
+
+    The list used to look up each teacher's profile row separately, so
+    its statement count grew with its size (N+1); both run lengths must
+    now cost exactly the same, and no statement may take the per-row
+    ``FROM teachers WHERE teachers.user_id`` shape.
+    """
+    from sqlalchemy import event
+
+    admin = _seed_user(accounts, role="admin")
+    admin_header = _header(_login(api_client, admin))
+    _seed_teachers(accounts, 1)
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(accounts, "before_cursor_execute", _record)
+    try:
+        before = len(statements)
+        one = api_client.get("/api/v1/admin/teachers", headers=admin_header)
+        one_queries = len(statements) - before
+
+        _seed_teachers(accounts, 24)
+
+        before = len(statements)
+        many = api_client.get(
+            "/api/v1/admin/teachers?limit=200", headers=admin_header
+        )
+        many_queries = len(statements) - before
+    finally:
+        event.remove(accounts, "before_cursor_execute", _record)
+
+    assert one.status_code == 200, one.text
+    assert many.status_code == 200, many.text
+    assert len(one.json()) == 1
+    assert len(many.json()) == 25
+
+    sample = many.json()[0]
+    assert {
+        "user_id",
+        "teacher_id",
+        "email",
+        "full_name",
+        "role",
+        "status",
+    } <= set(sample)
+    assert all(item["role"] == "teacher" for item in many.json())
+
+    assert one_queries > 0, "no statements were captured — the test proves nothing"
+    assert one_queries == many_queries, (
+        f"teacher list query count grew with row count: "
+        f"{one_queries} (1 row) vs {many_queries} (25 rows)"
+    )
+    per_row_lookups = [
+        statement
+        for statement in statements
+        if "FROM teachers WHERE teachers.user_id" in statement
+    ]
+    assert per_row_lookups == [], per_row_lookups
+
+
 # --- cross-role matrix ------------------------------------------------------------------
 
 
