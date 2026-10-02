@@ -9,6 +9,10 @@ reusable ``require_admin`` guard); the self-service counterpart is
   Self-service alternatives: ``POST /auth/register`` (public — account +
   profile + tokens) and ``POST /me/student`` (authenticated student —
   profile for an existing account that has none).
+- ``GET /admin/students`` — paginated list of student profiles
+  (``items``/``total``/``limit``/``offset`` envelope) with a
+  case-insensitive ``q`` search over email and full name, plus
+  ``gender``/``country`` filters.
 - ``GET /admin/students/{student_id}`` — read any profile.
 - ``PATCH /admin/students/{student_id}`` — update any profile (audited
   with the acting administrator). Student-owned editing is
@@ -46,6 +50,7 @@ from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.repositories import student_profile_history_repository as history_repo
+from app.schemas.pagination import Page
 from app.schemas.student_profile import (
     StudentProfileCreate,
     StudentProfileHistoryRead,
@@ -104,6 +109,48 @@ def create_student_profile(
         raise _http_error(exc) from exc
     session.commit()
     return profile
+
+
+@router.get(
+    "",
+    response_model=Page[StudentProfileRead],
+    summary="List student profiles (administrative)",
+    description=(
+        "One page of student profiles, newest first, in an "
+        "items/total/limit/offset envelope. limit defaults to 20 (max "
+        "100), offset defaults to 0; both are 422 outside their range. "
+        "?q= case-insensitively matches the account email and the "
+        "profile full name, treating %, _ and \\ as literal characters. "
+        "?gender= and ?country= filter on the profile fields (an unknown "
+        "gender value is 422). Ordering is deterministic "
+        "(created_at desc, id) so offset paging stays stable. "
+        "Administrator-only."
+    ),
+    responses={
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        422: {"description": "Invalid query parameters (limit/offset/gender)"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def list_student_profiles(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=255),
+    gender: str | None = Query(default=None, max_length=32),
+    country: str | None = Query(default=None, max_length=80),
+    session: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Page[StudentProfileRead]:
+    # Read path: translate domain errors only; no commit/rollback (the
+    # sibling GETs in this module behave the same way).
+    try:
+        return student_service.list_students(
+            session, limit=limit, offset=offset, q=q, gender=gender, country=country
+        )
+    except ProfileError as exc:
+        raise _http_error(exc) from exc
 
 
 @router.get(

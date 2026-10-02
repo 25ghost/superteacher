@@ -41,7 +41,9 @@ from app.models.user import User
 from app.repositories import student_repository as student_repo
 from app.repositories import student_profile_history_repository as history_repo
 from app.repositories import user_repository as user_repo
+from app.schemas.pagination import Page
 from app.schemas.student_profile import (
+    GENDER_VALUES,
     StudentProfileCreate,
     StudentProfileRead,
     StudentProfileSelfCreate,
@@ -148,6 +150,44 @@ def read_profile(user: User | None, student: Student) -> StudentProfileRead:
         country=student.country,
         created_at=student.created_at,
         updated_at=student.updated_at,
+    )
+
+
+def list_students(
+    session: Session,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    q: str | None = None,
+    gender: str | None = None,
+    country: str | None = None,
+) -> Page[StudentProfileRead]:
+    """One page of student profiles for the administrative list.
+
+    ``q`` case-insensitively matches the account email and the profile
+    full name (wildcards in the input are treated literally by the
+    repository). ``gender`` is confined to the shared vocabulary — an
+    unknown value is a 422 domain error, not an empty result. Exactly one
+    count query plus one page query run (the page query joins ``users``),
+    so the response costs the same number of statements for one row or
+    for a full page.
+
+    Read-only: the caller's session is used as-is and nothing is
+    committed here.
+    """
+    if gender is not None and gender not in GENDER_VALUES:
+        raise ProfileValidationError(
+            f"gender must be one of {', '.join(GENDER_VALUES)}"
+        )
+    total = student_repo.count_page(session, q=q, gender=gender, country=country)
+    rows = student_repo.list_page(
+        session, q=q, gender=gender, country=country, limit=limit, offset=offset
+    )
+    return Page[StudentProfileRead](
+        items=[read_profile(user, student) for student, user in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
