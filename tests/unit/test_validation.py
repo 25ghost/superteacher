@@ -108,3 +108,39 @@ def test_valid_synthetic_datasets_pass() -> None:
     parents = Dataset(_PARENT_SPEC, [{"code": "A", "name": "ok"}])
     children = Dataset(_CHILD_SPEC, [{"parent": "A", "code": "c1"}])
     assert _validate_ignoring_global_order([parents, children]) == []
+
+
+_VERSIONS_SPEC = DatasetSpec(
+    name="versions",
+    table="versions_table",
+    model="app.models.subject.Subject",
+    natural_key=("program", "code"),
+    record_fields=("name",),
+)
+_COMPOSITE_CHILD_SPEC = DatasetSpec(
+    name="children",
+    table="children_table",
+    model="app.models.subject.Subject",
+    natural_key=("version_key", "code"),
+    references={"version_key": "versions"},
+    fk_columns={"version_key": "version_id"},
+)
+
+
+def test_composite_list_natural_key_is_hashable() -> None:
+    """A list-valued natural-key part must not crash the duplicate lookup."""
+    versions = Dataset(_VERSIONS_SPEC, [{"program": "P", "code": "V1", "name": "n"}])
+    children = Dataset(_COMPOSITE_CHILD_SPEC, [
+        {"version_key": ["P", "V1"], "code": "c1"},
+    ])
+    assert _validate_ignoring_global_order([versions, children]) == []
+
+
+def test_detects_duplicate_composite_natural_key() -> None:
+    versions = Dataset(_VERSIONS_SPEC, [{"program": "P", "code": "V1", "name": "n"}])
+    children = Dataset(_COMPOSITE_CHILD_SPEC, [
+        {"version_key": ["P", "V1"], "code": "c1"},
+        {"version_key": ["P", "V1"], "code": "c1"},
+    ])
+    problems = _validate_ignoring_global_order([versions, children])
+    assert any("duplicate natural key" in p for p in problems)

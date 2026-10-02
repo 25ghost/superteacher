@@ -217,3 +217,61 @@ def test_single_transaction_dry_run_writes_nothing() -> None:
     finally:
         session.close()
         engine.dispose()
+
+
+def test_composite_version_key_resolves_through_its_parent_natural_key() -> None:
+    """Regression: program_versions' natural-key fields are relationships
+    ("program", "level" is not even an attribute), so the lookup must go
+    through FK columns — never filter_by(program=...)."""
+    import datetime
+
+    from app.data.loader import _resolve_column_values
+    from app.models.academic_year import AcademicYear
+    from app.models.education_level import EducationLevel
+    from app.models.pathway import Pathway
+    from app.models.program import Program
+    from app.models.program_version import ProgramVersion
+    from app.models.subject import Subject
+
+    session, engine = _sqlite_session()
+    try:
+        program = Program(code="P1", name="Program One")
+        year = AcademicYear(
+            name="2099/2100",
+            start_date=datetime.date(2099, 9, 1),
+            end_date=datetime.date(2100, 7, 31),
+        )
+        pathway = Pathway(code="OL", name="O-Level")
+        level = EducationLevel(code="L1", name="Level 1", level_number=1)
+        session.add_all([program, year, pathway, level])
+        session.flush()
+        version = ProgramVersion(
+            program_id=program.id,
+            academic_year_id=year.id,
+            pathway_id=pathway.id,
+            education_level_id=level.id,
+            code="V1",
+            name="Version 1",
+        )
+        subject = Subject(code="S1", name="Subject One")
+        session.add_all([version, subject])
+        session.flush()
+
+        datasets_by_name = {
+            dataset.name: dataset for dataset in load_registry()
+        }
+        spec = datasets_by_name["program_subjects"].spec
+        record = {
+            "version_key": ["P1", "2099/2100", "OL", "L1"],
+            "subject": "S1",
+        }
+        values = _resolve_column_values(session, datasets_by_name, spec, record)
+        assert values["program_version_id"] == version.id
+        assert values["subject_id"] == subject.id
+
+        bad = dict(record, version_key=["NOPE", "2099/2100", "OL", "L1"])
+        with pytest.raises(LookupError):
+            _resolve_column_values(session, datasets_by_name, spec, bad)
+    finally:
+        session.close()
+        engine.dispose()

@@ -96,14 +96,21 @@ def validate_datasets(datasets: Iterable[Dataset]) -> list[str]:
                     f"{label}: natural key {spec.natural_key} has an empty value"
                 )
                 continue
-            duplicate_index = seen.get(key)
+            # A natural key may contain a list (composite reference such as
+            # program_versions' "version_key"); normalize it so the key is
+            # hashable for the duplicate lookup.
+            hashable_key = tuple(
+                tuple(value) if isinstance(value, list) else value
+                for value in key
+            )
+            duplicate_index = seen.get(hashable_key)
             if duplicate_index is not None:
                 problems.append(
                     f"{label}: duplicate natural key {key} "
                     f"(already used by {spec.name}[{duplicate_index}])"
                 )
             else:
-                seen[key] = index
+                seen[hashable_key] = index
 
             # Every declared reference must have an fk_columns mapping...
             for field_name in spec.references:

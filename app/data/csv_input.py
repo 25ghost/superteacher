@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import Boolean, Date, Integer, select
+from sqlalchemy.orm import aliased
 
 from app.core.database import Base
 import app.models  # noqa: F401  (registers every table in Base.metadata)
@@ -324,51 +325,71 @@ def missing_from_input(session, datasets: Iterable[Dataset]) -> list[MissingRepo
             for record in dataset.records
         }
 
-        reference_fields = [
-            field for field in spec.natural_key if field in spec.references
-        ]
-        parent_specs = [
-            specs[spec.references[field]] for field in reference_fields
-        ]
-        parent_models = [_import_model(parent.model) for parent in parent_specs]
+        # Natural-key part expressions, grouped exactly like the input keys:
+        # a plain field contributes one expression; a reference contributes
+        # its parent's natural-key expressions (one scalar for a single-field
+        # parent, a nested group for a composite one such as program_versions).
+        # Reading parent *columns* (through aliased joins) rather than parent
+        # ORM attributes is required because a parent's natural-key field
+        # names may be relationships — or not attributes of the model at all.
+        expressions: list = []
+        joins: list = []
 
-        if parent_models:
-            entities = [model, *parent_models]
-            statement = select(*entities)
-            for parent_model, field in zip(parent_models, reference_fields):
-                statement = statement.join(
-                    parent_model,
-                    getattr(model, spec.fk_columns[field]) == parent_model.id,
-                )
-        else:
-            entities = [model]
-            statement = select(model)
+        def walk(current_spec, current_entity):
+            groups = []
+            for field in current_spec.natural_key:
+                if field in current_spec.references:
+                    parent_spec = specs[current_spec.references[field]]
+                    parent_entity = aliased(_import_model(parent_spec.model))
+                    joins.append(
+                        (
+                            parent_entity,
+                            getattr(
+                                current_entity, current_spec.fk_columns[field]
+                            )
+                            == parent_entity.id,
+                        )
+                    )
+                    sub = walk(parent_spec, parent_entity)
+                    if len(parent_spec.natural_key) == 1:
+                        groups.append(sub[0])
+                    else:
+                        groups.append(sub)
+                else:
+                    groups.append(getattr(current_entity, field))
+            return groups
+
+        def compile_groups(groups):
+            """Attach a flat column index to each leaf expression."""
+            shape = []
+            for group in groups:
+                if isinstance(group, list):
+                    shape.append(compile_groups(group))
+                else:
+                    shape.append(len(expressions))
+                    expressions.append(group)
+            return shape
+
+        shape = compile_groups(walk(spec, model))
+        # select_from() is required: when every natural-key part comes from a
+        # joined parent (e.g. pathway_levels), the top-level table would not
+        # otherwise appear in the FROM clause at all.
+        statement = select(*expressions).select_from(model)
+        for entity, onclause in joins:
+            statement = statement.join(entity, onclause)
+
+        def materialize(nodes):
+            parts = []
+            for node in nodes:
+                if isinstance(node, list):
+                    parts.append(materialize(node))
+                else:
+                    parts.append(row[node])
+            return parts
 
         db_keys: set[tuple] = set()
         for row in session.execute(statement):
-            instance = row[0]
-            parents = row[1:] if parent_models else ()
-            parts = []
-            parent_index = 0
-            for field in spec.natural_key:
-                if field in spec.references:
-                    parent_spec = parent_specs[parent_index]
-                    parent_instance = parents[parent_index]
-                    parent_index += 1
-                    if len(parent_spec.natural_key) == 1:
-                        parts.append(
-                            getattr(parent_instance, parent_spec.natural_key[0])
-                        )
-                    else:
-                        parts.append(
-                            tuple(
-                                getattr(parent_instance, key_field)
-                                for key_field in parent_spec.natural_key
-                            )
-                        )
-                else:
-                    parts.append(getattr(instance, field))
-            db_keys.add(tuple(_norm(part) for part in parts))
+            db_keys.add(tuple(_norm(part) for part in materialize(shape)))
 
         missing = sorted(
             _format_key(spec, key) for key in db_keys - input_keys

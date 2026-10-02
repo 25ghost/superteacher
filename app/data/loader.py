@@ -107,6 +107,45 @@ def _coerce_like(existing, value):
     return value
 
 
+def _lookup_by_natural_key(
+    session: Session,
+    datasets_by_name: dict[str, Dataset],
+    spec: DatasetSpec,
+    parts: list,
+):
+    """Return the row of ``spec`` matching its natural key ``parts``, or None.
+
+    Natural-key fields that are declared references are resolved recursively:
+    each part is looked up in its parent dataset first, and the resulting
+    parent PK (or None when the parent is absent) goes into the FK filter.
+    This matters because a parent's natural-key *field names* are not always
+    mapped columns of its model (e.g. program_versions' "program"/"level"
+    are relationships and "level" is not an attribute at all).
+    """
+    filters: dict = {}
+    for field, part in zip(spec.natural_key, parts):
+        if field in spec.references:
+            parent = datasets_by_name[spec.references[field]]
+            sub_parts = part if isinstance(part, list) else [part]
+            if len(sub_parts) != len(parent.spec.natural_key):
+                raise ValueError(
+                    f"reference {field!r} has {len(sub_parts)} parts but parent "
+                    f"{parent.name} natural key has {len(parent.spec.natural_key)}"
+                )
+            parent_instance = _lookup_by_natural_key(
+                session, datasets_by_name, parent.spec, sub_parts
+            )
+            filters[spec.fk_columns[field]] = (
+                parent_instance.id if parent_instance is not None else None
+            )
+        else:
+            filters[spec.fk_columns.get(field, field)] = part
+    model = _import_model(spec.model)
+    return session.execute(
+        select(model).filter_by(**filters)
+    ).scalar_one_or_none()
+
+
 def _resolve_column_values(
     session: Session,
     datasets_by_name: dict[str, Dataset],
@@ -135,25 +174,24 @@ def _resolve_column_values(
             continue
 
         parent = datasets_by_name[spec.references[key]]
-        parent_model = _import_model(parent.spec.model)
         if isinstance(value, list):
             if len(value) != len(parent.spec.natural_key):
                 raise ValueError(
                     f"reference {key!r} has {len(value)} parts but parent "
                     f"{parent.name} natural key has {len(parent.spec.natural_key)}"
                 )
-            filters = dict(zip(parent.spec.natural_key, value))
+            parts = value
         else:
             if len(parent.spec.natural_key) != 1:
                 raise ValueError(
                     f"reference {key!r} is scalar but parent {parent.name} "
                     f"has a composite natural key"
                 )
-            filters = {parent.spec.natural_key[0]: value}
+            parts = [value]
 
-        instance = session.execute(
-            select(parent_model).filter_by(**filters)
-        ).scalar_one_or_none()
+        instance = _lookup_by_natural_key(
+            session, datasets_by_name, parent.spec, parts
+        )
         if instance is None:
             if dry_run:
                 # Resolve against the parent dataset (validation gate has
