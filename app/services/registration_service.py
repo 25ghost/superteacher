@@ -32,6 +32,7 @@ by the API layer, so a half-created registration can never survive.
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 
@@ -52,6 +53,7 @@ from app.models.student import Student
 from app.models.student_subject import StudentSubject
 from app.models.enrollment import StudentEnrollment
 from app.models.tvet_program import TVETProgram
+from app.repositories import auth_event_repository as auth_event_repo
 from app.repositories import enrollment_repository as enrollment_repo
 from app.schemas.pagination import Page
 from app.schemas.registration import (
@@ -77,10 +79,13 @@ __all__ = [
     "RegistrationNotFoundError",
     "RegistrationUnavailableError",
     "ENROLLMENT_STATUS_VALUES",
+    "ALLOWED_STATUS_TRANSITIONS",
+    "TERMINAL_ENROLLMENT_STATUSES",
     "register_student",
     "get_registration",
     "list_student_registrations",
     "list_admin_registrations",
+    "update_registration_status",
     "registration_readiness",
     "commit",
 ]
@@ -97,6 +102,39 @@ REGISTRABLE_YEAR_STATUSES: frozenset[str] = frozenset(
 #: constraint), exposed for filter validation — no invented values.
 ENROLLMENT_STATUS_VALUES: frozenset[str] = frozenset(
     status.value for status in EnrollmentStatus
+)
+
+#: Allowed status transitions of the administrative PATCH workflow, in
+#: terms of the existing ``EnrollmentStatus`` vocabulary only — no new
+#: state is invented: ``pending`` may become ``active`` or ``cancelled``;
+#: an ``active`` registration may finish (``completed``) or end early
+#: (``transferred``, ``withdrawn``, ``cancelled``). Same status is not a
+#: transition (409), and any pair not listed here — including everything
+#: out of a terminal state — is refused with 409.
+ALLOWED_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    EnrollmentStatus.PENDING.value: frozenset(
+        {EnrollmentStatus.ACTIVE.value, EnrollmentStatus.CANCELLED.value}
+    ),
+    EnrollmentStatus.ACTIVE.value: frozenset(
+        {
+            EnrollmentStatus.COMPLETED.value,
+            EnrollmentStatus.TRANSFERRED.value,
+            EnrollmentStatus.WITHDRAWN.value,
+            EnrollmentStatus.CANCELLED.value,
+        }
+    ),
+    EnrollmentStatus.COMPLETED.value: frozenset(),
+    EnrollmentStatus.TRANSFERRED.value: frozenset(),
+    EnrollmentStatus.WITHDRAWN.value: frozenset(),
+    EnrollmentStatus.CANCELLED.value: frozenset(),
+}
+
+#: Statuses with no outgoing transitions (final). Entering one closes the
+#: registration and stamps ``ended_at``.
+TERMINAL_ENROLLMENT_STATUSES: frozenset[str] = frozenset(
+    status
+    for status, targets in ALLOWED_STATUS_TRANSITIONS.items()
+    if not targets
 )
 
 
@@ -494,6 +532,90 @@ def list_admin_registrations(
         limit=limit,
         offset=offset,
     )
+
+
+def update_registration_status(
+    session: Session,
+    enrollment_id: uuid.UUID,
+    new_status: str,
+    *,
+    actor_id: uuid.UUID,
+) -> RegistrationRead:
+    """Move one registration to another status (administrative, audited).
+
+    Order of operations:
+
+    1. validate the requested value against the model vocabulary (422 —
+       over HTTP unreachable, the request schema already enforces it),
+    2. lock the row with ``SELECT ... FOR UPDATE`` *before* reading its
+       status, so two concurrent transitions serialize: the second one
+       re-reads the committed row and honestly reports 409 instead of
+       both overwriting each other,
+    3. unknown id → 404; same status → 409; a pair outside
+       :data:`ALLOWED_STATUS_TRANSITIONS` → 409 naming the current and
+       the requested status,
+    4. apply the change; entering a terminal status stamps ``ended_at``
+       from the database clock (the model's other server timestamps use
+       the same authority), so the date-order CHECK
+       ``ended_at >= started_at`` can never be violated,
+    5. record exactly one ``auth_events`` audit row — subject is the
+       student's account, actor the administrator, payload
+       ``{"from": ..., "to": ...}`` in the style of ``user_role_changed``,
+    6. return the summary re-read through the eager path; the caller
+       commits, and a 404/409 rolls the whole transaction back (the
+       audit row included).
+
+    No commit happens here — the API layer owns the request transaction.
+    """
+    if new_status not in ENROLLMENT_STATUS_VALUES:
+        raise RegistrationValidationError(
+            f"unknown registration status {new_status!r} "
+            f"(expected one of {', '.join(sorted(ENROLLMENT_STATUS_VALUES))})"
+        )
+    enrollment = enrollment_repo.get_by_id_for_update(session, enrollment_id)
+    if enrollment is None:
+        raise RegistrationNotFoundError(f"no enrollment with id {enrollment_id}")
+
+    current = enrollment.status
+    if new_status == current:
+        raise RegistrationConflictError(
+            f"enrollment {enrollment_id} is already {current!r}"
+        )
+    if new_status not in ALLOWED_STATUS_TRANSITIONS.get(current, frozenset()):
+        raise RegistrationConflictError(
+            f"enrollment {enrollment_id} cannot move from status "
+            f"{current!r} to {new_status!r}"
+        )
+
+    enrollment.status = new_status
+    if new_status in TERMINAL_ENROLLMENT_STATUSES:
+        enrollment.ended_at = func.now()
+    session.flush()
+
+    student = session.get(Student, enrollment.student_id)
+    if student is None:  # pragma: no cover - FK guarantees the row
+        raise RegistrationNotFoundError(f"no student with id {enrollment.student_id}")
+    auth_event_repo.log_event(
+        session,
+        user_id=student.user_id,
+        event_type="registration_status_changed",
+        actor_user_id=actor_id,
+        metadata_json=json.dumps({"from": current, "to": new_status}),
+    )
+
+    reloaded = enrollment_repo.reload_with_relations(session, enrollment.id)
+    if reloaded is None:  # pragma: no cover - the row is locked in this transaction
+        raise RegistrationNotFoundError(f"no enrollment with id {enrollment_id}")
+    logger.info(
+        "registration status changed",
+        extra={
+            "enrollment_id": str(enrollment.id),
+            "actor_id": str(actor_id),
+            "from_status": current,
+            "to_status": new_status,
+        },
+    )
+    return _load_registration_read(session, reloaded)
 
 
 def registration_readiness(session: Session) -> dict:

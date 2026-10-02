@@ -34,6 +34,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.models.enums import EnrollmentStatus
+
 
 class RegistrationCreate(BaseModel):
     """Request body for registering a student into an academic year.
@@ -188,3 +190,18 @@ class RegistrationRead(BaseModel):
     started_at: datetime
     created_at: datetime
     subjects: list[RegistrationSubjectRead] = Field(default_factory=list)
+
+
+class RegistrationStatusUpdate(BaseModel):
+    """Request body for an administrative status transition.
+
+    ``extra="forbid"`` rejects unknown keys with a 422, and ``status``
+    must be one of the model's own ``EnrollmentStatus`` states (anything
+    else is a 422 before the handler runs). *Whether* the transition from
+    the current status to the requested one is allowed is a service rule:
+    a refused move is a 409 naming both statuses, never a silent no-op.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: EnrollmentStatus

@@ -75,6 +75,27 @@ def reload_with_relations(
     return session.execute(stmt).unique().scalar_one_or_none()
 
 
+def get_by_id_for_update(
+    session: Session, enrollment_id: uuid.UUID
+) -> StudentEnrollment | None:
+    """One enrollment with its row locked (``SELECT ... FOR UPDATE``).
+
+    Deliberately a plain single-table statement: a locking read must not
+    take row locks on the catalog tables (joinedload would), and the
+    relations are loaded afterwards through
+    :func:`reload_with_relations`. ``populate_existing`` makes the lock
+    read authoritative — the status checked by the caller is the one the
+    lock protects, not an earlier snapshot held in the identity map.
+    """
+    stmt = (
+        select(StudentEnrollment)
+        .where(StudentEnrollment.id == enrollment_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    return session.scalar(stmt)
+
+
 def find_existing(
     session: Session,
     student_id: uuid.UUID,

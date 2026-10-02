@@ -23,6 +23,9 @@ Administration (admin role, ``/admin`` prefix):
   academic year / status / school / student filters.
 - ``POST /admin/registrations`` — register on behalf of a student;
   ``student_id`` is REQUIRED in the body.
+- ``PATCH /admin/registrations/{enrollment_id}/status`` — move a
+  registration through the allowed status transitions (row-locked,
+  audited).
 - ``GET /admin/registrations/{enrollment_id}`` — any enrollment.
 - ``GET /admin/students/{student_id}/registrations`` — any student's
   history (404 for an unknown student).
@@ -55,6 +58,7 @@ from app.schemas.registration import (
     RegistrationCreateSelf,
     RegistrationRead,
     RegistrationReadiness,
+    RegistrationStatusUpdate,
 )
 from app.services import registration_service
 from app.services.registration_service import RegistrationError, RegistrationNotFoundError
@@ -347,6 +351,57 @@ def read_registration(
         return registration_service.get_registration(session, enrollment_id)
     except RegistrationError as exc:
         raise _http_error(exc) from exc
+
+
+@admin_router.patch(
+    "/registrations/{enrollment_id}/status",
+    response_model=RegistrationRead,
+    summary="Change a registration's status (administrative)",
+    description=(
+        "Move one enrollment to another status through the allowed "
+        "transitions of the existing vocabulary: pending → active | "
+        "cancelled; active → completed | transferred | withdrawn | "
+        "cancelled; every terminal state is final. The row is locked "
+        "(SELECT ... FOR UPDATE) while the change is decided, so two "
+        "concurrent transitions cannot both win — the second gets 409. "
+        "Unknown id → 404, same status → 409, any other pair → 409 "
+        "naming the current and requested status. Entering a terminal "
+        "status stamps ended_at. Each accepted change writes exactly one "
+        "audit event recording who did it. Administrator-only."
+    ),
+    responses={
+        200: {"description": "Status changed"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown enrollment id"},
+        409: {"description": "Same status, or the transition is not allowed"},
+        422: {"description": "Invalid request (unknown status value, extra keys)"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_WRITE)
+def change_registration_status(
+    request: Request,
+    enrollment_id: uuid.UUID,
+    payload: RegistrationStatusUpdate,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> RegistrationRead:
+    try:
+        updated = registration_service.update_registration_status(
+            session,
+            enrollment_id,
+            payload.status.value,
+            actor_id=admin.id,
+        )
+    except RegistrationError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
+    session.commit()
+    return updated
 
 
 @admin_router.get(
