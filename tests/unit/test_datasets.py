@@ -77,6 +77,17 @@ def test_academic_years_use_verify_policy() -> None:
     assert academic_years.spec.update_policy == "verify"
 
 
+def test_tvet_programs_requires_sector_record_field() -> None:
+    """sector is NOT NULL in the model and unconditional in the record shape.
+
+    With it missing from the allowed fields, the validator rejected every
+    record carrying it (unknown field) while omitting it failed NOT NULL.
+    """
+    tvet_programs = {d.name: d for d in load_registry()}["tvet_programs"]
+    assert "sector" in tvet_programs.spec.key_fields
+    assert "sector" in tvet_programs.spec.references
+
+
 @pytest.mark.parametrize(
     "dataset_name,natural_key",
     [

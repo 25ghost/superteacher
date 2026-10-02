@@ -26,6 +26,12 @@ _SPEC = DatasetSpec(
     table="tvet_programs",
     model="app.models.tvet_program.TVETProgram",
     natural_key=("program",),
+    # "sector" is a required record field: the model's sector_id is
+    # NOT NULL with no default, and the record shape above documents it
+    # unconditionally. Without this declaration the validator rejected
+    # every record that carried it (unknown field) and every record that
+    # omitted it failed NOT NULL — invisible only because RECORDS was empty.
+    record_fields=("sector",),
     references={"program": "programs", "sector": "tvet_sectors"},
     fk_columns={"program": "program_id", "sector": "sector_id"},
 )
