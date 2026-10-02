@@ -568,10 +568,10 @@ def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
             ["TEST-SCHOOL-001", "TEST-SCHOOL-002"], field="school_code",
         )
         # A school's offerings — the second TVET-style detail route
-        # (/schools/{school_code}/programs). The documented ORDER BY
-        # (school name, school code) cannot discriminate two offerings of
-        # the SAME school, so the pinned contract is a stable set plus an
-        # identical repeat response.
+        # (/schools/{school_code}/programs). School name and school code
+        # tie for offerings of the SAME school, so the intra-school order
+        # is pinned to the program-version id tiebreaker in the
+        # repository's ORDER BY (a two-offering school makes it real).
         first = client.get("/api/v1/catalog/schools/TEST-SCHOOL-001/programs")
         assert first.status_code == 200, first.text
         rows = first.json()
@@ -582,6 +582,10 @@ def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
             "TEST-COMBO-V1",
             "TEST-COMBO-V2",
         ]
+        version_ids = [row["program_version_id"] for row in rows]
+        assert version_ids == sorted(version_ids), (
+            f"school offerings: not ordered by program_version_id: {version_ids}"
+        )
         second = client.get("/api/v1/catalog/schools/TEST-SCHOOL-001/programs")
         assert second.json() == rows, "school offerings: non-deterministic ordering"
         _assert_list_route(

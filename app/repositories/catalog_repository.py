@@ -17,7 +17,7 @@ Ordering contract (documented for API consumers):
 - ``tvet_sectors``    : ``code`` ascending
 - ``tvet_programs``   : program code ascending
 - ``schools``         : ``name`` ascending, then school_code
-- ``school_programs`` : school name, then program-version identity
+- ``school_programs`` : school name, school code, then program-version id
 
 A repository function that resolves a catalog identity (e.g. one pathway by
 code) raises :class:`CatalogNotFoundError`; the service layer translates that
@@ -257,5 +257,5 @@ def list_school_programs(
     )
     if school_id is not None:
         stmt = stmt.where(SchoolProgram.school_id == school_id)
-    stmt = _order_by(stmt, School.name, School.school_code)
+    stmt = _order_by(stmt, School.name, School.school_code, SchoolProgram.program_version_id)
     return list(session.scalars(stmt))
