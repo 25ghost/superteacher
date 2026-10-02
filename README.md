@@ -417,6 +417,201 @@ The seeder:
 > TVET trades, schools) is researched, reviewed and added in a later phase,
 > through this same loader. Nothing in `app/data/` is authoritative data yet.
 
+## Catalog CSV loader (`load_catalog.py`)
+
+`scripts/load_catalog.py` loads an operator-supplied directory of CSV
+files into the **12 registry datasets** (the full `EXPECTED_LOAD_ORDER`,
+parents before children). It is the supported production path for the
+authoritative catalog; `seed_reference_data.py` keeps refusing
+production APPLY with no bypass.
+
+```bash
+python scripts/load_catalog.py --csv-dir path/to/csv                   # dry run (default)
+python scripts/load_catalog.py --csv-dir path/to/csv --apply           # load, with confirmation
+CATALOG_LOAD_CONFIRM=APPLY python scripts/load_catalog.py \
+    --csv-dir path/to/csv --apply                                      # non-interactive apply
+```
+
+- **Dry run by default.** `--apply` prints the dry-run summary first,
+  then asks for confirmation: type `APPLY` on a TTY, or set
+  `CATALOG_LOAD_CONFIRM=APPLY` for non-interactive runs.
+- **Whole-run validation before any write.** CSV parse errors and
+  structural validation problems (duplicate natural keys, unresolvable
+  references, wrong order) exit with code 1 and zero database writes —
+  on a parse or validation error the session is never even opened.
+- **One transaction for the whole apply.** The engine runs flush-only;
+  the script owns the single `commit()`/`rollback()` (the same explicit
+  exception `scripts/create_admin.py` documents). Any failure rolls the
+  entire load back — a partially-loaded catalog can never commit.
+- **Idempotent.** Rows are matched on each dataset's natural key, which
+  is never updated; `update_policy=update` fields are updated in place,
+  `update_policy=verify` (`academic_years`, `program_versions`) is never
+  rewritten — drift is reported as a warning. Re-running an identical
+  load issues zero INSERT/UPDATE/DELETE statements.
+- **Never deletes.** Database rows absent from the input are reported as
+  `missing from input` (full count per dataset, first 20 listed) and
+  left untouched.
+- **Production guard.** In `ENVIRONMENT=production`, `--apply` also
+  requires `--allow-production`; the refusal predicate and wording are
+  shared with the seeder via `scripts/apply_guard.py`. Dry runs are
+  allowed everywhere.
+- Protected tables (`users`, `students`, `student_enrollments`,
+  `student_subjects`) are never written.
+
+### CSV format
+
+- Exactly one file per dataset, named `<dataset>.csv` — all 12 files are
+  required (use a header-only file for a dataset you do not want to
+  touch); any other `*.csv` in the directory is rejected, so a typo like
+  `school.csv` cannot silently mean "no input". Encoding UTF-8.
+- The header is exactly the column names below, in any order. Foreign
+  keys carry the **referenced row's natural key**, never a database id;
+  the loader resolves them. A composite `version_key` is the parent's
+  natural-key parts joined with `|`, e.g.
+  `TEST-COMBO|TEST-2099/2100|TEST-OL|TEST-L1`.
+- Dates are ISO 8601 (`YYYY-MM-DD`), booleans are `true`/`false`
+  (anything else is an error), integers are plain digits. Cell values
+  are trimmed of surrounding whitespace.
+- An empty cell means NULL **only where the column is nullable**; an
+  empty cell in a non-nullable column is an error. To use a database
+  default, omit the *column* (row-wise omission is not expressible in
+  CSV when the column is present).
+- **`schools.school_code` is nullable in the model but never empty in
+  the CSV**: an empty natural-key cell is always rejected, reusing the
+  `app/data/validation.py` empty-natural-key rule (`validation.py:94`).
+  The same applies to every natural-key column.
+- Invalid enum values (e.g. `status=bogus`) are rejected by the
+  database CHECK constraints — the whole transaction rolls back.
+- Parse errors report **file, line and column**, e.g.
+  `schools.csv: line 2, column 'school_code': empty value in
+  natural-key column ...`. All problems across all files are collected
+  before the loader fails.
+
+### Column reference (one table per file)
+
+Required = the header must contain the column. Optional = may be
+omitted from the header entirely.
+
+**`academic_years.csv`** — `update_policy=verify` (drift is a warning,
+never rewritten)
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `name` | text | yes | natural key, e.g. `2025/2026` |
+| `start_date` | date | yes | ISO 8601 |
+| `end_date` | date | yes | ISO 8601, `>= start_date` |
+| `status` | text | yes | `planned` \| `active` \| `closed` \| `archived` |
+
+**`pathways.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `code` | text | yes | natural key, e.g. `O_LEVEL` |
+| `name` | text | yes | |
+| `description` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`education_levels.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `code` | text | yes | natural key, e.g. `S1` |
+| `name` | text | yes | |
+| `level_number` | integer | yes | |
+| `description` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`pathway_levels.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `pathway` | text | yes | FK → `pathways.code` (natural key of the row) |
+| `level` | text | yes | FK → `education_levels.code` (natural key of the row) |
+
+**`subjects.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `code` | text | yes | natural key, e.g. `SUB_MATH` |
+| `name` | text | yes | |
+| `description` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`programs.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `code` | text | yes | natural key — the authoritative program identity |
+| `name` | text | yes | |
+| `program_type` | text | no | `combination` \| `tvet_program` \| `stream` \| `other` (default `other`) |
+| `description` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`tvet_sectors.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `code` | text | yes | natural key |
+| `name` | text | yes | |
+| `description` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`tvet_programs.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `program` | text | yes | natural key; FK → `programs.code` (one TVET profile per program) |
+| `sector` | text | yes | FK → `tvet_sectors.code` |
+
+**`program_versions.csv`** — `update_policy=verify`; the natural key is
+the four-column offering tuple, never `code`
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `program` | text | yes | FK → `programs.code` (natural key part) |
+| `academic_year` | text | yes | FK → `academic_years.name` (natural key part) |
+| `pathway` | text | yes | FK → `pathways.code` (natural key part) |
+| `level` | text | yes | FK → `education_levels.code` (natural key part) |
+| `code` | text | yes | label only, never identity; `NOT NULL` without default |
+| `name` | text | yes | `NOT NULL` without default |
+| `description` | text | no | empty cell → NULL |
+| `effective_from` | date | no | ISO 8601 |
+| `effective_until` | date | no | ISO 8601, `>= effective_from` |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`program_subjects.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `version_key` | text | yes | `program\|academic_year\|pathway\|level` (4 parts joined with `\|`); FK → `program_versions` |
+| `subject` | text | yes | FK → `subjects.code` (natural key part) |
+| `subject_type` | text | no | `core` (default) \| `elective` \| `optional` \| `module` |
+| `is_required` | boolean | no | `true` (default) \| `false` |
+| `display_order` | integer | no | default `0` |
+
+**`schools.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `school_code` | text | yes | natural key; model column is nullable, but the CSV rejects an empty value (see above) |
+| `name` | text | yes | |
+| `school_type` | text | no | empty cell → NULL |
+| `province` | text | no | empty cell → NULL |
+| `district` | text | no | empty cell → NULL |
+| `sector` | text | no | empty cell → NULL |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+**`school_programs.csv`**
+
+| Column | Type | Required | Notes |
+|---|---|---|---|
+| `school` | text | yes | FK → `schools.school_code` (natural key part) |
+| `version_key` | text | yes | `program\|academic_year\|pathway\|level` (4 parts joined with `\|`); FK → `program_versions` (natural key part) |
+| `status` | text | no | `active` (default) \| `inactive` |
+
+Synthetic/test fixtures (obviously fake codes such as `TEST-SCHOOL-001`)
+live only under `tests/` and never ship as data files.
+
 ## Tests
 
 Development dependencies (test tooling only — runtime deps stay in
