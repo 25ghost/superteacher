@@ -13,8 +13,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database import Base
 import app.models  # noqa: F401
@@ -225,6 +225,63 @@ def test_tty_confirmation_rejects_anything_but_apply(
     out = capsys.readouterr().out
     assert rc == 1
     assert "Not confirmed" in out
+    assert _count(sqlite_engine, "pathways") == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [EOFError, KeyboardInterrupt],
+    ids=["eof", "keyboard-interrupt"],
+)
+def test_production_confirmation_interrupted_exits_1_with_no_writes_or_commit(
+    error: type[BaseException],
+    sqlite_engine,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EOF or Ctrl-C at the production TTY prompt: exit 1, nothing persisted."""
+    monkeypatch.setattr(
+        "scripts.load_catalog.get_settings",
+        lambda: _FakeSettings("production"),
+    )
+    monkeypatch.delenv("CATALOG_LOAD_CONFIRM", raising=False)
+    monkeypatch.setattr(sys, "stdin", _FakeTTY(True))
+    monkeypatch.setattr("builtins.input", Mock(side_effect=error()))
+
+    write_statements: list[str] = []
+
+    @event.listens_for(sqlite_engine, "before_cursor_execute")
+    def _record_writes(
+        conn, cursor, statement, parameters, context, executemany
+    ) -> None:
+        keyword = statement.strip().split(None, 1)[0].upper()
+        if keyword in {"INSERT", "UPDATE", "DELETE"}:
+            write_statements.append(statement)
+
+    commits: list = []
+
+    def _record_commit(session: Session) -> None:
+        commits.append(session)
+
+    event.listen(Session, "after_commit", _record_commit)
+    try:
+        rc = main(
+            [
+                "--csv-dir",
+                str(_valid_dir(tmp_path)),
+                "--apply",
+                "--allow-production",
+            ]
+        )
+    finally:
+        event.remove(Session, "after_commit", _record_commit)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Not confirmed — no database writes performed." in out
+    assert write_statements == []
+    assert commits == []
     assert _count(sqlite_engine, "pathways") == 0
 
 
