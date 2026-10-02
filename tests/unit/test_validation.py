@@ -50,6 +50,15 @@ def test_detects_duplicate_natural_key() -> None:
     assert any("duplicate natural key" in p for p in problems)
 
 
+def test_record_omitting_natural_key_field_is_reported_with_dataset_and_index() -> None:
+    parents = Dataset(_PARENT_SPEC, [
+        {"name": "no-code-here"},
+        {"code": "B", "name": "ok"},
+    ])
+    problems = _validate_ignoring_global_order([parents])
+    assert problems == ["parents[0]: missing required field 'code'"]
+
+
 def test_detects_missing_required_field() -> None:
     parents = Dataset(_PARENT_SPEC, [{"code": "X"}])  # name missing
     problems = _validate_ignoring_global_order([parents])
