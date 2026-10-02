@@ -19,33 +19,58 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.academic_year import AcademicYear
 from app.models.enrollment import StudentEnrollment
+from app.models.program_version import ProgramVersion
+from app.models.school import School
 from app.models.student_subject import StudentSubject
 from app.models.subject import Subject
 
+#: Every relation the registration summary reads, as loader options.
+#: The five catalog relations are many-to-one (``joinedload`` — same
+#: query, no extra round-trips), including the second-level
+#: ``program_version → program`` hop that used to lazy-load per row; the
+#: one-to-many ``subjects`` (plus each subject) uses ``selectinload``,
+#: which stays safe under ``LIMIT`` (a joined collection would silently
+#: truncate the page) and issues a fixed two queries whatever the row
+#: count.
+EAGER_OPTIONS = (
+    joinedload(StudentEnrollment.academic_year),
+    joinedload(StudentEnrollment.pathway),
+    joinedload(StudentEnrollment.education_level),
+    joinedload(StudentEnrollment.program_version).joinedload(ProgramVersion.program),
+    joinedload(StudentEnrollment.school),
+    selectinload(StudentEnrollment.subjects).selectinload(StudentSubject.subject),
+)
+
 
 def get_by_id(session: Session, enrollment_id: uuid.UUID) -> StudentEnrollment | None:
-    """One enrollment with its full catalog context loaded (or None).
+    """One enrollment with its full catalog context loaded (or None)."""
+    stmt = (
+        select(StudentEnrollment)
+        .options(*EAGER_OPTIONS)
+        .where(StudentEnrollment.id == enrollment_id)
+    )
+    return session.execute(stmt).unique().scalar_one_or_none()
 
-    The five catalog relations are many-to-one, so ``joinedload`` fetches
-    them in the same query (single row, no extra round-trips); the one-to-many
-    ``subjects`` (plus each subject) uses ``selectinload``.
+
+def reload_with_relations(
+    session: Session, enrollment_id: uuid.UUID
+) -> StudentEnrollment | None:
+    """Re-read one enrollment through :data:`EAGER_OPTIONS`.
+
+    Used after writes (create, status change) so the summary built from
+    the row never triggers lazy loads: ``populate_existing`` refreshes
+    already-bound attributes (including ``status``) from the eager query.
     """
     stmt = (
         select(StudentEnrollment)
-        .options(
-            joinedload(StudentEnrollment.academic_year),
-            joinedload(StudentEnrollment.pathway),
-            joinedload(StudentEnrollment.education_level),
-            joinedload(StudentEnrollment.program_version),
-            joinedload(StudentEnrollment.school),
-            selectinload(StudentEnrollment.subjects).selectinload(StudentSubject.subject),
-        )
+        .options(*EAGER_OPTIONS)
         .where(StudentEnrollment.id == enrollment_id)
+        .execution_options(populate_existing=True)
     )
     return session.execute(stmt).unique().scalar_one_or_none()
 
@@ -77,17 +102,98 @@ def list_for_student(session: Session, student_id: uuid.UUID) -> list[StudentEnr
     """
     stmt = (
         select(StudentEnrollment)
-        .options(
-            joinedload(StudentEnrollment.academic_year),
-            joinedload(StudentEnrollment.pathway),
-            joinedload(StudentEnrollment.education_level),
-            joinedload(StudentEnrollment.program_version),
-            joinedload(StudentEnrollment.school),
-            selectinload(StudentEnrollment.subjects).selectinload(StudentSubject.subject),
-        )
+        .options(*EAGER_OPTIONS)
         .join(AcademicYear, AcademicYear.id == StudentEnrollment.academic_year_id)
         .where(StudentEnrollment.student_id == student_id)
         .order_by(AcademicYear.start_date.desc(), StudentEnrollment.created_at.desc())
+    )
+    return list(session.execute(stmt).unique().scalars())
+
+
+def _page_filters(
+    *,
+    academic_year_id: uuid.UUID | None,
+    status: str | None,
+    school_id: uuid.UUID | None,
+    school_code: str | None,
+    student_id: uuid.UUID | None,
+) -> list:
+    conditions = []
+    if academic_year_id is not None:
+        conditions.append(StudentEnrollment.academic_year_id == academic_year_id)
+    if status is not None:
+        conditions.append(StudentEnrollment.status == status)
+    if school_id is not None:
+        conditions.append(StudentEnrollment.school_id == school_id)
+    if school_code is not None:
+        # EXISTS instead of a join: the count query stays a plain count
+        # and the page query keeps its joinedload plan.
+        conditions.append(
+            StudentEnrollment.school.has(School.school_code == school_code)
+        )
+    if student_id is not None:
+        conditions.append(StudentEnrollment.student_id == student_id)
+    return conditions
+
+
+def count_page(
+    session: Session,
+    *,
+    academic_year_id: uuid.UUID | None = None,
+    status: str | None = None,
+    school_id: uuid.UUID | None = None,
+    school_code: str | None = None,
+    student_id: uuid.UUID | None = None,
+) -> int:
+    """Total enrollments matching the filters (independent of limit/offset)."""
+    stmt = (
+        select(func.count())
+        .select_from(StudentEnrollment)
+        .where(
+            *_page_filters(
+                academic_year_id=academic_year_id,
+                status=status,
+                school_id=school_id,
+                school_code=school_code,
+                student_id=student_id,
+            )
+        )
+    )
+    return session.scalar(stmt) or 0
+
+
+def list_page(
+    session: Session,
+    *,
+    academic_year_id: uuid.UUID | None = None,
+    status: str | None = None,
+    school_id: uuid.UUID | None = None,
+    school_code: str | None = None,
+    student_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[StudentEnrollment]:
+    """One page of enrollments, newest first, fully eager-loaded.
+
+    Ordering is deterministic: ``created_at`` descending with the unique
+    ``id`` as tiebreaker, so offset paging stays stable when a whole
+    batch shares one ``created_at``.
+    """
+    stmt = (
+        select(StudentEnrollment)
+        .options(*EAGER_OPTIONS)
+        .where(
+            *_page_filters(
+                academic_year_id=academic_year_id,
+                status=status,
+                school_id=school_id,
+                school_code=school_code,
+                student_id=student_id,
+            )
+        )
+        .order_by(StudentEnrollment.created_at.desc(), StudentEnrollment.id)
+        .limit(limit)
+        .offset(offset)
     )
     return list(session.execute(stmt).unique().scalars())
 

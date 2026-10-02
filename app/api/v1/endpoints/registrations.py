@@ -19,6 +19,8 @@ Student Self-Service (role=student, ``/me`` prefix):
 
 Administration (admin role, ``/admin`` prefix):
 
+- ``GET /admin/registrations`` — paginated list of registrations with
+  academic year / status / school / student filters.
 - ``POST /admin/registrations`` — register on behalf of a student;
   ``student_id`` is REQUIRED in the body.
 - ``GET /admin/registrations/{enrollment_id}`` — any enrollment.
@@ -33,7 +35,7 @@ map service errors to HTTP → commit on success.
 """
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.auth_dependencies import (
@@ -43,8 +45,10 @@ from app.core.auth_dependencies import (
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import limiter
+from app.models.enums import EnrollmentStatus
 from app.models.student import Student
 from app.models.user import User
+from app.schemas.pagination import Page
 from app.schemas.registration import (
     RegistrationCreate,
     RegistrationCreateAdmin,
@@ -263,6 +267,57 @@ def create_registration_for_student(
         raise _http_error(exc) from exc
     session.commit()
     return registration
+
+
+@admin_router.get(
+    "/registrations",
+    response_model=Page[RegistrationRead],
+    summary="List registrations (administrative)",
+    description=(
+        "One page of registrations in an items/total/limit/offset "
+        "envelope, newest first. limit defaults to 20 (max 100), offset "
+        "defaults to 0; both are 422 outside their range. Optional "
+        "filters: academic_year_id, status (validated against the "
+        "enrollment vocabulary — an unknown value is 422), school_id, "
+        "school_code and student_id, combinable in any way. The page "
+        "eager-loads program version, program, school and subjects, so "
+        "the number of queries per request does not depend on the row "
+        "count. Administrator-only."
+    ),
+    responses={
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        422: {"description": "Invalid query parameters (limit/offset/status/ids)"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_REGISTRATION_READ)
+def list_registrations(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    academic_year_id: uuid.UUID | None = Query(default=None),
+    status_filter: EnrollmentStatus | None = Query(default=None, alias="status"),
+    school_id: uuid.UUID | None = Query(default=None),
+    school_code: str | None = Query(default=None, max_length=32),
+    student_id: uuid.UUID | None = Query(default=None),
+    session: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Page[RegistrationRead]:
+    # Read path: translate domain errors only; no commit/rollback (the
+    # sibling GETs in this module behave the same way).
+    try:
+        return registration_service.list_admin_registrations(
+            session,
+            limit=limit,
+            offset=offset,
+            academic_year_id=academic_year_id,
+            status=status_filter.value if status_filter is not None else None,
+            school_id=school_id,
+            school_code=school_code,
+            student_id=student_id,
+        )
+    except RegistrationError as exc:
+        raise _http_error(exc) from exc
 
 
 @admin_router.get(

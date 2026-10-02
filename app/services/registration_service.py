@@ -53,6 +53,7 @@ from app.models.student_subject import StudentSubject
 from app.models.enrollment import StudentEnrollment
 from app.models.tvet_program import TVETProgram
 from app.repositories import enrollment_repository as enrollment_repo
+from app.schemas.pagination import Page
 from app.schemas.registration import (
     RegistrationCreate,
     RegistrationRead,
@@ -75,9 +76,11 @@ __all__ = [
     "RegistrationConflictError",
     "RegistrationNotFoundError",
     "RegistrationUnavailableError",
+    "ENROLLMENT_STATUS_VALUES",
     "register_student",
     "get_registration",
     "list_student_registrations",
+    "list_admin_registrations",
     "registration_readiness",
     "commit",
 ]
@@ -88,6 +91,12 @@ __all__ = [
 # ``active`` accept it.
 REGISTRABLE_YEAR_STATUSES: frozenset[str] = frozenset(
     {AcademicYearStatus.PLANNED.value, AcademicYearStatus.ACTIVE.value}
+)
+
+#: The status vocabulary of ``student_enrollments`` (the model's CHECK
+#: constraint), exposed for filter validation — no invented values.
+ENROLLMENT_STATUS_VALUES: frozenset[str] = frozenset(
+    status.value for status in EnrollmentStatus
 )
 
 
@@ -412,8 +421,12 @@ def register_student(session: Session, payload: RegistrationCreate) -> Registrat
                 status=StudentSubjectStatus.ACTIVE.value,
             )
 
-    # 8. Summary (reads back through the relationships; caller commits) ----------
-    return _load_registration_read(session, enrollment)
+    # 8. Summary — re-read through the eager path so subjects and program
+    #    context arrive via loader options, never lazy loads; caller commits.
+    reloaded = enrollment_repo.reload_with_relations(session, enrollment.id)
+    if reloaded is None:  # pragma: no cover - the row was just flushed
+        raise RegistrationNotFoundError(f"no enrollment with id {enrollment.id}")
+    return _load_registration_read(session, reloaded)
 
 
 def get_registration(
@@ -438,6 +451,49 @@ def list_student_registrations(
         _load_registration_read(session, enrollment)
         for enrollment in enrollment_repo.list_for_student(session, student_id)
     ]
+
+
+def list_admin_registrations(
+    session: Session,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    academic_year_id: uuid.UUID | None = None,
+    status: str | None = None,
+    school_id: uuid.UUID | None = None,
+    school_code: str | None = None,
+    student_id: uuid.UUID | None = None,
+) -> Page[RegistrationRead]:
+    """One page of registrations for the administrative list.
+
+    Every filter is optional and validated against the model's own
+    vocabulary (``status``) or resolved as a plain equality/EXISTS
+    predicate in the repository — exactly one count query plus one page
+    query run, and the page query eager-loads program version → program,
+    school and subjects so the summaries cost no per-row statements.
+
+    Read-only: the caller's session is used as-is, nothing is committed.
+    """
+    if status is not None and status not in ENROLLMENT_STATUS_VALUES:
+        raise RegistrationValidationError(
+            f"unknown registration status {status!r} "
+            f"(expected one of {', '.join(sorted(ENROLLMENT_STATUS_VALUES))})"
+        )
+    filters = dict(
+        academic_year_id=academic_year_id,
+        status=status,
+        school_id=school_id,
+        school_code=school_code,
+        student_id=student_id,
+    )
+    total = enrollment_repo.count_page(session, **filters)
+    rows = enrollment_repo.list_page(session, limit=limit, offset=offset, **filters)
+    return Page[RegistrationRead](
+        items=[_load_registration_read(session, enrollment) for enrollment in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 def registration_readiness(session: Session) -> dict:
