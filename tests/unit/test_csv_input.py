@@ -106,6 +106,25 @@ def test_missing_required_column_reports_file_line_column(tmp_path: Path) -> Non
     assert "required column is missing" in problem
 
 
+def test_file_without_header_row_reports_exact_message(tmp_path: Path) -> None:
+    csv_dir = _csv_dir(tmp_path)
+    (csv_dir / "subjects.csv").write_text("", encoding="utf-8")
+    with pytest.raises(CsvParseError) as excinfo:
+        load_csv_datasets(csv_dir)
+    assert excinfo.value.problems == [
+        "subjects.csv: line 1, column 'header': missing header row"
+    ]
+
+
+def test_duplicate_header_column_reports_exact_message(tmp_path: Path) -> None:
+    csv_dir = _csv_dir(tmp_path, {"subjects.csv": "code,name,code\n"})
+    with pytest.raises(CsvParseError) as excinfo:
+        load_csv_datasets(csv_dir)
+    assert excinfo.value.problems == [
+        "subjects.csv: line 1, column 'code': duplicate header column"
+    ]
+
+
 def test_empty_school_code_is_rejected_even_though_column_is_nullable(
     tmp_path: Path,
 ) -> None:
@@ -136,6 +155,17 @@ def test_empty_non_nullable_cell_is_rejected(tmp_path: Path) -> None:
     problem = str(excinfo.value)
     assert "pathways.csv: line 2, column 'name'" in problem
     assert "empty value in non-nullable column" in problem
+
+
+def test_empty_reference_cell_reports_exact_message(tmp_path: Path) -> None:
+    csv_dir = _csv_dir(
+        tmp_path, {"tvet_programs.csv": "program,sector\nTEST-PROG,\n"}
+    )
+    with pytest.raises(CsvParseError) as excinfo:
+        load_csv_datasets(csv_dir)
+    assert excinfo.value.problems == [
+        "tvet_programs.csv: line 2, column 'sector': empty value in non-nullable column"
+    ]
 
 
 def test_bad_boolean_reports_file_line_column(tmp_path: Path) -> None:
@@ -200,6 +230,26 @@ def test_composite_reference_wrong_part_count_reports_file_line_column(
     problem = str(excinfo.value)
     assert "school_programs.csv: line 2, column 'version_key'" in problem
     assert "4 parts joined with '|'" in problem
+
+
+def test_composite_reference_empty_part_reports_exact_message(
+    tmp_path: Path,
+) -> None:
+    csv_dir = _csv_dir(
+        tmp_path,
+        {
+            "school_programs.csv": (
+                "school,version_key\n"
+                "TEST-SCHOOL-001,TEST-COMBO||TEST-OL|TEST-L1\n"
+            )
+        },
+    )
+    with pytest.raises(CsvParseError) as excinfo:
+        load_csv_datasets(csv_dir)
+    assert excinfo.value.problems == [
+        "school_programs.csv: line 2, column 'version_key': "
+        "composite reference has an empty part"
+    ]
 
 
 def test_row_with_more_cells_than_header_is_rejected(tmp_path: Path) -> None:
