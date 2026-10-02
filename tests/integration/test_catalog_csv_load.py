@@ -14,7 +14,10 @@ Proves on the real database:
 - one transaction: a single bad row rolls the WHOLE run back (zero rows
   anywhere), and validator-invalid input exits 1 with ZERO statements;
 - end to end: a student registers through the API against the loaded
-  catalog and is enrolled into the CSV-defined subjects.
+  catalog and is enrolled into the CSV-defined subjects;
+- the catalog API serves the loaded rows: every one of the 10
+  GET /catalog/* routes returns 200 with a stable shape, the loaded
+  rows, and deterministic ordering.
 """
 from __future__ import annotations
 
@@ -28,6 +31,18 @@ from sqlalchemy.orm import sessionmaker
 
 from app.data.csv_input import required_columns
 from app.data.registry import EXPECTED_LOAD_ORDER, load_registry
+from app.schemas.catalog import (
+    AcademicYearRead,
+    EducationLevelRead,
+    PathwayRead,
+    ProgramRead,
+    ProgramVersionRead,
+    SchoolProgramRead,
+    SchoolRead,
+    SubjectRead,
+    TVETProgramRead,
+    TVETSectorRead,
+)
 from tests.conftest import APPLICATION_TABLES
 from tests.integration.test_seeder_idempotency import (
     EXPECTED_DATASET_COUNTS,
@@ -182,6 +197,28 @@ def _run_cli(engine, csv_dir: Path, monkeypatch, capsys, *, apply: bool = True):
     args = ["--csv-dir", str(csv_dir)] + (["--apply"] if apply else [])
     rc = load_catalog.main(args)
     return rc, capsys.readouterr().out
+
+
+@contextlib.contextmanager
+def _catalog_api_client(pg_engine):
+    """TestClient bound to ``pg_engine``; catalog routes need no auth."""
+    from fastapi.testclient import TestClient
+
+    from app.core.database import SessionLocal, get_db
+    from app.main import app
+
+    def _override_get_db():
+        db = SessionLocal(bind=pg_engine)
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_apply_then_rerun_issues_zero_write_statements(
@@ -355,11 +392,8 @@ def test_e2e_registration_against_the_csv_loaded_catalog(
     clean_db, pg_engine, tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """A student registers through the API against the synthetic catalog."""
-    from fastapi.testclient import TestClient
-
-    from app.core.database import Base, SessionLocal, get_db
+    from app.core.database import Base
     import app.models  # noqa: F401
-    from app.main import app
 
     csv_dir = _write_catalog(tmp_path / "csv", SYNTHETIC)
     rc, _ = _run_cli(clean_db, csv_dir, monkeypatch, capsys)
@@ -367,61 +401,258 @@ def test_e2e_registration_against_the_csv_loaded_catalog(
 
     Base.metadata.create_all(pg_engine)
 
-    def _override_get_db():
-        db = SessionLocal(bind=pg_engine)
+    with _catalog_api_client(pg_engine) as client:
         try:
-            yield db
+            response = client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": "csv-e2e@example.com",
+                    "password": "correct horse battery staple",
+                    "full_name": "Catalog End To End Student",
+                    "date_of_birth": "2012-04-10",
+                    "gender": "female",
+                    "country": "Rwanda",
+                },
+            )
+            assert response.status_code == 201, response.text
+            header = {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+            with clean_db.connect() as connection:
+                year_id = connection.execute(
+                    text("SELECT id FROM academic_years WHERE name = 'TEST-2099/2100'")
+                ).scalar_one()
+                version_id = connection.execute(
+                    text("SELECT id FROM program_versions WHERE code = 'TEST-COMBO-V1'")
+                ).scalar_one()
+                school_id = connection.execute(
+                    text("SELECT id FROM schools WHERE school_code = 'TEST-SCHOOL-001'")
+                ).scalar_one()
+
+            registration = client.post(
+                "/api/v1/me/registrations",
+                json={
+                    "academic_year_id": str(year_id),
+                    "pathway": "TEST-OL",
+                    "education_level": "TEST-L1",
+                    "program_version_id": str(version_id),
+                    "school_id": str(school_id),
+                },
+                headers=header,
+            )
+            assert registration.status_code == 201, registration.text
+            body = registration.json()
+            assert body["status"] == "pending"
+            assert body["program_code"] == "TEST-COMBO"
+            assert body["school_name"] == "Test School One"
+            assert sorted(subject["code"] for subject in body["subjects"]) == [
+                "TEST-SUB-ENG",
+                "TEST-SUB-MATH",
+            ]
         finally:
-            db.close()
+            _truncate_all(clean_db)
 
-    app.dependency_overrides[get_db] = _override_get_db
-    try:
-        client = TestClient(app)
-        response = client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": "csv-e2e@example.com",
-                "password": "correct horse battery staple",
-                "full_name": "Catalog End To End Student",
-                "date_of_birth": "2012-04-10",
-                "gender": "female",
-                "country": "Rwanda",
-            },
+
+# --- catalog API sweep over the loaded catalog ---------------------------------
+
+
+def _sweep_catalog() -> dict[str, str]:
+    """SYNTHETIC plus a second row in every dataset backing a list route.
+
+    Two rows per route make the ordering assertions meaningful; the rows
+    stay FK-consistent (validated by the loader gate before any write).
+    """
+    files = dict(SYNTHETIC)
+    files["academic_years"] = (
+        SYNTHETIC["academic_years"]
+        + "TEST-2100/2101,2100-09-01,2101-07-31,planned\n"
+    )
+    files["pathways"] = SYNTHETIC["pathways"] + "TEST-AL,Test A-Level\n"
+    files["education_levels"] = (
+        SYNTHETIC["education_levels"] + "TEST-L2,Test Level 2,2\n"
+    )
+    files["pathway_levels"] = SYNTHETIC["pathway_levels"] + "TEST-AL,TEST-L2\n"
+    files["programs"] = (
+        SYNTHETIC["programs"]
+        + "TEST-TVET-PROG-2,Test TVET Programme Two,tvet_program\n"
+    )
+    files["tvet_sectors"] = (
+        SYNTHETIC["tvet_sectors"] + "TEST-SECTOR-ENG,Test Engineering Sector\n"
+    )
+    files["tvet_programs"] = (
+        SYNTHETIC["tvet_programs"] + "TEST-TVET-PROG-2,TEST-SECTOR-ENG\n"
+    )
+    files["program_versions"] = (
+        SYNTHETIC["program_versions"]
+        + "TEST-COMBO,TEST-2100/2101,TEST-AL,TEST-L2,"
+        "TEST-COMBO-V2,Test Combination 2100/2101\n"
+    )
+    files["schools"] = SYNTHETIC["schools"] + "TEST-SCHOOL-002,Test School Two\n"
+    files["school_programs"] = (
+        SYNTHETIC["school_programs"]
+        + "TEST-SCHOOL-001,TEST-COMBO|TEST-2100/2101|TEST-AL|TEST-L2\n"
+        + "TEST-SCHOOL-002,TEST-COMBO|TEST-2100/2101|TEST-AL|TEST-L2\n"
+    )
+    return files
+
+
+def _assert_list_route(
+    client, path: str, model, expected: list[str], *, field: str = "code"
+) -> list[dict]:
+    """GET a list route: 200, stable shape, expected rows in documented order.
+
+    Each route is fetched twice; identical payloads prove the ordering is
+    deterministic across calls (the documented ORDER BY).
+    """
+    first = client.get(f"/api/v1/catalog{path}")
+    assert first.status_code == 200, f"{path}: {first.text}"
+    payload = first.json()
+    assert isinstance(payload, list), path
+    fields = set(model.model_fields)
+    for item in payload:
+        assert set(item) == fields, f"{path}: unstable shape {set(item) ^ fields}"
+    assert [row[field] for row in payload] == expected, path
+    second = client.get(f"/api/v1/catalog{path}")
+    assert second.status_code == 200, path
+    assert second.json() == payload, f"{path}: non-deterministic ordering"
+    return payload
+
+
+def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
+    clean_db, pg_engine, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """All 10 GET /catalog/* routes against the CSV-loaded sweep catalog."""
+    csv_dir = _write_catalog(tmp_path / "csv", _sweep_catalog())
+    rc, _ = _run_cli(clean_db, csv_dir, monkeypatch, capsys)
+    assert rc == 0
+
+    with _catalog_api_client(pg_engine) as client:
+        # start_date descending, then name
+        _assert_list_route(
+            client, "/academic-years", AcademicYearRead,
+            ["TEST-2100/2101", "TEST-2099/2100"], field="name",
         )
-        assert response.status_code == 201, response.text
-        header = {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-        with clean_db.connect() as connection:
-            year_id = connection.execute(
-                text("SELECT id FROM academic_years WHERE name = 'TEST-2099/2100'")
-            ).scalar_one()
-            version_id = connection.execute(
-                text("SELECT id FROM program_versions WHERE code = 'TEST-COMBO-V1'")
-            ).scalar_one()
-            school_id = connection.execute(
-                text("SELECT id FROM schools WHERE school_code = 'TEST-SCHOOL-001'")
-            ).scalar_one()
-
-        registration = client.post(
-            "/api/v1/me/registrations",
-            json={
-                "academic_year_id": str(year_id),
-                "pathway": "TEST-OL",
-                "education_level": "TEST-L1",
-                "program_version_id": str(version_id),
-                "school_id": str(school_id),
-            },
-            headers=header,
+        # code
+        _assert_list_route(client, "/pathways", PathwayRead, ["TEST-AL", "TEST-OL"])
+        # level_number, then code
+        _assert_list_route(
+            client, "/education-levels", EducationLevelRead, ["TEST-L1", "TEST-L2"]
         )
-        assert registration.status_code == 201, registration.text
-        body = registration.json()
-        assert body["status"] == "pending"
-        assert body["program_code"] == "TEST-COMBO"
-        assert body["school_name"] == "Test School One"
-        assert sorted(subject["code"] for subject in body["subjects"]) == [
-            "TEST-SUB-ENG",
-            "TEST-SUB-MATH",
+        # name, then code
+        _assert_list_route(
+            client, "/subjects", SubjectRead,
+            ["Test English", "Test Mathematics"], field="name",
+        )
+        # code
+        _assert_list_route(
+            client, "/programs", ProgramRead,
+            ["TEST-COMBO", "TEST-TVET-PROG", "TEST-TVET-PROG-2"],
+        )
+        # program code, start_date descending, level_number
+        _assert_list_route(
+            client, "/program-versions", ProgramVersionRead,
+            ["TEST-COMBO-V2", "TEST-COMBO-V1"],
+        )
+        # code
+        _assert_list_route(
+            client, "/tvet/sectors", TVETSectorRead,
+            ["TEST-SECTOR-ENG", "TEST-SECTOR-ICT"],
+        )
+        # program code — the first of the two TVET routes
+        _assert_list_route(
+            client, "/tvet/programs", TVETProgramRead,
+            ["TEST-TVET-PROG", "TEST-TVET-PROG-2"], field="program_code",
+        )
+        # name, then school_code
+        _assert_list_route(
+            client, "/schools", SchoolRead,
+            ["TEST-SCHOOL-001", "TEST-SCHOOL-002"], field="school_code",
+        )
+        # A school's offerings — the second TVET-style detail route
+        # (/schools/{school_code}/programs). The documented ORDER BY
+        # (school name, school code) cannot discriminate two offerings of
+        # the SAME school, so the pinned contract is a stable set plus an
+        # identical repeat response.
+        first = client.get("/api/v1/catalog/schools/TEST-SCHOOL-001/programs")
+        assert first.status_code == 200, first.text
+        rows = first.json()
+        fields = set(SchoolProgramRead.model_fields)
+        for item in rows:
+            assert set(item) == fields, f"school offerings: unstable shape {set(item) ^ fields}"
+        assert sorted(row["code"] for row in rows) == [
+            "TEST-COMBO-V1",
+            "TEST-COMBO-V2",
         ]
-    finally:
-        app.dependency_overrides.clear()
-        _truncate_all(clean_db)
+        second = client.get("/api/v1/catalog/schools/TEST-SCHOOL-001/programs")
+        assert second.json() == rows, "school offerings: non-deterministic ordering"
+        _assert_list_route(
+            client, "/schools/TEST-SCHOOL-002/programs", SchoolProgramRead,
+            ["TEST-COMBO-V2"],
+        )
+
+    _truncate_all(clean_db)
+
+
+def test_catalog_api_filter_and_unknown_value_pins(
+    clean_db, pg_engine, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Pin current filter semantics: identity vs attribute unknown values."""
+    csv_dir = _write_catalog(tmp_path / "csv", _sweep_catalog())
+    rc, _ = _run_cli(clean_db, csv_dir, monkeypatch, capsys)
+    assert rc == 0
+
+    with _catalog_api_client(pg_engine) as client:
+        # ?pathway= / ?level= / ?sector= resolve through real relationships.
+        response = client.get("/api/v1/catalog/education-levels?pathway=TEST-OL")
+        assert response.status_code == 200
+        assert [row["code"] for row in response.json()] == ["TEST-L1"]
+        response = client.get("/api/v1/catalog/education-levels?pathway=TEST-AL")
+        assert [row["code"] for row in response.json()] == ["TEST-L2"]
+
+        response = client.get(
+            "/api/v1/catalog/programs?pathway=TEST-OL&level=TEST-L1"
+        )
+        assert response.status_code == 200
+        assert [row["code"] for row in response.json()] == ["TEST-COMBO"]
+        response = client.get(
+            "/api/v1/catalog/programs?pathway=TEST-AL&level=TEST-L2"
+        )
+        assert [row["code"] for row in response.json()] == ["TEST-COMBO"]
+
+        response = client.get("/api/v1/catalog/program-versions?pathway=TEST-OL")
+        assert response.status_code == 200
+        assert [row["code"] for row in response.json()] == ["TEST-COMBO-V1"]
+
+        response = client.get("/api/v1/catalog/tvet/programs?sector=TEST-SECTOR-ENG")
+        assert response.status_code == 200
+        assert [row["program_code"] for row in response.json()] == [
+            "TEST-TVET-PROG-2"
+        ]
+        response = client.get("/api/v1/catalog/tvet/programs?sector=TEST-SECTOR-ICT")
+        assert [row["program_code"] for row in response.json()] == ["TEST-TVET-PROG"]
+
+        # Unknown *identities* are pinned as 404 (documented behavior).
+        for path in (
+            "/education-levels?pathway=NOPE",
+            "/programs?pathway=NOPE",
+            "/programs?level=NOPE",
+            "/program-versions?pathway=NOPE",
+            "/tvet/programs?sector=NOPE",
+            "/schools/NOPE/programs",
+        ):
+            response = client.get(f"/api/v1/catalog{path}")
+            assert response.status_code == 404, path
+
+        # Unknown *attribute values* are pinned as 200 with [] — asymmetric
+        # with the identity filters above, but the documented contract
+        # ("404/400 are reserved for invalid or unknown requested identities").
+        for path in (
+            "/academic-years?status=BOGUS",
+            "/subjects?status=BOGUS",
+            "/schools?province=NOPE",
+            "/programs?program_type=BOGUS",
+        ):
+            response = client.get(f"/api/v1/catalog{path}")
+            assert response.status_code == 200, path
+            assert response.json() == [], path
+
+    _truncate_all(clean_db)
