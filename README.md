@@ -119,8 +119,9 @@ route serves both a student and an administrator:
 
 A student's data access is token-derived: `GET /me/registrations`
 returns only the caller's own rows, and another student's enrollment id
-on `GET /me/registrations/{id}` is a 403 (UUIDs are identifiers, not
-authorization). An administrator registers on behalf of a student with
+on `GET /me/registrations/{id}` is a 404 byte-identical to an unknown id
+(UUIDs are identifiers, not authorization — a foreign id must never
+confirm existence). An administrator registers on behalf of a student with
 an explicit `student_id` on `POST /admin/registrations`. A missing
 student profile is a 403 domain error whose detail points at the
 self-service remedy (`POST /api/v1/me/student`) — never an implicit
@@ -138,13 +139,15 @@ internals — a lockout answers exactly like a wrong password) · `403`
 wrong role for the namespace (`require_admin` and `require_teacher`
 answer with `"administrator role required for this operation"` /
 `"teacher role required for this operation"`; student-only routes refuse
-non-students), wrong
-object ownership on `/me/*`, or a missing student profile · `404` unknown
-id for an authorized caller (an application-wide exception handler maps
+non-students), or a missing student profile · `404` unknown
+id for an authorized caller, and another student's enrollment id on
+`GET /me/registrations/{id}` (the same answer as an unknown id — no
+existence leak; an application-wide exception handler maps
 `ProfileError` statuses, so an unknown student id is a clean 404 on
 admin read **and** PATCH, never a 500 — students get 403 from the role
-guard first) · `409` duplicate account/enrollment, an invalid status
-transition, or unlocking an account that is not locked · `422` invalid
+guard first) · `409` duplicate account/enrollment, a refused status
+transition on `PATCH /admin/registrations/{id}/status`, or unlocking an
+account that is not locked · `422` invalid
 request (including implausible dates of birth, spoofed/unknown body keys
 and failed name/phone/country validation) · `429` rate limit exceeded ·
 `503` catalog/year unavailability.
@@ -213,7 +216,8 @@ lock and unlock writes an audit event.
 `password_change`, `password_reset`, `invite_accepted`,
 `account_deactivated` and every administrative mutation
 (`teacher_created`, `teacher_invite_sent`, `teacher_activated`,
-`teacher_deactivated`, `user_role_changed`, `user_unlocked`) write an
+`teacher_deactivated`, `user_role_changed`, `user_unlocked`,
+`registration_status_changed`) write an
 `auth_events` row: the subject (`user_id`), the acting administrator
 (`actor_user_id`) when that is someone else, and — on login and logout —
 the caller's `ip_address` and `user_agent` (truncated to the column
@@ -248,7 +252,7 @@ POST   /api/v1/me/student                        (attach a missing profile)
 PATCH  /api/v1/me/student
 GET    /api/v1/me/registrations
 POST   /api/v1/me/registrations                  (no student_id field — 422 if sent)
-GET    /api/v1/me/registrations/{enrollment_id}  (owner only, else 403)
+GET    /api/v1/me/registrations/{enrollment_id}  (owner only, else 404 like an unknown id)
 
 # --- teacher self-service (Bearer, role=teacher) ------------------------------
 GET    /api/v1/me/teacher                        (own profile; 404 when none exists)
@@ -256,11 +260,14 @@ PATCH  /api/v1/me/teacher                        (full_name|phone|subject; extra
 
 # --- administration (Bearer, role=admin) --------------------------------------
 POST   /api/v1/admin/students                    (create profile pair)
+GET    /api/v1/admin/students                    (paginated; q|gender|country filters)
 GET    /api/v1/admin/students/{student_id}
 PATCH  /api/v1/admin/students/{student_id}
 GET    /api/v1/admin/students/{student_id}/history (paginated audit trail)
 POST   /api/v1/admin/registrations               (student_id REQUIRED)
+GET    /api/v1/admin/registrations               (paginated; year|status|school|student filters)
 GET    /api/v1/admin/registrations/{enrollment_id}
+PATCH  /api/v1/admin/registrations/{enrollment_id}/status  (allowed transitions; ended_at; audited)
 GET    /api/v1/admin/students/{student_id}/registrations
 POST   /api/v1/admin/teachers                    (pending account + invitation email)
 GET    /api/v1/admin/teachers                    (paginated)
@@ -351,6 +358,17 @@ Cross-entity rules enforced by `app/services/registration_service.py`
   together or roll back completely;
 - `student_subjects` derive only from `program_version → program_subjects
   → subjects`, never from the bare subjects table.
+
+**Re-registration after a terminal status (documented, pinned by
+tests).** `find_existing` deliberately matches the student's enrollment
+for the year in *any* status, so an enrollment that already ended
+(`cancelled`, `withdrawn`, `transferred` or `completed`) keeps refusing
+a new `POST /me/registrations` / `POST /admin/registrations` for the
+same academic year with the same 409 — the UNIQUE constraint agrees,
+and terminal statuses have no outgoing transitions. Correcting a
+mistaken cancellation is therefore a deliberate data decision with no
+API path today; neither the list nor the status endpoint changes this
+behavior.
 
 ### Known catalog limitations (honest by design)
 

@@ -15,7 +15,9 @@ Student Self-Service (role=student, ``/me`` prefix):
 - ``GET /me/registrations`` — your enrollment history (newest academic
   year first), the preferred form for the Student Portal.
 - ``GET /me/registrations/{enrollment_id}`` — one of your enrollments;
-  someone else's id is a 403 (UUIDs are identifiers, not authorization).
+  someone else's id is a 404 identical to an unknown id (UUIDs are
+  identifiers, not authorization — a foreign id must not confirm
+  existence).
 
 Administration (admin role, ``/admin`` prefix):
 

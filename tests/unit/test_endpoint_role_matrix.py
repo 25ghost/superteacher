@@ -26,6 +26,7 @@ import uuid
 
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -64,6 +65,7 @@ TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
 ]
 
 ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
+    ("GET", "/api/v1/admin/students", None),
     ("POST", "/api/v1/admin/students", {}),
     ("GET", "/api/v1/admin/students/{student_id}", None),
     ("PATCH", "/api/v1/admin/students/{student_id}", {}),
@@ -75,8 +77,10 @@ ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/admin/teachers/{user_id}/deactivate", {}),
     ("PATCH", "/api/v1/admin/users/{user_id}/role", {}),
     ("POST", "/api/v1/admin/users/{user_id}/unlock", {}),
+    ("GET", "/api/v1/admin/registrations", None),
     ("POST", "/api/v1/admin/registrations", {}),
     ("GET", "/api/v1/admin/registrations/{enrollment_id}", None),
+    ("PATCH", "/api/v1/admin/registrations/{enrollment_id}/status", {}),
     ("GET", "/api/v1/admin/students/{student_id}/registrations", None),
 ]
 
@@ -226,6 +230,31 @@ def test_public_routes_never_answer_401_or_403(
     assert response.status_code not in (401, 403), (
         f"{route[0]} {route[1]} -> {response.status_code}: {response.text}"
     )
+
+
+def test_route_inventory_is_exactly_the_matrix() -> None:
+    """No v1 endpoint may exist outside the role matrix — and vice versa.
+
+    The count pin (49) makes adding or removing a route a conscious
+    decision: a new endpoint must be listed in one of the five groups
+    above or this test names it as unlisted.
+    """
+    actual = {
+        (method, f"/api/v1{route.path}")  # the prefix the app mounts it with
+        for route in api_router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+        if method not in ("HEAD", "OPTIONS")
+    }
+    listed = {
+        (method, template)
+        for method, template, _ in PROTECTED_ROUTES + PUBLIC_ROUTES
+    }
+    assert listed == actual, (
+        f"unlisted routes: {sorted(actual - listed)}; "
+        f"stale matrix entries: {sorted(listed - actual)}"
+    )
+    assert len(actual) == 49, f"route count changed: {len(actual)} != 49"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------
