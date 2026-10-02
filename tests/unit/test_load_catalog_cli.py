@@ -70,6 +70,19 @@ def _refuse_session(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return factory
 
 
+def _capture_write_statements(engine) -> list[str]:
+    """Record every INSERT/UPDATE/DELETE executed through this engine."""
+    statements: list[str] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany) -> None:
+        keyword = statement.strip().split(None, 1)[0].upper()
+        if keyword in {"INSERT", "UPDATE", "DELETE"}:
+            statements.append(statement)
+
+    return statements
+
+
 def test_dry_run_is_the_default_and_writes_nothing(
     sqlite_engine, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -122,6 +135,37 @@ def test_missing_csv_dir_exits_1(
     assert rc == 1
     assert "CSV PARSE FAILED" in capsys.readouterr().out
     factory.assert_not_called()
+
+
+def test_unexpected_dry_run_exception_exits_1_with_counts_only_output(
+    sqlite_engine,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ValidationError blow-up in the dry run: exit 1, zero writes,
+    and the failure message carries no record payloads."""
+    monkeypatch.setattr(
+        "scripts.load_catalog.run_load",
+        Mock(side_effect=RuntimeError("unexpected dry-run failure")),
+    )
+    write_statements = _capture_write_statements(sqlite_engine)
+
+    rc = main(["--csv-dir", str(_valid_dir(tmp_path)), "--apply"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert (
+        "DRY RUN FAILED — no database writes performed: "
+        "unexpected dry-run failure" in out
+    )
+    assert "Dataset validation: OK" in out
+    # counts-only output: no row contents anywhere, including the message
+    assert "TEST-OL" not in out
+    assert "Test O-Level" not in out
+    assert "records=" not in out
+    assert write_statements == []
+    assert _count(sqlite_engine, "pathways") == 0
 
 
 def test_apply_without_confirmation_is_refused(
@@ -249,16 +293,7 @@ def test_production_confirmation_interrupted_exits_1_with_no_writes_or_commit(
     monkeypatch.setattr(sys, "stdin", _FakeTTY(True))
     monkeypatch.setattr("builtins.input", Mock(side_effect=error()))
 
-    write_statements: list[str] = []
-
-    @event.listens_for(sqlite_engine, "before_cursor_execute")
-    def _record_writes(
-        conn, cursor, statement, parameters, context, executemany
-    ) -> None:
-        keyword = statement.strip().split(None, 1)[0].upper()
-        if keyword in {"INSERT", "UPDATE", "DELETE"}:
-            write_statements.append(statement)
-
+    write_statements = _capture_write_statements(sqlite_engine)
     commits: list = []
 
     def _record_commit(session: Session) -> None:
