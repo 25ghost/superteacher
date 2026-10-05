@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import csv as csv_mod
+import uuid
 from pathlib import Path
 
 import pytest
@@ -487,12 +488,98 @@ def _sweep_catalog() -> dict[str, str]:
         "TEST-COMBO-V2,Test Combination 2100/2101\n"
     )
     files["schools"] = SYNTHETIC["schools"] + "TEST-SCHOOL-002,Test School Two\n"
+    # TEST-SCHOOL-001 keeps EXACTLY ONE loaded offering. Its further
+    # offerings are appended by the sweep test with chosen ids in
+    # descending order (_insert_probe_offerings); a second loader-minted
+    # uuid4 row would leave the pair's relative order to a coin toss and
+    # the school's insertion order would no longer run strictly downward.
     files["school_programs"] = (
         SYNTHETIC["school_programs"]
-        + "TEST-SCHOOL-001,TEST-COMBO|TEST-2100/2101|TEST-AL|TEST-L2\n"
         + "TEST-SCHOOL-002,TEST-COMBO|TEST-2100/2101|TEST-AL|TEST-L2\n"
     )
     return files
+
+
+#: TEST-SCHOOL-001's probe offerings, ordered as they are INSERTED (high
+#: id first). Each carries a free four-column program-version identity —
+#: the loaded TEST-COMBO-V1/V2 tuples are already taken.
+#:
+#: The ids are strictly below every uuid4: the version nibble is 0 (uuid4
+#: always mints 4) and time_low/time_mid are zero, so no loader-generated
+#: uuid4 can sort under them. Written in this order the school's physical
+#: row order is descending end to end — the exact opposite of the
+#: ascending ``program_version_id`` contract asserted below.
+_PROBE_OFFERINGS = (
+    (
+        uuid.UUID("00000000-0000-0000-8000-000000000002"),
+        "TEST-COMBO-V3",
+        "Test Combination Probe 3",
+        ("TEST-COMBO", "TEST-2100/2101", "TEST-OL", "TEST-L1"),
+    ),
+    (
+        uuid.UUID("00000000-0000-0000-8000-000000000001"),
+        "TEST-COMBO-V4",
+        "Test Combination Probe 4",
+        ("TEST-COMBO", "TEST-2099/2100", "TEST-AL", "TEST-L2"),
+    ),
+)
+
+
+def _insert_probe_offerings(engine) -> None:
+    """Give TEST-SCHOOL-001 offerings with chosen, descending version ids.
+
+    The loader mints uuid4 ids, so a CSV-loaded school cannot promise that
+    insertion order is the opposite of id order. These two rows are
+    written directly instead, high id first, one flush per row so the
+    physical insert order of ``school_programs`` is this loop's order.
+
+    Called AFTER the ``/program-versions`` sweep above: the probe versions
+    are real rows, so they deliberately exercise only this route's
+    ordering contract.
+    """
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.models.academic_year import AcademicYear
+    from app.models.education_level import EducationLevel
+    from app.models.pathway import Pathway
+    from app.models.program import Program
+    from app.models.program_version import ProgramVersion
+    from app.models.school import School
+    from app.models.school_program import SchoolProgram
+
+    session = SessionLocal(bind=engine)
+
+    def _id(model, **filter_by):
+        return session.execute(select(model.id).filter_by(**filter_by)).scalar_one()
+
+    try:
+        school_id = _id(School, school_code="TEST-SCHOOL-001")
+        for version_id, code, name, (program, year, pathway, level) in _PROBE_OFFERINGS:
+            session.add(
+                ProgramVersion(
+                    id=version_id,
+                    program_id=_id(Program, code=program),
+                    academic_year_id=_id(AcademicYear, name=year),
+                    pathway_id=_id(Pathway, code=pathway),
+                    education_level_id=_id(EducationLevel, code=level),
+                    code=code,
+                    name=name,
+                    status="active",
+                )
+            )
+            session.flush()
+            session.add(
+                SchoolProgram(
+                    school_id=school_id,
+                    program_version_id=version_id,
+                    status="active",
+                )
+            )
+            session.flush()
+        session.commit()
+    finally:
+        session.close()
 
 
 def _assert_list_route(
@@ -569,9 +656,32 @@ def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
         )
         # A school's offerings — the second TVET-style detail route
         # (/schools/{school_code}/programs). School name and school code
-        # tie for offerings of the SAME school, so the intra-school order
-        # is pinned to the program-version id tiebreaker in the
-        # repository's ORDER BY (a two-offering school makes it real).
+        # tie for EVERY offering of the same school, so the intra-school
+        # order rests entirely on the program-version id tiebreaker in the
+        # repository's ORDER BY.
+        #
+        # Fixture premise, asserted and not assumed: the table's own row
+        # order — ctid, i.e. insertion order, no ORDER BY at all — runs
+        # strictly DOWNWARD. An untied query returns exactly that, which is
+        # the reverse of the ascending contract asserted below, so a
+        # missing tiebreaker can never pass by accident.
+        _insert_probe_offerings(pg_engine)
+        with pg_engine.connect() as connection:
+            physical = [
+                str(row[0])
+                for row in connection.execute(
+                    text(
+                        "SELECT program_version_id FROM school_programs WHERE "
+                        "school_id = (SELECT id FROM schools "
+                        "WHERE school_code = 'TEST-SCHOOL-001') ORDER BY ctid"
+                    )
+                )
+            ]
+        assert physical == sorted(physical, reverse=True), (
+            "probe fixture: insertion order is not the opposite of id order: "
+            f"{physical}"
+        )
+
         first = client.get("/api/v1/catalog/schools/TEST-SCHOOL-001/programs")
         assert first.status_code == 200, first.text
         rows = first.json()
@@ -580,7 +690,8 @@ def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
             assert set(item) == fields, f"school offerings: unstable shape {set(item) ^ fields}"
         assert sorted(row["code"] for row in rows) == [
             "TEST-COMBO-V1",
-            "TEST-COMBO-V2",
+            "TEST-COMBO-V3",
+            "TEST-COMBO-V4",
         ]
         version_ids = [row["program_version_id"] for row in rows]
         assert version_ids == sorted(version_ids), (
