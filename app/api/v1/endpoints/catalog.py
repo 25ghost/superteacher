@@ -19,6 +19,7 @@ Conventions:
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.api.v1.tags import TAG_CATALOG
 from app.core.database import get_db
 from app.repositories.catalog_repository import CatalogNotFoundError
 from app.schemas.catalog import (
@@ -35,7 +36,7 @@ from app.schemas.catalog import (
 )
 from app.services import catalog_service
 
-router = APIRouter(prefix="/catalog", tags=["catalog"])
+router = APIRouter(prefix="/catalog", tags=[TAG_CATALOG])
 
 _SHARED_REFERENCE_NOTE = (
     "SuperTeacher shared reference-data API: consumed by the Student "

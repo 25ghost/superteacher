@@ -15,10 +15,12 @@ Authentication (Phase 5G): protected endpoints (student profile writes,
 registrations, /me) require a Bearer access token issued by
 ``/api/v1/auth/login`` or ``/api/v1/auth/register``. The Bearer scheme is
 declared in OpenAPI; public endpoints (health, catalog, readiness) remain
-public. Endpoints are role-split: self-service lives under ``/me/*``
-(student-only routes tagged "Student Self-Service"), administration under
-``/admin/*`` (admin role, tagged "Administration"), and no route serves
-both roles.
+public. Endpoints are role-split: self-service lives under ``/me/*``,
+administration under ``/admin/*``, and no route serves two roles. The
+OpenAPI document groups them by role (Authentication, Account, Student,
+Teacher, Admin - *, Catalog, Health) and prefixes every operation
+description with the role it requires; the vocabulary lives in
+``app.api.v1.tags``.
 
 Rate limiting: login, register and refresh endpoints are throttled via
 slowapi to prevent brute-force and account-spam attacks. The limits are
@@ -31,11 +33,13 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.security import HTTPBearer
 from fastapi.openapi.utils import get_openapi
 from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import api_router
+from app.api.v1.tags import OPENAPI_TAGS, access_note_for, generate_operation_id
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
@@ -61,14 +65,34 @@ _is_production = settings.ENVIRONMENT.lower() == "production"
 app = FastAPI(
     title="SuperTeacher API",
     description=(
-        "SuperTeacher backend API. Currently serving the Student "
-        "Registration Portal module (authenticated). Independent from the "
-        "existing SuperTeacher desktop application."
+        "SuperTeacher backend API for the Student Registration Portal — "
+        "independent from the SuperTeacher desktop application.\n\n"
+        "Three roles share the surface: **student** (own profile and "
+        "registrations under /me/student and /me/registrations), "
+        "**teacher** (own profile under /me/teacher) and **admin** (student, "
+        "registration, teacher and user administration under /admin/*).\n\n"
+        "**Authorizing:** call POST /api/v1/auth/login (or /register) to "
+        "obtain an access token, click **Authorize**, pick the HTTPBearer "
+        "scheme and paste the token without the leading \"Bearer \". Every "
+        "protected operation then shows a padlock.\n\n"
+        "Only Authentication, Catalog and Health are public; within "
+        "Authentication, GET /auth/me and POST /auth/logout still need a "
+        "token. Each operation description starts with an ``Access:`` line "
+        "naming the role that may call it."
     ),
     version="0.2.0",
     docs_url="/docs" if not _is_production else None,
     redoc_url="/redoc" if not _is_production else None,
     openapi_url="/openapi.json" if not _is_production else None,
+    openapi_tags=OPENAPI_TAGS,
+    swagger_ui_parameters={
+        "docExpansion": "none",
+        "persistAuthorization": True,
+        "displayRequestDuration": True,
+        "filter": True,
+        "operationsSorter": "alpha",
+        "defaultModelsExpandDepth": -1,
+    },
 )
 app.state.limiter = limiter
 
@@ -177,6 +201,31 @@ app.add_middleware(
 )
 
 
+def _apply_operation_metadata() -> None:
+    """Apply the two per-route documentation touches before ``get_openapi``.
+
+    * ``operation_id`` — the stable, tag-based id clients see. Assigned here
+      rather than through ``generate_unique_id_function`` on purpose: FastAPI
+      also derives ``route.unique_id`` from that function *and* uses it to name
+      the response schema field (``routing.py``: ``"Response_" + unique_id``),
+      which would rename schema titles. ``operation_id`` is read only for the
+      spec's ``operationId`` (``openapi/utils.py``), so schemas stay untouched.
+    * The ``Access:`` line — role from the route's own dependency (see
+      ``app.api.v1.tags.access_note_for``), so the note cannot drift from the
+      code. Both assignments are idempotent.
+    """
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        route.operation_id = generate_operation_id(route)
+        if route.description and route.description.startswith("Access: "):
+            continue
+        note = access_note_for(route)
+        route.description = (
+            f"{note}\n\n{route.description}" if route.description else note
+        )
+
+
 def custom_openapi() -> dict:
     """OpenAPI schema with the Bearer security scheme declared (Step 37).
 
@@ -185,14 +234,20 @@ def custom_openapi() -> dict:
     endpoints that depend on ``get_current_user`` advertise their own
     ``security`` requirements; public endpoints (health, catalog,
     readiness) carry none.
+
+    Also the single place where documentation metadata is assembled: the
+    role-based tag blocks (``OPENAPI_TAGS``) are published, and every
+    operation description gets its ``Access:`` line prepended first.
     """
     if app.openapi_schema:
         return app.openapi_schema
+    _apply_operation_metadata()
     openapi_schema = get_openapi(
         title=app.title,
         version=app.version,
         description=app.description,
         routes=app.routes,
+        tags=app.openapi_tags,
     )
     openapi_schema.setdefault("components", {})["securitySchemes"] = {
         "HTTPBearer": {

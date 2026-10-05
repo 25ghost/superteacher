@@ -43,6 +43,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
+from app.api.v1.tags import TAG_ADMIN_REGISTRATIONS, TAG_CATALOG, TAG_STUDENT
 from app.core.auth_dependencies import (
     get_current_student,
     require_admin,
@@ -67,14 +68,15 @@ from app.services.registration_service import RegistrationError, RegistrationNot
 
 _settings = get_settings()
 
-# Public readiness report — the only endpoint left on /registrations.
-router = APIRouter(prefix="/registrations", tags=["registrations"])
+# Public readiness report — the only endpoint left on /registrations; it
+# reports *catalog* readiness, so it belongs to the Catalog group.
+router = APIRouter(prefix="/registrations", tags=[TAG_CATALOG])
 
 # Student self-service registration routes (mounted under /me).
-me_router = APIRouter(prefix="/me", tags=["Student Self-Service", "registrations"])
+me_router = APIRouter(prefix="/me", tags=[TAG_STUDENT])
 
 # Administrative registration routes (mounted under /admin).
-admin_router = APIRouter(prefix="/admin", tags=["Administration", "registrations"])
+admin_router = APIRouter(prefix="/admin", tags=[TAG_ADMIN_REGISTRATIONS])
 
 
 def _http_error(exc: RegistrationError) -> HTTPException:

@@ -286,8 +286,11 @@ removed, not aliased: `GET/PATCH /students/{id}` (split into
 `/admin/registrations/{id}`) and `GET /students/{id}/registrations`
 (replaced by `/me/registrations` for the owner and
 `/admin/students/{id}/registrations` for administrators). Swagger groups
-the namespaces under the tags *Self-Service*, *Student Self-Service*,
-*Teacher Self-Service* and *Administration*.
+the operations into ten role-based tag groups — *Authentication*,
+*Account*, *Student*, *Teacher*, *Admin - Students*,
+*Admin - Registrations*, *Admin - Teachers*, *Admin - Users*, *Catalog*
+and *Health* — and prefixes every operation description with an
+`Access:` line naming the role that may call it.
 
 `GET /health` needs no database (and is rate-limited so a probe storm
 cannot pin the event loop). Catalog endpoints are read-only and

@@ -31,6 +31,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
+from app.api.v1.tags import TAG_ADMIN_TEACHERS, TAG_ADMIN_USERS
 from app.core.auth_dependencies import require_admin
 from app.core.config import get_settings
 from app.core.database import get_db
@@ -47,7 +48,9 @@ from app.services.auth_service import AuthError
 
 _settings = get_settings()
 
-router = APIRouter(prefix="/admin", tags=["Administration"])
+# No router-level tags: this router mixes two groups, so every route below
+# declares its own single tag (Admin - Teachers vs Admin - Users).
+router = APIRouter(prefix="/admin")
 
 
 def _error(exc: AuthError) -> HTTPException:
@@ -57,6 +60,7 @@ def _error(exc: AuthError) -> HTTPException:
 
 @router.post(
     "/teachers",
+    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     status_code=status.HTTP_201_CREATED,
     summary="Create a teacher account and send its invitation (administrative)",
@@ -94,6 +98,7 @@ def create_teacher(
 
 @router.get(
     "/teachers",
+    tags=[TAG_ADMIN_TEACHERS],
     response_model=list[TeacherRead],
     summary="List teacher accounts (administrative)",
     description=(
@@ -118,6 +123,7 @@ def list_teachers(
 
 @router.post(
     "/teachers/{user_id}/invite",
+    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Re-send a teacher invitation (administrative)",
     description=(
@@ -151,6 +157,7 @@ def resend_invite(
 
 @router.post(
     "/teachers/{user_id}/activate",
+    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Activate a teacher account (administrative)",
     description=(
@@ -183,6 +190,7 @@ def activate_teacher(
 
 @router.post(
     "/teachers/{user_id}/deactivate",
+    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Deactivate a teacher account (administrative)",
     description=(
@@ -216,6 +224,7 @@ def deactivate_teacher(
 
 @router.patch(
     "/users/{user_id}/role",
+    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserRead,
     summary="Change an account's role (administrative)",
     description=(
@@ -257,6 +266,7 @@ def change_role(
 
 @router.post(
     "/users/{user_id}/unlock",
+    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserRead,
     summary="Clear a login lockout (administrative)",
     description=(

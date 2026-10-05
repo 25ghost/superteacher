@@ -38,6 +38,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.api.v1.tags import TAG_ACCOUNT, TAG_AUTHENTICATION, TAG_STUDENT, TAG_TEACHER
 from app.core.auth_dependencies import (
     get_current_student,
     get_current_user,
@@ -73,10 +74,10 @@ from app.services import student_service
 from app.services import teacher_service
 from app.services.student_service import read_profile
 
-router = APIRouter(prefix="/auth", tags=["Authentication"])
-me_router = APIRouter(prefix="/me", tags=["Self-Service"])
-student_me_router = APIRouter(prefix="/me/student", tags=["Student Self-Service"])
-teacher_me_router = APIRouter(prefix="/me/teacher", tags=["Teacher Self-Service"])
+router = APIRouter(prefix="/auth", tags=[TAG_AUTHENTICATION])
+me_router = APIRouter(prefix="/me", tags=[TAG_ACCOUNT])
+student_me_router = APIRouter(prefix="/me/student", tags=[TAG_STUDENT])
+teacher_me_router = APIRouter(prefix="/me/teacher", tags=[TAG_TEACHER])
 
 # Advertised in OpenAPI so protected endpoints document the Bearer scheme
 # (Step 37). auto_error=False keeps our own 401 contract for missing headers.
@@ -256,7 +257,7 @@ def logout(
 @router.get(
     "/me",
     response_model=AuthUserRead,
-    summary="Current authenticated identity",
+    summary="Return the current authenticated identity",
     description=(
         "Safe information about the caller: user id, email, role (one of "
         "'student', 'teacher', 'admin'), status and the linked student "
@@ -287,7 +288,7 @@ def read_auth_me(
 @me_router.get(
     "",
     response_model=AuthUserRead,
-    summary="Current authenticated identity",
+    summary="Return the current authenticated identity",
     description=(
         "Safe information about the caller: user id, email, role, status "
         "and the linked student profile summary when applicable. Derived "
@@ -315,7 +316,7 @@ def read_me(
 @student_me_router.get(
     "",
     response_model=StudentProfileRead,
-    summary="Current authenticated student profile",
+    summary="Return the current student profile",
     description=(
         "The authenticated student's own profile. The identity comes from "
         "the access token (role must be 'student' and the profile must "
@@ -614,7 +615,7 @@ def deactivate_account(
 @teacher_me_router.get(
     "",
     response_model=TeacherMeRead,
-    summary="Current authenticated teacher profile",
+    summary="Return the current teacher profile",
     description=(
         "The authenticated teacher's own profile. The identity comes from "
         "the access token (role must be 'teacher'); there is no id in the "
