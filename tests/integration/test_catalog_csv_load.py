@@ -48,7 +48,6 @@ from tests.conftest import APPLICATION_TABLES
 from tests.integration.test_seeder_idempotency import (
     EXPECTED_DATASET_COUNTS,
     _run_seeder,
-    _truncate_all,
     capture_row_counts,
 )
 
@@ -248,8 +247,6 @@ def test_apply_then_rerun_issues_zero_write_statements(
     assert "warning" not in out
     assert capture_row_counts(clean_db) == counts_after_first
 
-    _truncate_all(clean_db)
-
 
 def test_dry_run_issues_no_write_statements(
     clean_db, tmp_path: Path, monkeypatch, capsys
@@ -335,8 +332,6 @@ def test_missing_from_input_is_reported_and_rows_are_never_deleted(
     assert counts["pathway_levels"] == 1  # untouched, never deleted
     assert counts["school_programs"] == 1
 
-    _truncate_all(clean_db)
-
 
 def test_shipped_catalog_roundtrip_is_a_noop(
     clean_db, tmp_path: Path, monkeypatch, capsys
@@ -354,8 +349,6 @@ def test_shipped_catalog_roundtrip_is_a_noop(
     assert "Database writes: 0" in out
     assert "warning" not in out
     assert capture_row_counts(clean_db) == counts_seeded
-
-    _truncate_all(clean_db)
 
 
 def test_update_policy_updates_while_verify_policy_never_rewrites(
@@ -386,8 +379,6 @@ def test_update_policy_updates_while_verify_policy_never_rewrites(
         ).scalar_one()
         assert str(start_date) == "2025-09-01"  # never rewritten
 
-    _truncate_all(clean_db)
-
 
 def test_e2e_registration_against_the_csv_loaded_catalog(
     clean_db, pg_engine, tmp_path: Path, monkeypatch, capsys
@@ -403,54 +394,51 @@ def test_e2e_registration_against_the_csv_loaded_catalog(
     Base.metadata.create_all(pg_engine)
 
     with _catalog_api_client(pg_engine) as client:
-        try:
-            response = client.post(
-                "/api/v1/auth/register",
-                json={
-                    "email": "csv-e2e@example.com",
-                    "password": "correct horse battery staple",
-                    "full_name": "Catalog End To End Student",
-                    "date_of_birth": "2012-04-10",
-                    "gender": "female",
-                    "country": "Rwanda",
-                },
-            )
-            assert response.status_code == 201, response.text
-            header = {"Authorization": f"Bearer {response.json()['access_token']}"}
+        response = client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "csv-e2e@example.com",
+                "password": "correct horse battery staple",
+                "full_name": "Catalog End To End Student",
+                "date_of_birth": "2012-04-10",
+                "gender": "female",
+                "country": "Rwanda",
+            },
+        )
+        assert response.status_code == 201, response.text
+        header = {"Authorization": f"Bearer {response.json()['access_token']}"}
 
-            with clean_db.connect() as connection:
-                year_id = connection.execute(
-                    text("SELECT id FROM academic_years WHERE name = 'TEST-2099/2100'")
-                ).scalar_one()
-                version_id = connection.execute(
-                    text("SELECT id FROM program_versions WHERE code = 'TEST-COMBO-V1'")
-                ).scalar_one()
-                school_id = connection.execute(
-                    text("SELECT id FROM schools WHERE school_code = 'TEST-SCHOOL-001'")
-                ).scalar_one()
+        with clean_db.connect() as connection:
+            year_id = connection.execute(
+                text("SELECT id FROM academic_years WHERE name = 'TEST-2099/2100'")
+            ).scalar_one()
+            version_id = connection.execute(
+                text("SELECT id FROM program_versions WHERE code = 'TEST-COMBO-V1'")
+            ).scalar_one()
+            school_id = connection.execute(
+                text("SELECT id FROM schools WHERE school_code = 'TEST-SCHOOL-001'")
+            ).scalar_one()
 
-            registration = client.post(
-                "/api/v1/me/registrations",
-                json={
-                    "academic_year_id": str(year_id),
-                    "pathway": "TEST-OL",
-                    "education_level": "TEST-L1",
-                    "program_version_id": str(version_id),
-                    "school_id": str(school_id),
-                },
-                headers=header,
-            )
-            assert registration.status_code == 201, registration.text
-            body = registration.json()
-            assert body["status"] == "pending"
-            assert body["program_code"] == "TEST-COMBO"
-            assert body["school_name"] == "Test School One"
-            assert sorted(subject["code"] for subject in body["subjects"]) == [
-                "TEST-SUB-ENG",
-                "TEST-SUB-MATH",
-            ]
-        finally:
-            _truncate_all(clean_db)
+        registration = client.post(
+            "/api/v1/me/registrations",
+            json={
+                "academic_year_id": str(year_id),
+                "pathway": "TEST-OL",
+                "education_level": "TEST-L1",
+                "program_version_id": str(version_id),
+                "school_id": str(school_id),
+            },
+            headers=header,
+        )
+        assert registration.status_code == 201, registration.text
+        body = registration.json()
+        assert body["status"] == "pending"
+        assert body["program_code"] == "TEST-COMBO"
+        assert body["school_name"] == "Test School One"
+        assert sorted(subject["code"] for subject in body["subjects"]) == [
+            "TEST-SUB-ENG",
+            "TEST-SUB-MATH",
+        ]
 
 
 # --- catalog API sweep over the loaded catalog ---------------------------------
@@ -704,8 +692,6 @@ def test_catalog_api_sweep_returns_loaded_rows_in_documented_order(
             ["TEST-COMBO-V2"],
         )
 
-    _truncate_all(clean_db)
-
 
 def test_catalog_api_filter_and_unknown_value_pins(
     clean_db, pg_engine, tmp_path: Path, monkeypatch, capsys
@@ -769,5 +755,3 @@ def test_catalog_api_filter_and_unknown_value_pins(
             response = client.get(f"/api/v1/catalog{path}")
             assert response.status_code == 200, path
             assert response.json() == [], path
-
-    _truncate_all(clean_db)

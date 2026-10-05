@@ -14,7 +14,8 @@ Integration fixtures:
 
 - ``pg_engine``: session-scoped engine bound to the guarded test DB URL.
 - ``clean_db``: function-scoped; truncates all application tables
-  (RESTART IDENTITY CASCADE) before the test and verifies zero rows after.
+  (RESTART IDENTITY CASCADE) before the test and again in the fixture
+  finalizer, so a failing assertion can never leak rows into the next test.
 - ``db_session``: a session wrapped in an outer transaction that is always
   rolled back — temporary inserts never persist.
 
@@ -136,8 +137,10 @@ def pg_engine() -> Iterator[Engine]:
 def clean_db(pg_engine: Engine) -> Iterator[Engine]:
     """Provide an empty test database for the duration of one test.
 
-    Truncates all application tables before the test and asserts zero rows
-    after, so a failing test cannot leak data into the next run.
+    Truncates all application tables before the test and again in the
+    finalizer after it. The finalizer runs whether the test passed OR
+    failed, so a failing assertion can neither leak rows into the next
+    test nor trigger a teardown error of its own.
     """
     with pg_engine.begin() as connection:
         for table in APPLICATION_TABLES:
@@ -145,8 +148,7 @@ def clean_db(pg_engine: Engine) -> Iterator[Engine]:
     yield pg_engine
     with pg_engine.begin() as connection:
         for table in APPLICATION_TABLES:
-            rows = connection.execute(text(f'SELECT count(*) FROM "{table}"')).scalar_one()
-            assert rows == 0, f"test leaked {rows} row(s) into {table}"
+            connection.execute(text(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE'))
 
 
 @pytest.fixture()

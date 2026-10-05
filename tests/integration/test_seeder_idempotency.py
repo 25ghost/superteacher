@@ -67,20 +67,6 @@ def _run_seeder(engine: Engine) -> list:
         session.close()
 
 
-def _truncate_all(engine: Engine) -> None:
-    """Restore the empty-database state the ``clean_db`` fixture expects.
-
-    These tests deliberately seed real catalog rows, so they must clean up
-    after themselves to honor the fixture's leak-guard (zero rows after the
-    test).
-    """
-    from tests.conftest import APPLICATION_TABLES
-
-    with engine.begin() as connection:
-        for table in APPLICATION_TABLES:
-            connection.execute(text(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE'))
-
-
 def test_first_seed_inserts_expected_counts_and_second_seed_is_noop(clean_db) -> None:
     """The core Phase 4B idempotency loop with the real catalog."""
     from sqlalchemy import text as _text
@@ -146,8 +132,6 @@ def test_first_seed_inserts_expected_counts_and_second_seed_is_noop(clean_db) ->
             ("TTC", "S4"), ("TTC", "S5"), ("TTC", "S6"),
         }
 
-    _truncate_all(clean_db)
-
 
 def test_dry_run_issues_zero_statements(clean_db) -> None:
     """A dry run against a real database executes nothing at all."""
@@ -176,4 +160,3 @@ def test_loader_never_writes_enrollment_data(clean_db) -> None:
         for table in sorted(PROTECTED_TABLES):
             rows = connection.execute(text(f'SELECT count(*) FROM "{table}"')).scalar_one()
             assert rows == 0
-    _truncate_all(clean_db)
