@@ -364,19 +364,97 @@ def resend_invite(session: Session, user_id: uuid.UUID, *, actor: User) -> Teach
     return _read_teacher(session, user)
 
 
-def activate_teacher(session: Session, user_id: uuid.UUID, *, actor: User) -> TeacherRead:
-    """pending/suspended → active (the account may now authenticate)."""
-    user = _load_teacher_user(session, user_id)
+def _activate_target(
+    session: Session,
+    user: User,
+    *,
+    actor: User,
+    event_type: str,
+    allow_pending_teacher: bool,
+) -> None:
+    """Shared ``pending/suspended → active`` core (no transport concerns).
+
+    409 when the account is already active. A pending *teacher* account
+    is refused unless the caller is the teacher-specific route: teachers
+    are activated by accepting their invitation, so activating them
+    generically would bypass the email confirmation the invitation flow
+    exists for. The caller names the audit event, so the trail keeps
+    distinguishing ``teacher_activated`` from ``user_activated``.
+    """
     if user.status == UserStatus.ACTIVE.value:
         raise AuthConflictError("account is already active")
+    if (
+        not allow_pending_teacher
+        and user.role == UserRole.TEACHER.value
+        and user.status == UserStatus.PENDING.value
+    ):
+        raise AuthConflictError(
+            "a pending teacher account must be activated through the "
+            "invitation flow: re-send it with POST /admin/teachers/"
+            f"{user.id}/invite or accept it with POST /auth/accept-invite"
+        )
     user.status = UserStatus.ACTIVE.value
     auth_event_repo.log_event(
         session,
         user_id=user.id,
-        event_type="teacher_activated",
+        event_type=event_type,
         actor_user_id=actor.id,
     )
     session.flush()
+
+
+def _deactivate_target(
+    session: Session,
+    user: User,
+    *,
+    actor: User,
+    event_type: str,
+) -> None:
+    """Shared ``→ suspended`` core: every refresh session is revoked.
+
+    409 when the account is already suspended. Two guards run before any
+    state is written and are unreachable through the *teacher* routes
+    (those only accept non-admin targets): an administrator cannot
+    deactivate their own account, and the last active administrator
+    cannot be deactivated. The second guard takes the same row lock that
+    two concurrent deactivations contend on, so two administrators
+    trying to deactivate each other cannot both pass it — exactly one
+    commit survives.
+    """
+    if user.id == actor.id:
+        raise AuthConflictError(
+            "an administrator cannot deactivate their own account"
+        )
+    if user.status == UserStatus.SUSPENDED.value:
+        raise AuthConflictError("account is already suspended")
+    if user.role == UserRole.ADMIN.value and user.status == UserStatus.ACTIVE.value:
+        admins = user_repo.lock_active_admins(session)
+        if len(admins) == 1 and user.id in {admin.id for admin in admins}:
+            raise AuthConflictError(
+                "the last active administrator cannot be deactivated"
+            )
+    user.status = UserStatus.SUSPENDED.value
+    revoked = revoke_all_sessions(session, user.id)
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type=event_type,
+        actor_user_id=actor.id,
+        metadata_json=json.dumps({"revoked_sessions": revoked}),
+    )
+    session.flush()
+
+
+def activate_teacher(session: Session, user_id: uuid.UUID, *, actor: User) -> TeacherRead:
+    """pending/suspended → active (the account may now authenticate)."""
+    user = _load_teacher_user(session, user_id)
+    _activate_target(
+        session,
+        user,
+        actor=actor,
+        event_type="teacher_activated",
+        allow_pending_teacher=True,
+    )
     logger.info(
         "teacher account activated",
         extra={"user_id": str(user.id), "actor_id": str(actor.id)},
@@ -389,23 +467,55 @@ def deactivate_teacher(
 ) -> TeacherRead:
     """active/pending → suspended, with every refresh session revoked."""
     user = _load_teacher_user(session, user_id)
-    if user.status == UserStatus.SUSPENDED.value:
-        raise AuthConflictError("account is already suspended")
-    user.status = UserStatus.SUSPENDED.value
-    revoked = revoke_all_sessions(session, user.id)
-    auth_event_repo.log_event(
-        session,
-        user_id=user.id,
-        event_type="teacher_deactivated",
-        actor_user_id=actor.id,
-        metadata_json=json.dumps({"revoked_sessions": revoked}),
+    _deactivate_target(
+        session, user, actor=actor, event_type="teacher_deactivated"
     )
-    session.flush()
     logger.info(
         "teacher account deactivated",
         extra={"user_id": str(user.id), "actor_id": str(actor.id)},
     )
     return _read_teacher(session, user)
+
+
+def activate_user(session: Session, user_id: uuid.UUID, *, actor: User) -> AdminUserListRead:
+    """Any non-teacher account → active (``user_activated``).
+
+    404 unknown id; 409 already active or a pending teacher (see
+    ``_activate_target``). The teacher's own activate route is the one
+    that lifts its invitation guard.
+    """
+    target = session.get(User, user_id)
+    if target is None:
+        raise AuthNotFoundError("user not found")
+    _activate_target(
+        session,
+        target,
+        actor=actor,
+        event_type="user_activated",
+        allow_pending_teacher=False,
+    )
+    logger.info(
+        "user account activated",
+        extra={"user_id": str(target.id), "actor_id": str(actor.id)},
+    )
+    return _list_item(target)
+
+
+def deactivate_user(session: Session, user_id: uuid.UUID, *, actor: User) -> AdminUserListRead:
+    """Any status → suspended, sessions revoked, ``user_deactivated``.
+
+    404 unknown id; 409 already suspended, self-deactivation, or the last
+    active administrator (see ``_deactivate_target``).
+    """
+    target = session.get(User, user_id)
+    if target is None:
+        raise AuthNotFoundError("user not found")
+    _deactivate_target(session, target, actor=actor, event_type="user_deactivated")
+    logger.info(
+        "user account deactivated",
+        extra={"user_id": str(target.id), "actor_id": str(actor.id)},
+    )
+    return _list_item(target)
 
 
 # --- lockout --------------------------------------------------------------------------

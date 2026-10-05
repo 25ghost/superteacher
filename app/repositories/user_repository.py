@@ -11,7 +11,7 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.enums import UserRole
+from app.models.enums import UserStatus, UserRole
 from app.models.school import School
 from app.models.student import Student
 from app.models.teacher import Teacher
@@ -115,6 +115,35 @@ def get_detail_row(
         .where(User.id == user_id)
     )
     return session.execute(stmt).first()
+
+
+def lock_active_admins(session: Session) -> list[User]:
+    """Every active admin row, locked ``FOR UPDATE`` in id order.
+
+    The concurrency guard behind "the last active administrator cannot be
+    deactivated": two administrators deactivating each other at the same
+    moment both reach this query, and the second transaction blocks here
+    until the first commits. PostgreSQL then re-checks the rows it just
+    locked against the ``status = 'active'`` condition, so the winner's
+    committed deactivation is already visible — the loser counts the
+    post-commit state and refuses. Locking in ``ORDER BY id`` order makes
+    both transactions acquire the same sequence, so they queue instead of
+    deadlocking.
+
+    SQLite renders ``FOR UPDATE`` as an empty string (its single-writer
+    lock already serialises writers), which keeps the in-memory unit
+    suites on the same code path.
+    """
+    stmt = (
+        select(User)
+        .where(
+            User.role == UserRole.ADMIN.value,
+            User.status == UserStatus.ACTIVE.value,
+        )
+        .order_by(User.id)
+        .with_for_update()
+    )
+    return list(session.scalars(stmt))
 
 
 def create_student_user(

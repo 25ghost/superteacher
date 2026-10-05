@@ -19,6 +19,11 @@ before any logic runs, and anonymous callers get 401.
   envelope) with role/status filters and an email search.
 - ``GET /admin/users/{user_id}`` — one account with its profiles, live
   session count and newest audit events (404 unknown id).
+- ``POST /admin/users/{user_id}/deactivate`` — any role → suspended,
+  revoking every refresh session; self, last-admin and repeat
+  deactivations → 409.
+- ``POST /admin/users/{user_id}/activate`` — suspended → active; a
+  pending teacher is refused (the invitation flow owns that).
 - ``PATCH /admin/users/{user_id}/role`` — change any *other* account's
   role (self-change → 403); sessions are revoked so an old token cannot
   keep the previous privileges.
@@ -214,6 +219,86 @@ def get_user(
     except Exception:
         session.rollback()
         raise
+
+
+@router.post(
+    "/users/{user_id}/deactivate",
+    tags=[TAG_ADMIN_USERS],
+    response_model=AdminUserListRead,
+    summary="Deactivate any user account, revoking its sessions (administrative)",
+    description=(
+        "Any role and any current status (except an already-suspended "
+        "account) → suspended, with every refresh session revoked so live "
+        "tokens stop authenticating immediately; audited as "
+        "user_deactivated with the number of revoked sessions. 409 when "
+        "the account is already suspended, when an administrator tries to "
+        "deactivate their own account, and for the last active "
+        "administrator — two administrators deactivating each other at "
+        "the same moment contend on one row lock, so exactly one commit "
+        "survives. 404 unknown id. Administrator-only."
+    ),
+    responses={
+        200: {"description": "The account is now suspended"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown user id"},
+        409: {"description": "Already suspended / self / last active administrator"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def deactivate_user(
+    request: Request,
+    user_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> AdminUserListRead:
+    try:
+        updated = admin_user_service.deactivate_user(session, user_id, actor=admin)
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    session.commit()
+    return updated
+
+
+@router.post(
+    "/users/{user_id}/activate",
+    tags=[TAG_ADMIN_USERS],
+    response_model=AdminUserListRead,
+    summary="Reactivate a suspended user account (administrative)",
+    description=(
+        "suspended/pending → active, audited as user_activated. 409 when "
+        "the account is already active, and for a pending *teacher*: "
+        "teachers are activated by accepting their invitation, so the "
+        "generic route refuses to bypass it (use "
+        "POST /admin/teachers/{user_id}/activate or "
+        "POST /auth/accept-invite instead). 404 unknown id. "
+        "Administrator-only."
+    ),
+    responses={
+        200: {"description": "The account is now active"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown user id"},
+        409: {"description": "Already active / pending teacher (invitation flow)"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def activate_user(
+    request: Request,
+    user_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> AdminUserListRead:
+    try:
+        updated = admin_user_service.activate_user(session, user_id, actor=admin)
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    session.commit()
+    return updated
 
 
 @router.post(
