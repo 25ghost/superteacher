@@ -66,6 +66,23 @@ class AdminUserRead(BaseModel):
     created_at: datetime
 
 
+class AdminUserListRead(BaseModel):
+    """One row of the administrative account list (``GET /admin/users``).
+
+    Deliberately excludes ``password_hash`` and ``phone``: an identifier a
+    caller cannot authenticate with is enough for administrative triage,
+    and the lockout columns are what the list exists to surface.
+    """
+
+    id: UUID
+    email: str | None = None
+    role: str
+    status: str
+    locked_until: datetime | None = None
+    failed_login_count: int
+    created_at: datetime
+
+
 class RoleChangeRequest(BaseModel):
     """The single request body that may choose an account's role."""
 

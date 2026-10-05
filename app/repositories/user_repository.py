@@ -28,6 +28,70 @@ def get_by_phone(session: Session, phone: str) -> User | None:
     return session.scalar(select(User).where(User.phone == phone))
 
 
+def _escape_like(needle: str) -> str:
+    """Escape the LIKE wildcards (``%``, ``_``) and the escape character itself.
+
+    The escaped string is embedded as ``%<escaped>%`` with
+    ``escape="\\\\"`` so user input matches *literally*: a search for
+    ``100%`` is not "match everything" and ``_`` is not "any character".
+    The pattern always travels as a bound parameter — SQL text is never
+    string-built from input.
+    """
+    return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _page_filters(*, role: str | None, status: str | None, q: str | None) -> list:
+    """Where-clauses for the administrative account list.
+
+    ``q`` case-insensitively matches ``users.email`` (same treatment the
+    student list gives its searchable columns); ``role``/``status`` are
+    plain equality against values the *service* already validated against
+    the vocabulary, so an unknown value can never reach this layer.
+    """
+    conditions = []
+    if role is not None:
+        conditions.append(User.role == role)
+    if status is not None:
+        conditions.append(User.status == status)
+    if q is not None:
+        pattern = f"%{_escape_like(q).lower()}%"
+        conditions.append(func.lower(User.email).like(pattern, escape="\\"))
+    return conditions
+
+
+def count_page(
+    session: Session, *, role: str | None = None, status: str | None = None,
+    q: str | None = None,
+) -> int:
+    """Total accounts matching the filters (ignores limit/offset)."""
+    stmt = (
+        select(func.count())
+        .select_from(User)
+        .where(*_page_filters(role=role, status=status, q=q))
+    )
+    return session.scalar(stmt) or 0
+
+
+def list_page(
+    session: Session, *, role: str | None = None, status: str | None = None,
+    q: str | None = None, limit: int = 20, offset: int = 0,
+) -> list[User]:
+    """One page of accounts, newest first.
+
+    Ordering is deterministic (``created_at`` descending with the unique
+    ``id`` as tiebreaker) so offset paging stays stable even when a whole
+    batch shares one ``created_at`` (rows inserted in one transaction do).
+    """
+    stmt = (
+        select(User)
+        .where(*_page_filters(role=role, status=status, q=q))
+        .order_by(User.created_at.desc(), User.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(session.scalars(stmt))
+
+
 def create_student_user(
     session: Session,
     email: str | None,

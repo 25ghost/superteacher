@@ -423,6 +423,7 @@ def _routes(target_user_id: uuid.UUID, teacher_email: str) -> list[tuple[str, st
         ("POST", f"/api/v1/admin/teachers/{target_user_id}/invite", {}),
         ("POST", f"/api/v1/admin/teachers/{target_user_id}/activate", {}),
         ("POST", f"/api/v1/admin/teachers/{target_user_id}/deactivate", {}),
+        ("GET", "/api/v1/admin/users", None),
         ("PATCH", f"/api/v1/admin/users/{target_user_id}/role", {"role": "teacher"}),
     ]
 

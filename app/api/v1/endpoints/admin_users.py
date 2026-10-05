@@ -15,6 +15,8 @@ before any logic runs, and anonymous callers get 401.
 - ``POST /admin/teachers/{user_id}/activate`` — pending/suspended → active.
 - ``POST /admin/teachers/{user_id}/deactivate`` — → suspended, revoking
   every refresh session.
+- ``GET /admin/users`` — list every account (paginated ``Page[T]``
+  envelope) with role/status filters and an email search.
 - ``PATCH /admin/users/{user_id}/role`` — change any *other* account's
   role (self-change → 403); sessions are revoked so an old token cannot
   keep the previous privileges.
@@ -37,7 +39,9 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
+from app.schemas.pagination import Page
 from app.schemas.teacher_admin import (
+    AdminUserListRead,
     AdminUserRead,
     RoleChangeRequest,
     TeacherCreate,
@@ -119,6 +123,53 @@ def list_teachers(
     _: User = Depends(require_admin),
 ) -> list[TeacherRead]:
     return admin_user_service.list_teachers(session, limit=limit, offset=offset)
+
+
+@router.get(
+    "/users",
+    tags=[TAG_ADMIN_USERS],
+    response_model=Page[AdminUserListRead],
+    summary="List user accounts (administrative)",
+    description=(
+        "One page of every account in an items/total/limit/offset "
+        "envelope. limit defaults to 20 (max 100), offset defaults to 0; "
+        "both are 422 outside their range. ?role= and ?status= filter on "
+        "the account vocabularies (an unknown value is 422, never a "
+        "silently empty page) and ?q= case-insensitively matches the "
+        "email, treating %, _ and \\ as literal characters. Ordering is "
+        "deterministic (created_at desc, id) so offset paging stays "
+        "stable. One count query plus one page query, whatever the page "
+        "size. Administrator-only."
+    ),
+    responses={
+        200: {"description": "One page of user accounts"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        422: {"description": "Invalid query parameters (limit/offset/role/status)"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def list_users(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    role: str | None = Query(default=None, max_length=32),
+    status: str | None = Query(default=None, max_length=32),
+    q: str | None = Query(default=None, max_length=255),
+    session: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Page[AdminUserListRead]:
+    # Read path: nothing to commit; errors are translated, never swallowed.
+    try:
+        return admin_user_service.list_users(
+            session, limit=limit, offset=offset, role=role, status=status, q=q
+        )
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
 
 
 @router.post(

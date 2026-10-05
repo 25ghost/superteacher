@@ -1,8 +1,9 @@
 """Administrative account lifecycle (Phase B, slice 4).
 
-Service layer for the ``/admin/teachers`` and ``/admin/users/{id}/role``
-routes: create a teacher account (pending, invited), list teachers, re-send
-or cancel invitations, activate/deactivate accounts, and change roles.
+Service layer for the ``/admin/teachers``, ``/admin/users`` and
+``/admin/users/{id}/role`` routes: create a teacher account (pending,
+invited), list teachers, list accounts, re-send or cancel invitations,
+activate/deactivate accounts, and change roles.
 
 Invariants enforced here (never in a request body):
 
@@ -39,11 +40,18 @@ from app.models.teacher import Teacher
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
 from app.repositories import user_repository as user_repo
-from app.schemas.teacher_admin import AdminUserRead, TeacherCreate, TeacherRead
+from app.schemas.pagination import Page
+from app.schemas.teacher_admin import (
+    AdminUserListRead,
+    AdminUserRead,
+    TeacherCreate,
+    TeacherRead,
+)
 from app.services.auth_service import (
     AuthConflictError,
     AuthForbiddenError,
     AuthNotFoundError,
+    AuthValidationError,
     revoke_all_sessions,
 )
 
@@ -105,6 +113,19 @@ def _read_user(user: User) -> AdminUserRead:
         email=user.email,
         role=user.role,
         status=user.status,
+        created_at=user.created_at,
+    )
+
+
+def _list_item(user: User) -> AdminUserListRead:
+    """The list projection of one account — lockout state included, no secrets."""
+    return AdminUserListRead(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        status=user.status,
+        locked_until=user.locked_until,
+        failed_login_count=user.failed_login_count,
         created_at=user.created_at,
     )
 
@@ -235,6 +256,50 @@ def list_teachers(
         .offset(offset)
     ).all()
     return [_build_teacher_read(user, profile) for user, profile in rows]
+
+
+# --- administrative account list ------------------------------------------------------
+
+
+def list_users(
+    session: Session,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    role: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+) -> Page[AdminUserListRead]:
+    """One page of every account for ``GET /admin/users``.
+
+    ``role`` and ``status`` are confined to the shared vocabularies — an
+    unknown value is a 422 domain error, never a silently empty page.
+    ``q`` matches the email case-insensitively with wildcards treated
+    literally (the repository binds the pattern, it never builds SQL).
+
+    Exactly one count query plus one page query run, both independent of
+    how many rows come back, so the response costs the same statements
+    for one account or a full page. Read-only: nothing is committed here.
+    """
+    if role is not None and role not in {member.value for member in UserRole}:
+        raise AuthValidationError(
+            f"role must be one of {', '.join(member.value for member in UserRole)}"
+        )
+    if status is not None and status not in {member.value for member in UserStatus}:
+        raise AuthValidationError(
+            "status must be one of "
+            + ", ".join(member.value for member in UserStatus)
+        )
+    total = user_repo.count_page(session, role=role, status=status, q=q)
+    rows = user_repo.list_page(
+        session, role=role, status=status, q=q, limit=limit, offset=offset
+    )
+    return Page[AdminUserListRead](
+        items=[_list_item(user) for user in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 # --- invite / activate / deactivate --------------------------------------------------
