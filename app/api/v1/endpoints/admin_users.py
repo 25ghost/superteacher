@@ -23,8 +23,8 @@ before any logic runs, and anonymous callers get 401.
 - ``GET /admin/users/{user_id}`` — one account with its profiles, live
   session count and newest audit events (404 unknown id).
 - ``POST /admin/users/{user_id}/deactivate`` — any role → suspended,
-  revoking every refresh session; self, last-admin and repeat
-  deactivations → 409.
+  revoking every refresh session; self, last-admin and
+  already-deactivated (suspended or disabled) targets → 409.
 - ``POST /admin/users/{user_id}/activate`` — suspended → active; a
   teacher that has never accepted its invitation is refused (the
   invitation flow owns that).
@@ -232,22 +232,23 @@ def get_user(
     response_model=AdminUserListRead,
     summary="Deactivate any user account, revoking its sessions (administrative)",
     description=(
-        "Any role and any current status (except an already-suspended "
-        "account) → suspended, with every refresh session revoked so live "
-        "tokens stop authenticating immediately; audited as "
-        "user_deactivated with the number of revoked sessions. 409 when "
-        "the account is already suspended, when an administrator tries to "
-        "deactivate their own account, and for the last active "
-        "administrator — two administrators deactivating each other at "
-        "the same moment contend on one row lock, so exactly one commit "
-        "survives. 404 unknown id. Administrator-only."
+        "Any role and any current status (except an already-deactivated "
+        "account: suspended by an administrator or disabled by the "
+        "account's own request) → suspended, with every refresh session "
+        "revoked so live tokens stop authenticating immediately; audited "
+        "as user_deactivated with the number of revoked sessions. 409 "
+        "when the account is already suspended or disabled, when an "
+        "administrator tries to deactivate their own account, and for the "
+        "last active administrator — two administrators deactivating each "
+        "other at the same moment contend on one row lock, so exactly one "
+        "commit survives. 404 unknown id. Administrator-only."
     ),
     responses={
         200: {"description": "The account is now suspended"},
         401: {"description": "Missing/invalid credentials"},
         403: {"description": "Authenticated but not an administrator"},
         404: {"description": "Unknown user id"},
-        409: {"description": "Already suspended / self / last active administrator"},
+        409: {"description": "Already suspended/disabled / self / last active administrator"},
         429: {"description": "Rate limit exceeded"},
     },
 )
@@ -381,14 +382,15 @@ def activate_teacher(
     summary="Deactivate a teacher account (administrative)",
     description=(
         "→ suspended, revoking every refresh session so no outstanding "
-        "token survives the decision. 409 when already suspended; 404 "
-        "unknown id. Administrator-only."
+        "token survives the decision. 409 when the account is already "
+        "deactivated (suspended or disabled); 404 unknown id. "
+        "Administrator-only."
     ),
     responses={
         401: {"description": "Missing/invalid credentials"},
         403: {"description": "Authenticated but not an administrator"},
         404: {"description": "Unknown user id"},
-        409: {"description": "Account is already suspended"},
+        409: {"description": "Account is already deactivated (suspended/disabled)"},
         429: {"description": "Rate limit exceeded"},
     },
 )

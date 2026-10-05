@@ -322,6 +322,53 @@ def test_deactivate_unknown_user_is_404(session: Session, admin: User) -> None:
         admin_user_service.deactivate_teacher(session, uuid.uuid4(), actor=admin)
 
 
+# --- deactivation of an already-deactivated (disabled) account ------------------
+
+
+def test_generic_deactivate_refuses_a_disabled_account(session: Session, admin: User) -> None:
+    """'disabled' (self-service) ends in the same place as 'suspended'."""
+    target = _make_user(
+        session, role=UserRole.STUDENT.value, status=UserStatus.DISABLED.value
+    )
+    session.commit()
+
+    with pytest.raises(AuthConflictError) as excinfo:
+        admin_user_service.deactivate_user(session, target.id, actor=admin)
+    session.rollback()
+
+    assert "already deactivated" in str(excinfo.value)
+    assert session.get(User, target.id).status == UserStatus.DISABLED.value
+    assert not _events(session, "user_deactivated")
+
+
+def test_teacher_route_deactivate_refuses_a_disabled_teacher(
+    session: Session, admin: User
+) -> None:
+    user, _ = _create_teacher(session, admin, email="disabled-teacher@example.com")
+    user.status = UserStatus.DISABLED.value
+    session.commit()
+
+    with pytest.raises(AuthConflictError):
+        admin_user_service.deactivate_teacher(session, user.id, actor=admin)
+    session.rollback()
+    assert session.get(User, user.id).status == UserStatus.DISABLED.value
+
+
+def test_generic_activate_lifts_a_disabled_account(session: Session, admin: User) -> None:
+    target = _make_user(
+        session, role=UserRole.STUDENT.value, status=UserStatus.DISABLED.value
+    )
+    session.commit()
+
+    read = admin_user_service.activate_user(session, target.id, actor=admin)
+    session.commit()
+
+    assert read.status == UserStatus.ACTIVE.value
+    assert session.get(User, target.id).status == UserStatus.ACTIVE.value
+    [event] = _events(session, "user_activated")
+    assert event.actor_user_id == admin.id
+
+
 # --- generic activate: never-accepted teachers ---------------------------------
 
 

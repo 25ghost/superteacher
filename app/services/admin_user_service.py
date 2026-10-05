@@ -494,21 +494,26 @@ def _deactivate_target(
 ) -> None:
     """Shared ``→ suspended`` core: every refresh session is revoked.
 
-    409 when the account is already suspended. Two guards run before any
-    state is written and are unreachable through the *teacher* routes
-    (those only accept non-admin targets): an administrator cannot
+    409 when the account is already deactivated — ``suspended`` (an
+    administrative deactivation) or ``disabled`` (the self-service one):
+    both mean the same "cannot authenticate" end state, so re-deactivating
+    would only rewrite rows and inflate the audit trail. Two guards run
+    before any state is written and are unreachable through the *teacher*
+    routes (those only accept non-admin targets): an administrator cannot
     deactivate their own account, and the last active administrator
     cannot be deactivated. The second guard takes the same row lock that
-    two concurrent deactivations contend on, so two administrators
-    trying to deactivate each other cannot both pass it — exactly one
-    commit survives.
+    two concurrent deactivations contend on, so two administrators trying
+    to deactivate each other cannot both pass it — exactly one commit
+    survives.
     """
     if user.id == actor.id:
         raise AuthConflictError(
             "an administrator cannot deactivate their own account"
         )
-    if user.status == UserStatus.SUSPENDED.value:
-        raise AuthConflictError("account is already suspended")
+    if user.status in (UserStatus.SUSPENDED.value, UserStatus.DISABLED.value):
+        raise AuthConflictError(
+            f"account is already deactivated (status: {user.status})"
+        )
     if user.role == UserRole.ADMIN.value and user.status == UserStatus.ACTIVE.value:
         admins = user_repo.lock_active_admins(session)
         if len(admins) == 1 and user.id in {admin.id for admin in admins}:
@@ -586,8 +591,9 @@ def activate_user(session: Session, user_id: uuid.UUID, *, actor: User) -> Admin
 def deactivate_user(session: Session, user_id: uuid.UUID, *, actor: User) -> AdminUserListRead:
     """Any status → suspended, sessions revoked, ``user_deactivated``.
 
-    404 unknown id; 409 already suspended, self-deactivation, or the last
-    active administrator (see ``_deactivate_target``).
+    404 unknown id; 409 already deactivated (suspended or disabled),
+    self-deactivation, or the last active administrator (see
+    ``_deactivate_target``).
     """
     target = session.get(User, user_id)
     if target is None:
