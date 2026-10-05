@@ -238,6 +238,17 @@ def get_school_by_code(session: Session, school_code: str) -> School:
     return school
 
 
+def get_school_by_id(session: Session, school_id: uuid.UUID) -> School | None:
+    """The school with this primary key, or ``None`` when unknown.
+
+    Unlike :func:`get_school_by_code` this returns ``None`` instead of
+    raising: callers outside the catalog API (administrative school
+    assignment) map the miss onto their own error family, and a
+    repository must not choose the caller's HTTP contract for them.
+    """
+    return session.scalar(select(School).where(School.id == school_id))
+
+
 def list_school_programs(
     session: Session,
     school_id: uuid.UUID | None = None,

@@ -20,6 +20,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.school import School
 from app.models.teacher import Teacher
 from app.models.user import User
 from app.schemas.teacher_admin import TeacherMeRead, TeacherMeUpdate
@@ -39,6 +40,19 @@ def _load_profile(session: Session, user: User) -> Teacher:
 
 
 def _read(session: Session, user: User, profile: Teacher) -> TeacherMeRead:
+    """The profile row, with the assigned school resolved in place.
+
+    The school is a read-only presentation detail (assignment itself is
+    administrative): one ``session.get`` when a school is assigned and
+    none at all otherwise, so the read stays bounded — and it never
+    fails on hand-edited data, where ``school_id`` may point nowhere:
+    the code and name simply come back ``None``.
+    """
+    school = (
+        session.get(School, profile.school_id)
+        if profile.school_id is not None
+        else None
+    )
     return TeacherMeRead(
         user_id=user.id,
         teacher_id=profile.id,
@@ -46,6 +60,8 @@ def _read(session: Session, user: User, profile: Teacher) -> TeacherMeRead:
         full_name=profile.full_name,
         phone=profile.phone,
         school_id=profile.school_id,
+        school_code=school.school_code if school is not None else None,
+        school_name=school.name if school is not None else None,
         subject=profile.subject,
         role=user.role,
         status=user.status,

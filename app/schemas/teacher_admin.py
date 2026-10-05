@@ -1,7 +1,8 @@
 """Pydantic schemas for administrative user management (Phase B, slice 4).
 
 Boundary: creating/listing teacher accounts, resending invitations,
-activating/deactivating them, and changing an account's role.
+activating/deactivating them, assigning a school, and changing an
+account's role.
 
 Security rules baked into these schemas:
 
@@ -41,7 +42,12 @@ class TeacherCreate(BaseModel):
 
 
 class TeacherRead(BaseModel):
-    """One teacher account as the administration sees it."""
+    """One teacher account as the administration sees it.
+
+    ``school_code``/``school_name`` are flattened alongside ``school_id``
+    so an administrator reads the assignment without a second request to
+    the catalog.
+    """
 
     user_id: UUID
     teacher_id: UUID
@@ -49,6 +55,8 @@ class TeacherRead(BaseModel):
     full_name: str
     phone: str | None = None
     school_id: UUID | None = None
+    school_code: str | None = None
+    school_name: str | None = None
     subject: str | None = None
     role: str
     status: str
@@ -132,11 +140,29 @@ class TeacherMeRead(BaseModel):
     full_name: str
     phone: str | None = None
     school_id: UUID | None = None
+    school_code: str | None = None
+    school_name: str | None = None
     subject: str | None = None
     role: str
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class TeacherSchoolUpdate(BaseModel):
+    """Administrative school assignment (``PATCH /admin/teachers/{id}/school``).
+
+    The only body that moves a teacher between schools: ``school_id``
+    naming an existing school assigns it, an explicit ``null`` clears the
+    assignment, and the field is required so an empty body cannot clear
+    anything by accident (422). Role and status never appear here — the
+    id is a foreign key the *service* validates (unknown school → 404,
+    never a database error).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    school_id: UUID | None
 
 
 class TeacherMeUpdate(BaseModel):

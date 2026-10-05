@@ -15,6 +15,9 @@ before any logic runs, and anonymous callers get 401.
 - ``POST /admin/teachers/{user_id}/activate`` — pending/suspended → active.
 - ``POST /admin/teachers/{user_id}/deactivate`` — → suspended, revoking
   every refresh session.
+- ``PATCH /admin/teachers/{user_id}/school`` — assign or clear the
+  teacher's school (404 unknown teacher *or* school; the audit event is
+  written even when the value does not change).
 - ``GET /admin/users`` — list every account (paginated ``Page[T]``
   envelope) with role/status filters and an email search.
 - ``GET /admin/users/{user_id}`` — one account with its profiles, live
@@ -54,6 +57,7 @@ from app.schemas.teacher_admin import (
     RoleChangeRequest,
     TeacherCreate,
     TeacherRead,
+    TeacherSchoolUpdate,
 )
 from app.services import admin_user_service
 from app.services.auth_service import AuthError
@@ -395,6 +399,51 @@ def deactivate_teacher(
 ) -> TeacherRead:
     try:
         updated = admin_user_service.deactivate_teacher(session, user_id, actor=admin)
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    session.commit()
+    return updated
+
+
+@router.patch(
+    "/teachers/{user_id}/school",
+    tags=[TAG_ADMIN_TEACHERS],
+    response_model=TeacherRead,
+    summary="Assign or clear a teacher's school (administrative)",
+    description=(
+        "Body {school_id}: a UUID assigns that school, an explicit null "
+        "clears the assignment (the field is required, so an empty body "
+        "cannot clear anything: 422). Unknown teacher id → 404; unknown "
+        "school id → 404, checked before the write so a bogus foreign "
+        "key is a domain error, never a database error; extra fields → "
+        "422. Assigning the school a teacher already has still succeeds "
+        "and still writes the teacher_school_changed audit event — the "
+        "trail records the administrative action, not just the delta. "
+        "The response is the teacher with school_id, school_code and "
+        "school_name resolved. Administrator-only."
+    ),
+    responses={
+        200: {"description": "The teacher account with its school resolved"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown user id or unknown school id"},
+        422: {"description": "Missing/unknown fields in the body"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def assign_teacher_school(
+    request: Request,
+    user_id: uuid.UUID,
+    payload: TeacherSchoolUpdate,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TeacherRead:
+    try:
+        updated = admin_user_service.set_teacher_school(
+            session, user_id, payload, actor=admin
+        )
     except AuthError as exc:
         session.rollback()
         raise _error(exc) from exc

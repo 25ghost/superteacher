@@ -3,7 +3,8 @@
 Service layer for the ``/admin/teachers``, ``/admin/users`` and
 ``/admin/users/{id}/role`` routes: create a teacher account (pending,
 invited), list teachers, list accounts, re-send or cancel invitations,
-activate/deactivate accounts, and change roles.
+activate/deactivate accounts, assign a teacher's school, and change
+roles.
 
 Invariants enforced here (never in a request body):
 
@@ -36,10 +37,13 @@ from sqlalchemy.orm import Session
 from app.core import security
 from app.models.enums import UserStatus, UserRole
 from app.models.invite_token import InviteToken
+from app.models.school import School
 from app.models.teacher import Teacher
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
 from app.repositories import auth_session_repository as auth_session_repo
+from app.repositories import catalog_repository as catalog_repo
+from app.repositories import teacher_repository as teacher_repo
 from app.repositories import user_repository as user_repo
 from app.schemas.pagination import Page
 from app.schemas.teacher_admin import (
@@ -49,6 +53,7 @@ from app.schemas.teacher_admin import (
     AdminUserRead,
     TeacherCreate,
     TeacherRead,
+    TeacherSchoolUpdate,
 )
 from app.services.auth_service import (
     AuthConflictError,
@@ -81,12 +86,16 @@ def _load_teacher_user(session: Session, user_id: uuid.UUID) -> User:
     return user
 
 
-def _build_teacher_read(user: User, profile: Teacher | None) -> TeacherRead:
-    """Map an account + its profile row onto ``TeacherRead``.
+def _build_teacher_read(
+    user: User, profile: Teacher | None, school: School | None = None
+) -> TeacherRead:
+    """Map an account + profile + assigned school onto ``TeacherRead``.
 
     The profile is mandatory data — the API always creates both rows
     together — so its absence means the rows were edited outside the
-    API, exactly like the single-row read has always treated it.
+    API, exactly like the single-row read has always treated it. The
+    school arrives as an argument (never a per-row query) so the list
+    keeps its single joined statement.
     """
     if profile is None:  # pragma: no cover - only reachable on hand-edited data
         raise AuthNotFoundError("teacher profile not found")
@@ -97,6 +106,8 @@ def _build_teacher_read(user: User, profile: Teacher | None) -> TeacherRead:
         full_name=profile.full_name,
         phone=profile.phone,
         school_id=profile.school_id,
+        school_code=school.school_code if school is not None else None,
+        school_name=school.name if school is not None else None,
         subject=profile.subject,
         role=user.role,
         status=user.status,
@@ -106,8 +117,10 @@ def _build_teacher_read(user: User, profile: Teacher | None) -> TeacherRead:
 
 
 def _read_teacher(session: Session, user: User) -> TeacherRead:
-    profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
-    return _build_teacher_read(user, profile)
+    row = teacher_repo.get_profile_with_school(session, user.id)
+    profile = row[0] if row is not None else None
+    school = row[1] if row is not None else None
+    return _build_teacher_read(user, profile, school)
 
 
 def _read_user(user: User) -> AdminUserRead:
@@ -243,22 +256,86 @@ def list_teachers(
 ) -> list[TeacherRead]:
     """All teacher accounts, newest first (administrative read).
 
-    One joined statement fetches account and profile together — the
-    per-row profile lookup of :func:`_read_teacher` used to cost one
-    extra query per teacher, so the list grew linearly. The
-    ``outerjoin`` preserves the single-row contract: a teacher account
-    whose profile row is missing (hand-edited data) is an error, never
-    a silently skipped row.
+    One joined statement fetches account, profile and assigned school
+    together — the per-row profile lookup of :func:`_read_teacher` used
+    to cost one extra query per teacher, so the list grew linearly, and
+    resolving the school per row would have reintroduced the same shape.
+    The ``outerjoin`` preserves the single-row contract: a teacher
+    account whose profile row is missing (hand-edited data) is an error,
+    never a silently skipped row.
     """
     rows = session.execute(
-        select(User, Teacher)
+        select(User, Teacher, School)
         .outerjoin(Teacher, Teacher.user_id == User.id)
+        .outerjoin(School, School.id == Teacher.school_id)
         .where(User.role == UserRole.TEACHER.value)
         .order_by(User.created_at.desc(), User.id)
         .limit(limit)
         .offset(offset)
     ).all()
-    return [_build_teacher_read(user, profile) for user, profile in rows]
+    return [
+        _build_teacher_read(user, profile, school)
+        for user, profile, school in rows
+    ]
+
+
+# --- school assignment ------------------------------------------------------------------
+
+
+def set_teacher_school(
+    session: Session,
+    user_id: uuid.UUID,
+    payload: TeacherSchoolUpdate,
+    *,
+    actor: User,
+) -> TeacherRead:
+    """Move a teacher to another school, or clear the assignment.
+
+    ``school_id`` names an existing school; an explicit ``null`` clears
+    the assignment; an unknown id → 404 and an unknown *school* → 404 as
+    well, so a bogus foreign key is a domain error raised before the
+    write, never a database error. Assigning the school a teacher
+    already has still writes ``teacher_school_changed``: the audit trail
+    records the administrative action, not just the delta. Profile and
+    (current) school come from one joined statement; nothing is
+    committed here — the endpoint owns the transaction.
+    """
+    user = _load_teacher_user(session, user_id)
+    row = teacher_repo.get_profile_with_school(session, user.id)
+    if row is None:
+        raise AuthNotFoundError("teacher profile not found")
+    profile, _current_school = row
+    school: School | None = None
+    if payload.school_id is not None:
+        school = catalog_repo.get_school_by_id(session, payload.school_id)
+        if school is None:
+            raise AuthNotFoundError("school not found")
+    previous_school_id = profile.school_id
+    profile.school_id = payload.school_id
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="teacher_school_changed",
+        actor_user_id=actor.id,
+        metadata_json=json.dumps(
+            {
+                "school_id": str(payload.school_id) if payload.school_id else None,
+                "previous_school_id": (
+                    str(previous_school_id) if previous_school_id else None
+                ),
+            }
+        ),
+    )
+    session.flush()
+    logger.info(
+        "teacher school changed",
+        extra={
+            "user_id": str(user.id),
+            "actor_id": str(actor.id),
+            "school_id": str(payload.school_id) if payload.school_id else None,
+        },
+    )
+    return _build_teacher_read(user, profile, school)
 
 
 # --- administrative account list ------------------------------------------------------
