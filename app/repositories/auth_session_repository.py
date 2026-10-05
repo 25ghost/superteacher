@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.auth_session import AuthSession
@@ -61,6 +61,21 @@ def get_by_token_hash_for_update(session: Session, token_hash: str) -> AuthSessi
 
 def get_by_id(session: Session, auth_session_id: uuid.UUID) -> AuthSession | None:
     return session.get(AuthSession, auth_session_id)
+
+
+def count_active_for_user(session: Session, user_id: uuid.UUID, *, now: datetime) -> int:
+    """How many of one user's sessions can still authenticate right now.
+
+    "Active" = never revoked and not yet expired: a revoked session cannot
+    refresh (its digest is dead) and an expired one cannot either, so both
+    are excluded from the count an administrator sees.
+    """
+    stmt = select(func.count()).where(
+        AuthSession.user_id == user_id,
+        AuthSession.revoked_at.is_(None),
+        AuthSession.expires_at > now,
+    )
+    return session.scalar(stmt) or 0
 
 
 def mark_used(session: Session, auth_session: AuthSession, used_at: datetime) -> AuthSession:

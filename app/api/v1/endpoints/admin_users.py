@@ -17,6 +17,8 @@ before any logic runs, and anonymous callers get 401.
   every refresh session.
 - ``GET /admin/users`` — list every account (paginated ``Page[T]``
   envelope) with role/status filters and an email search.
+- ``GET /admin/users/{user_id}`` — one account with its profiles, live
+  session count and newest audit events (404 unknown id).
 - ``PATCH /admin/users/{user_id}/role`` — change any *other* account's
   role (self-change → 403); sessions are revoked so an old token cannot
   keep the previous privileges.
@@ -41,6 +43,7 @@ from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.pagination import Page
 from app.schemas.teacher_admin import (
+    AdminUserDetailRead,
     AdminUserListRead,
     AdminUserRead,
     RoleChangeRequest,
@@ -164,6 +167,47 @@ def list_users(
         return admin_user_service.list_users(
             session, limit=limit, offset=offset, role=role, status=status, q=q
         )
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
+
+
+@router.get(
+    "/users/{user_id}",
+    tags=[TAG_ADMIN_USERS],
+    response_model=AdminUserDetailRead,
+    summary="Retrieve one user account with its profiles and recent activity (administrative)",
+    description=(
+        "The list fields for one account plus its student profile id (when "
+        "the account has a student profile), its teacher profile id and "
+        "assigned school (id, code and name), the number of refresh "
+        "sessions that can still authenticate, and the newest 10 audit "
+        "events for the account (event type, timestamp, acting "
+        "administrator's email, ip address). Three bounded queries "
+        "whatever the account's data, so the cost never grows with row "
+        "count. No password hash, no token digests, no event metadata "
+        "blobs. 404 unknown id. Administrator-only."
+    ),
+    responses={
+        200: {"description": "The account, its profiles and recent audit events"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown user id"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def get_user(
+    request: Request,
+    user_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> AdminUserDetailRead:
+    # Read path: nothing to commit; errors are translated, never swallowed.
+    try:
+        return admin_user_service.get_user_detail(session, user_id)
     except AuthError as exc:
         session.rollback()
         raise _error(exc) from exc

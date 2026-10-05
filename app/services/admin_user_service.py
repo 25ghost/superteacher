@@ -39,9 +39,12 @@ from app.models.invite_token import InviteToken
 from app.models.teacher import Teacher
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
+from app.repositories import auth_session_repository as auth_session_repo
 from app.repositories import user_repository as user_repo
 from app.schemas.pagination import Page
 from app.schemas.teacher_admin import (
+    AdminUserDetailRead,
+    AdminUserEventRead,
     AdminUserListRead,
     AdminUserRead,
     TeacherCreate,
@@ -299,6 +302,50 @@ def list_users(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+def get_user_detail(session: Session, user_id: uuid.UUID) -> AdminUserDetailRead:
+    """One account with its profiles, live sessions and newest audit rows.
+
+    Exactly three statements run for every account — the identity plus
+    both optional profiles and the assigned school come from a single
+    joined query, the session count is one aggregate, and the audit trail
+    is one ``LIMIT 10`` query with the actor already resolved. Unknown id
+    → 404. Read-only: nothing is committed here, and nothing sensitive
+    leaks: no password hash, no token digest, no event metadata blob.
+    """
+    row = user_repo.get_detail_row(session, user_id)
+    if row is None:
+        raise AuthNotFoundError("user not found")
+    user, student, teacher, school = row
+    active_sessions = auth_session_repo.count_active_for_user(
+        session, user.id, now=_now()
+    )
+    events = auth_event_repo.list_recent_for_user(session, user.id, limit=10)
+    return AdminUserDetailRead(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        status=user.status,
+        locked_until=user.locked_until,
+        failed_login_count=user.failed_login_count,
+        created_at=user.created_at,
+        student_profile_id=student.id if student is not None else None,
+        teacher_profile_id=teacher.id if teacher is not None else None,
+        school_id=teacher.school_id if teacher is not None else None,
+        school_code=school.school_code if school is not None else None,
+        school_name=school.name if school is not None else None,
+        active_session_count=active_sessions,
+        recent_events=[
+            AdminUserEventRead(
+                event_type=event.event_type,
+                created_at=event.created_at,
+                actor_email=actor.email if actor is not None else None,
+                ip_address=event.ip_address,
+            )
+            for event, actor in events
+        ],
     )
 
 

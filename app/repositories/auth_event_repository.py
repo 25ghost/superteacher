@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.auth_event import AuthEvent
+from app.models.user import User
 
 
 def log_event(
@@ -36,3 +38,23 @@ def log_event(
     session.add(record)
     session.flush()
     return record
+
+
+def list_recent_for_user(
+    session: Session, user_id: uuid.UUID, *, limit: int = 10
+) -> list[tuple[AuthEvent, User | None]]:
+    """The newest ``limit`` events *about* one user, actor resolved in-place.
+
+    The outer join on ``actor_user_id`` puts the acting administrator's
+    email in the same round-trip (no per-row actor lookup), and ``LIMIT``
+    keeps the query bounded whatever the audit trail's size. The actor
+    column is a self-reference, so a deleted actor comes back as ``None``.
+    """
+    stmt = (
+        select(AuthEvent, User)
+        .outerjoin(User, User.id == AuthEvent.actor_user_id)
+        .where(AuthEvent.user_id == user_id)
+        .order_by(AuthEvent.created_at.desc(), AuthEvent.id.desc())
+        .limit(limit)
+    )
+    return list(session.execute(stmt))

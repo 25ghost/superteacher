@@ -6,10 +6,15 @@ service layer decides *when* a user row is created; this module decides
 """
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.enums import UserRole
+from app.models.school import School
+from app.models.student import Student
+from app.models.teacher import Teacher
 from app.models.user import User
 
 
@@ -90,6 +95,26 @@ def list_page(
         .offset(offset)
     )
     return list(session.scalars(stmt))
+
+
+def get_detail_row(
+    session: Session, user_id: uuid.UUID
+) -> tuple[User, Student | None, Teacher | None, School | None] | None:
+    """Account + both optional profiles + assigned school in ONE statement.
+
+    The three outer joins mean the detail endpoint costs the same number
+    of queries whether the account is a bare identity or a fully
+    cross-linked one — no per-profile lookups. Returns ``None`` for an
+    unknown id (the service turns that into 404).
+    """
+    stmt = (
+        select(User, Student, Teacher, School)
+        .outerjoin(Student, Student.user_id == User.id)
+        .outerjoin(Teacher, Teacher.user_id == User.id)
+        .outerjoin(School, School.id == Teacher.school_id)
+        .where(User.id == user_id)
+    )
+    return session.execute(stmt).first()
 
 
 def create_student_user(

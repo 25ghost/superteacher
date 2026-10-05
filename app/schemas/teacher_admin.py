@@ -83,6 +83,38 @@ class AdminUserListRead(BaseModel):
     created_at: datetime
 
 
+class AdminUserEventRead(BaseModel):
+    """One audit event as the account detail shows it.
+
+    Identifiers and timestamps only: ``metadata_json`` deliberately stays
+    server-side (it can name tokens, roles or session counts), and the
+    acting administrator is resolved to their email so the trail reads.
+    """
+
+    event_type: str
+    created_at: datetime
+    actor_email: str | None = None
+    ip_address: str | None = None
+
+
+class AdminUserDetailRead(AdminUserListRead):
+    """One account with its profiles, live session count and recent audit.
+
+    The profile links are ids (``None`` when the account has no such
+    profile) plus the assigned school's code and name, so an administrator
+    sees where a teacher teaches without a second request. Never includes
+    ``password_hash``, token digests or event metadata blobs.
+    """
+
+    student_profile_id: UUID | None = None
+    teacher_profile_id: UUID | None = None
+    school_id: UUID | None = None
+    school_code: str | None = None
+    school_name: str | None = None
+    active_session_count: int = Field(ge=0)
+    recent_events: list[AdminUserEventRead] = Field(default_factory=list)
+
+
 class RoleChangeRequest(BaseModel):
     """The single request body that may choose an account's role."""
 
