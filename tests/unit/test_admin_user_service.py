@@ -16,6 +16,7 @@ the real ``/admin/teachers`` and ``/admin/users/{id}/role`` routes:
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -367,6 +368,61 @@ def test_generic_activate_lifts_a_disabled_account(session: Session, admin: User
     assert session.get(User, target.id).status == UserStatus.ACTIVE.value
     [event] = _events(session, "user_activated")
     assert event.actor_user_id == admin.id
+
+
+# --- audit metadata of the lifecycle events ---------------------------------------
+
+
+def test_activate_audit_metadata_records_from_and_to(session: Session, admin: User) -> None:
+    target = _make_user(
+        session, role=UserRole.STUDENT.value, status=UserStatus.DISABLED.value
+    )
+    session.commit()
+
+    admin_user_service.activate_user(session, target.id, actor=admin)
+    session.commit()
+
+    [event] = _events(session, "user_activated")
+    assert json.loads(event.metadata_json) == {"from": "disabled", "to": "active"}
+
+
+def test_deactivate_audit_metadata_records_from_to_and_revoked_sessions(
+    session: Session, admin: User
+) -> None:
+    target = _make_user(session, role=UserRole.STUDENT.value)
+    _seed_session(session, target)
+    session.commit()
+
+    admin_user_service.deactivate_user(session, target.id, actor=admin)
+    session.commit()
+
+    [event] = _events(session, "user_deactivated")
+    assert json.loads(event.metadata_json) == {
+        "from": "active",
+        "to": "suspended",
+        "revoked_sessions": 1,
+    }
+
+
+def test_teacher_lifecycle_events_carry_the_same_metadata(
+    session: Session, admin: User
+) -> None:
+    """The shared core writes one shape of metadata for all four events."""
+    user, _ = _create_teacher(session, admin, email="meta-teacher@example.com")
+
+    admin_user_service.deactivate_teacher(session, user.id, actor=admin)
+    session.commit()
+    [event] = _events(session, "teacher_deactivated")
+    assert json.loads(event.metadata_json) == {
+        "from": "pending",
+        "to": "suspended",
+        "revoked_sessions": 0,
+    }
+
+    admin_user_service.activate_teacher(session, user.id, actor=admin)
+    session.commit()
+    [event] = _events(session, "teacher_activated")
+    assert json.loads(event.metadata_json) == {"from": "suspended", "to": "active"}
 
 
 # --- generic activate: never-accepted teachers ---------------------------------

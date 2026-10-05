@@ -236,7 +236,8 @@ def get_user(
         "account: suspended by an administrator or disabled by the "
         "account's own request) → suspended, with every refresh session "
         "revoked so live tokens stop authenticating immediately; audited "
-        "as user_deactivated with the number of revoked sessions. 409 "
+        "as user_deactivated with metadata {\"from\": previous status, "
+        "\"to\": \"suspended\", \"revoked_sessions\": n}. 409 "
         "when the account is already suspended or disabled, when an "
         "administrator tries to deactivate their own account, and for the "
         "last active administrator — two administrators deactivating each "
@@ -274,7 +275,8 @@ def deactivate_user(
     response_model=AdminUserListRead,
     summary="Reactivate a suspended user account (administrative)",
     description=(
-        "suspended/pending → active, audited as user_activated. 409 when "
+        "suspended/pending → active, audited as user_activated with "
+        "metadata {\"from\": previous status, \"to\": \"active\"}. 409 when "
         "the account is already active, and for a teacher that has never "
         "accepted its invitation (users.password_hash IS NULL, whatever "
         "the status): teachers are activated by accepting their "

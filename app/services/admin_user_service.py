@@ -460,7 +460,8 @@ def _activate_target(
     refusal keys on the missing password, not on the status, so a
     teacher that was suspended *before* accepting the invite cannot slip
     through either. The caller names the audit event, so the trail keeps
-    distinguishing ``teacher_activated`` from ``user_activated``.
+    distinguishing ``teacher_activated`` from ``user_activated``; either
+    way the row carries ``{"from": <previous status>, "to": "active"}``.
     """
     if user.status == UserStatus.ACTIVE.value:
         raise AuthConflictError("account is already active")
@@ -475,12 +476,16 @@ def _activate_target(
             "POST /admin/teachers/"
             f"{user.id}/invite or accept it with POST /auth/accept-invite"
         )
+    previous = user.status
     user.status = UserStatus.ACTIVE.value
     auth_event_repo.log_event(
         session,
         user_id=user.id,
         event_type=event_type,
         actor_user_id=actor.id,
+        metadata_json=json.dumps(
+            {"from": previous, "to": UserStatus.ACTIVE.value}
+        ),
     )
     session.flush()
 
@@ -504,7 +509,8 @@ def _deactivate_target(
     cannot be deactivated. The second guard takes the same row lock that
     two concurrent deactivations contend on, so two administrators trying
     to deactivate each other cannot both pass it — exactly one commit
-    survives.
+    survives. The audit row records the transition as
+    ``{"from": <previous status>, "to": "suspended", "revoked_sessions": n}``.
     """
     if user.id == actor.id:
         raise AuthConflictError(
@@ -520,6 +526,7 @@ def _deactivate_target(
             raise AuthConflictError(
                 "the last active administrator cannot be deactivated"
             )
+    previous = user.status
     user.status = UserStatus.SUSPENDED.value
     revoked = revoke_all_sessions(session, user.id)
     auth_event_repo.log_event(
@@ -527,7 +534,13 @@ def _deactivate_target(
         user_id=user.id,
         event_type=event_type,
         actor_user_id=actor.id,
-        metadata_json=json.dumps({"revoked_sessions": revoked}),
+        metadata_json=json.dumps(
+            {
+                "from": previous,
+                "to": UserStatus.SUSPENDED.value,
+                "revoked_sessions": revoked,
+            }
+        ),
     )
     session.flush()
 
