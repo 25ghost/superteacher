@@ -322,6 +322,55 @@ def test_deactivate_unknown_user_is_404(session: Session, admin: User) -> None:
         admin_user_service.deactivate_teacher(session, uuid.uuid4(), actor=admin)
 
 
+# --- generic activate: never-accepted teachers ---------------------------------
+
+
+def test_generic_activate_refuses_a_teacher_suspended_before_accepting(
+    session: Session, admin: User
+) -> None:
+    """password_hash IS NULL decides, not the status: pending → suspended → 409."""
+    user, _ = _create_teacher(session, admin, email="never-accepted@example.com")
+    assert user.password_hash is None
+    admin_user_service.deactivate_user(session, user.id, actor=admin)
+    session.commit()
+    assert session.get(User, user.id).status == UserStatus.SUSPENDED.value
+
+    with pytest.raises(AuthConflictError) as excinfo:
+        admin_user_service.activate_user(session, user.id, actor=admin)
+    session.rollback()
+
+    assert "invitation" in str(excinfo.value)
+    assert session.get(User, user.id).status == UserStatus.SUSPENDED.value
+    assert not _events(session, "user_activated")
+
+
+def test_generic_activate_refuses_a_pending_teacher(session: Session, admin: User) -> None:
+    user, _ = _create_teacher(session, admin, email="generic-pending@example.com")
+    with pytest.raises(AuthConflictError) as excinfo:
+        admin_user_service.activate_user(session, user.id, actor=admin)
+    session.rollback()
+    assert "invitation" in str(excinfo.value)
+    assert session.get(User, user.id).status == UserStatus.PENDING.value
+
+
+def test_generic_activate_accepts_a_suspended_teacher_that_has_a_password(
+    session: Session, admin: User
+) -> None:
+    """The refusal is about the missing password, not about the role alone."""
+    user, _ = _create_teacher(session, admin, email="has-password@example.com")
+    user.password_hash = PASSWORD_HASH
+    user.status = UserStatus.SUSPENDED.value
+    session.commit()
+
+    read = admin_user_service.activate_user(session, user.id, actor=admin)
+    session.commit()
+
+    assert read.status == UserStatus.ACTIVE.value
+    assert session.get(User, user.id).status == UserStatus.ACTIVE.value
+    [event] = _events(session, "user_activated")
+    assert event.actor_user_id == admin.id
+
+
 # --- role change -----------------------------------------------------------------
 
 

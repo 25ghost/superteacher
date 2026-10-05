@@ -451,11 +451,15 @@ def _activate_target(
 ) -> None:
     """Shared ``pending/suspended → active`` core (no transport concerns).
 
-    409 when the account is already active. A pending *teacher* account
-    is refused unless the caller is the teacher-specific route: teachers
-    are activated by accepting their invitation, so activating them
-    generically would bypass the email confirmation the invitation flow
-    exists for. The caller names the audit event, so the trail keeps
+    409 when the account is already active. A *teacher* account that has
+    never accepted its invitation (``password_hash IS NULL``) is refused
+    unless the caller is the teacher-specific route: without a password
+    the account cannot authenticate, and accepting the invitation is the
+    only way to set one — activating it generically would strand an
+    ``active`` account that can neither log in nor be invited again. The
+    refusal keys on the missing password, not on the status, so a
+    teacher that was suspended *before* accepting the invite cannot slip
+    through either. The caller names the audit event, so the trail keeps
     distinguishing ``teacher_activated`` from ``user_activated``.
     """
     if user.status == UserStatus.ACTIVE.value:
@@ -463,11 +467,12 @@ def _activate_target(
     if (
         not allow_pending_teacher
         and user.role == UserRole.TEACHER.value
-        and user.status == UserStatus.PENDING.value
+        and user.password_hash is None
     ):
         raise AuthConflictError(
-            "a pending teacher account must be activated through the "
-            "invitation flow: re-send it with POST /admin/teachers/"
+            "this teacher account has never accepted its invitation (no "
+            "password set): use the invitation flow — re-send the link with "
+            "POST /admin/teachers/"
             f"{user.id}/invite or accept it with POST /auth/accept-invite"
         )
     user.status = UserStatus.ACTIVE.value
@@ -557,9 +562,9 @@ def deactivate_teacher(
 def activate_user(session: Session, user_id: uuid.UUID, *, actor: User) -> AdminUserListRead:
     """Any non-teacher account → active (``user_activated``).
 
-    404 unknown id; 409 already active or a pending teacher (see
-    ``_activate_target``). The teacher's own activate route is the one
-    that lifts its invitation guard.
+    404 unknown id; 409 already active, or a teacher that has never
+    accepted its invitation (see ``_activate_target``). The teacher's own
+    activate route is the one that lifts its invitation guard.
     """
     target = session.get(User, user_id)
     if target is None:

@@ -26,7 +26,8 @@ before any logic runs, and anonymous callers get 401.
   revoking every refresh session; self, last-admin and repeat
   deactivations → 409.
 - ``POST /admin/users/{user_id}/activate`` — suspended → active; a
-  pending teacher is refused (the invitation flow owns that).
+  teacher that has never accepted its invitation is refused (the
+  invitation flow owns that).
 - ``PATCH /admin/users/{user_id}/role`` — change any *other* account's
   role (self-change → 403); sessions are revoked so an old token cannot
   keep the previous privileges.
@@ -273,10 +274,11 @@ def deactivate_user(
     summary="Reactivate a suspended user account (administrative)",
     description=(
         "suspended/pending → active, audited as user_activated. 409 when "
-        "the account is already active, and for a pending *teacher*: "
-        "teachers are activated by accepting their invitation, so the "
-        "generic route refuses to bypass it (use "
-        "POST /admin/teachers/{user_id}/activate or "
+        "the account is already active, and for a teacher that has never "
+        "accepted its invitation (users.password_hash IS NULL, whatever "
+        "the status): teachers are activated by accepting their "
+        "invitation, so the generic route refuses to bypass it (use "
+        "POST /admin/teachers/{user_id}/invite or "
         "POST /auth/accept-invite instead). 404 unknown id. "
         "Administrator-only."
     ),
@@ -285,7 +287,7 @@ def deactivate_user(
         401: {"description": "Missing/invalid credentials"},
         403: {"description": "Authenticated but not an administrator"},
         404: {"description": "Unknown user id"},
-        409: {"description": "Already active / pending teacher (invitation flow)"},
+        409: {"description": "Already active / never-accepted teacher (invitation flow)"},
         429: {"description": "Rate limit exceeded"},
     },
 )
