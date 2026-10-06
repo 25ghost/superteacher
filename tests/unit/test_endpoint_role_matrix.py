@@ -57,11 +57,42 @@ STUDENT_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/me/registrations", {}),
     ("GET", "/api/v1/me/registrations", None),
     ("GET", "/api/v1/me/registrations/{enrollment_id}", None),
+    # Phase 1 marketplace + learning enrollments (student-only).
+    ("GET", "/api/v1/marketplace/offerings", None),
+    ("POST", "/api/v1/marketplace/offerings/{offering_id}/enroll", None),
+    ("GET", "/api/v1/me/learning-enrollments", None),
+    ("GET", "/api/v1/me/learning-enrollments/{enrollment_id}", None),
+    ("POST", "/api/v1/me/learning-enrollments/{enrollment_id}/leave", None),
 ]
 
 TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/me/teacher", None),
     ("PATCH", "/api/v1/me/teacher", {}),
+    # Phase 1 teaching offerings (teacher-only).
+    ("POST", "/api/v1/me/teacher/offerings", {}),
+    ("GET", "/api/v1/me/teacher/offerings", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}", None),
+    ("PATCH", "/api/v1/me/teacher/offerings/{offering_id}", {}),
+    # Phase 2 slice 2A — topics and lessons under an offering (teacher-only).
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/topics", {}),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/topics", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}", None),
+    ("PATCH", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}", {}),
+    ("DELETE", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}", None),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}/lessons", {}),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}/lessons", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}/lessons/{lesson_id}", None),
+    ("PATCH", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}/lessons/{lesson_id}", {}),
+    ("DELETE", "/api/v1/me/teacher/offerings/{offering_id}/topics/{topic_id}/lessons/{lesson_id}", None),
+    # Phase 2 slice 2B — teaching materials under an offering (teacher-only).
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials", {}),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/materials", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}", None),
+    ("PATCH", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}", {}),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}/submit", None),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}/revise", None),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}/archive", None),
+    ("DELETE", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}", None),
 ]
 
 ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -76,6 +107,8 @@ ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/admin/teachers/{user_id}/activate", {}),
     ("POST", "/api/v1/admin/teachers/{user_id}/deactivate", {}),
     ("PATCH", "/api/v1/admin/teachers/{user_id}/school", {"school_id": None}),
+    # Phase 1 verification axis (admin-only).
+    ("PATCH", "/api/v1/admin/teachers/{user_id}/verification", {"status": "approved"}),
     ("GET", "/api/v1/admin/users", None),
     ("GET", "/api/v1/admin/users/{user_id}", None),
     ("POST", "/api/v1/admin/users/{user_id}/deactivate", None),
@@ -87,6 +120,12 @@ ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/admin/registrations/{enrollment_id}", None),
     ("PATCH", "/api/v1/admin/registrations/{enrollment_id}/status", {}),
     ("GET", "/api/v1/admin/students/{student_id}/registrations", None),
+    # Phase 2 slice 2B — material moderation (admin-only).
+    ("GET", "/api/v1/admin/materials", None),
+    ("GET", "/api/v1/admin/materials/{material_id}", None),
+    ("POST", "/api/v1/admin/materials/{material_id}/approve", None),
+    ("POST", "/api/v1/admin/materials/{material_id}/reject", {"reason": "not allowed"}),
+    ("POST", "/api/v1/admin/materials/{material_id}/archive", None),
 ]
 
 ANY_ROLE_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -101,6 +140,7 @@ PUBLIC_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/health", None),
     ("GET", "/api/v1/health/ready", None),
     ("POST", "/api/v1/auth/register", {}),
+    ("POST", "/api/v1/auth/register-teacher", {}),
     ("POST", "/api/v1/auth/login", {}),
     ("POST", "/api/v1/auth/refresh", {}),
     ("POST", "/api/v1/auth/forgot-password", {}),
@@ -200,6 +240,10 @@ def _path(template: str) -> str:
         student_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
         enrollment_id=uuid.uuid4(),
+        offering_id=uuid.uuid4(),
+        topic_id=uuid.uuid4(),
+        lesson_id=uuid.uuid4(),
+        material_id=uuid.uuid4(),
         school_code="MISSING",
     )
 
@@ -240,7 +284,7 @@ def test_public_routes_never_answer_401_or_403(
 def test_route_inventory_is_exactly_the_matrix() -> None:
     """No v1 endpoint may exist outside the role matrix — and vice versa.
 
-    The count pin (54) makes adding or removing a route a conscious
+    The count pin (88) makes adding or removing a route a conscious
     decision: a new endpoint must be listed in one of the five groups
     above or this test names it as unlisted.
     """
@@ -259,7 +303,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 54, f"route count changed: {len(actual)} != 54"
+    assert len(actual) == 88, f"route count changed: {len(actual)} != 88"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------

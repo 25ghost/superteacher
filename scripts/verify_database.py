@@ -73,9 +73,20 @@ EXPECTED_TABLES = {
     "auth_events",
     "password_reset_tokens",
     "student_profile_history",
+    # created by 0010 (Phase 1 learning marketplace)
+    "learning_contexts",
+    "teaching_offerings",
+    "learning_enrollments",
+    # created by 0011 (Phase 2 slice 2A: curriculum under an offering)
+    "topics",
+    "lessons",
+    # created by 0012 (Phase 2 slice 2B: materials + moderation)
+    "file_assets",
+    "materials",
+    "material_moderations",
 }
 
-EXPECTED_REVISION = "0009"
+EXPECTED_REVISION = "0012"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -108,6 +119,22 @@ EXPECTED_FK_INDEXES = {
     "program_versions_academic_year_id_idx": ("program_versions", ("academic_year_id",)),
     "program_versions_pathway_id_idx": ("program_versions", ("pathway_id",)),
     "program_versions_education_level_id_idx": ("program_versions", ("education_level_id",)),
+    # Phase 2 slice 2A: curriculum FKs under an offering / topic.
+    "topics_teaching_offering_id_idx": ("topics", ("teaching_offering_id",)),
+    "lessons_topic_id_idx": ("lessons", ("topic_id",)),
+    # Phase 2 slice 2B: material system FKs.
+    "file_assets_uploaded_by_user_id_idx": ("file_assets", ("uploaded_by_user_id",)),
+    "materials_teaching_offering_id_idx": ("materials", ("teaching_offering_id",)),
+    "materials_lesson_id_idx": ("materials", ("lesson_id",)),
+    "materials_file_asset_id_idx": ("materials", ("file_asset_id",)),
+    "material_moderations_material_id_idx": (
+        "material_moderations",
+        ("material_id",),
+    ),
+    "material_moderations_reviewer_user_id_idx": (
+        "material_moderations",
+        ("reviewer_user_id",),
+    ),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------
@@ -724,6 +751,17 @@ LATER_MIGRATION_TABLES = {
     "auth_events",
     "password_reset_tokens",
     "student_profile_history",
+    # created by 0010 (Phase 1 learning marketplace)
+    "learning_contexts",
+    "teaching_offerings",
+    "learning_enrollments",
+    # created by 0011 (Phase 2 slice 2A: curriculum under an offering)
+    "topics",
+    "lessons",
+    # created by 0012 (Phase 2 slice 2B: materials + moderation)
+    "file_assets",
+    "materials",
+    "material_moderations",
 }
 
 

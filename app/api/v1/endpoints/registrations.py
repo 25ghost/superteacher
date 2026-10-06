@@ -43,7 +43,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.api.v1.tags import TAG_ADMIN_REGISTRATIONS, TAG_CATALOG, TAG_STUDENT
+from app.api.v1.tags import TAG_ADMIN, TAG_CATALOG, TAG_STUDENT
 from app.core.auth_dependencies import (
     get_current_student,
     require_admin,
@@ -76,7 +76,7 @@ router = APIRouter(prefix="/registrations", tags=[TAG_CATALOG])
 me_router = APIRouter(prefix="/me", tags=[TAG_STUDENT])
 
 # Administrative registration routes (mounted under /admin).
-admin_router = APIRouter(prefix="/admin", tags=[TAG_ADMIN_REGISTRATIONS])
+admin_router = APIRouter(prefix="/admin", tags=[TAG_ADMIN])
 
 
 def _http_error(exc: RegistrationError) -> HTTPException:

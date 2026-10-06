@@ -18,7 +18,7 @@ declared in OpenAPI; public endpoints (health, catalog, readiness) remain
 public. Endpoints are role-split: self-service lives under ``/me/*``,
 administration under ``/admin/*``, and no route serves two roles. The
 OpenAPI document groups them by role (Authentication, Account, Student,
-Teacher, Admin - *, Catalog, Health) and prefixes every operation
+Teacher, Admin, Catalog, Health) and prefixes every operation
 description with the role it requires; the vocabulary lives in
 ``app.api.v1.tags``.
 

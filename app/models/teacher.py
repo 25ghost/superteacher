@@ -10,14 +10,19 @@ Created by migration ``0006`` together with the ``pending`` account status:
 
 Deletion policy mirrors ``students``: the ``user_id`` FK has no ``ondelete``,
 so deleting a user that still owns a profile is refused by the database.
+
+Migration ``0010`` adds ``verification_status`` (Phase 1): the vetting axis
+that gates publishing teaching offerings, deliberately separate from the
+account status above.
 """
 import uuid
 
-from sqlalchemy import ForeignKey, String
+from sqlalchemy import CheckConstraint, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.time_mixin import TimestampMixin
+from app.models.enums import TeacherVerificationStatus, sql_in_list
 
 
 class Teacher(TimestampMixin, Base):
@@ -36,5 +41,19 @@ class Teacher(TimestampMixin, Base):
     )
     # Optional teaching subject/assignment hint (free text, not a catalog FK).
     subject: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Phase 1: vetting state, separate from the account status — the
+    # service refuses teaching offerings unless this is 'approved'.
+    verification_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=TeacherVerificationStatus.PENDING.value,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            f"verification_status IN ({sql_in_list(TeacherVerificationStatus)})",
+            name="teachers_verification_status_check",
+        ),
+    )
 
     user = relationship("User", uselist=False)

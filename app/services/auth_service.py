@@ -38,8 +38,9 @@ from sqlalchemy import select
 from app.core import security
 from app.core.security import PasswordPolicyError
 from app.models.auth_session import AuthSession
-from app.models.enums import UserRole, UserStatus
+from app.models.enums import TeacherVerificationStatus, UserRole, UserStatus
 from app.models.student import Student
+from app.models.teacher import Teacher
 from app.models.user import User
 from app.repositories import auth_session_repository as auth_session_repo
 from app.repositories import student_repository as student_repo
@@ -54,6 +55,7 @@ from app.schemas.auth import (
     LoginRequest,
     ResetPasswordRequest,
     StudentAccountCreate,
+    TeacherAccountCreate,
     TokenResponse,
 )
 from app.services.student_service import (
@@ -71,6 +73,7 @@ logger = logging.getLogger(__name__)
 _DUPLICATE_EMAIL_CONSTRAINT = "uq_users_email_key"
 _DUPLICATE_EMAIL_CI_CONSTRAINT = "uq_users_email_ci_key"
 _DUPLICATE_PROFILE_CONSTRAINT = "students_user_id_key"
+_DUPLICATE_TEACHER_PROFILE_CONSTRAINT = "teachers_user_id_key"
 
 # Generic public conflict detail for registration: the public endpoint must
 # never confirm whether an email is already registered (anti-enumeration —
@@ -342,6 +345,75 @@ def register_student_account(
     identity = _read_user(user, student_repo.get_by_user_id(session, user.id))
     tokens = _issue_session(session, user, datetime.now(timezone.utc))
     return identity, tokens
+
+
+def register_teacher_account(
+    session: Session,
+    payload: TeacherAccountCreate,
+) -> TokenResponse:
+    """Create a teacher account (user + profile) atomically, then issue tokens.
+
+    The role is fixed server-side to ``teacher`` and the account starts
+    ``active`` so the new teacher can log in right away; the *profile*
+    starts ``pending`` verification, which is what gates publishing
+    teaching offerings — account status and vetting stay independent axes.
+
+    Returns the token pair; the caller commits. Any raise after the inserts
+    is rolled back by the caller, so no orphaned user survives. Email
+    uniqueness follows the student path: pre-check first, the database's
+    unique constraints under a concurrent race.
+    """
+    try:
+        password = security.validate_password_policy(payload.password)
+    except PasswordPolicyError as exc:
+        raise AuthValidationError(str(exc)) from exc
+
+    email = str(payload.email).strip().lower()
+    if user_repo.get_by_email(session, email) is not None:
+        raise AuthConflictError(_REGISTER_EMAIL_TAKEN_DETAIL)
+
+    try:
+        user = user_repo.create_teacher_user(
+            session,
+            email=email,
+            password_hash=security.hash_password(password),
+        )
+        teacher = Teacher(
+            user_id=user.id,
+            full_name=payload.full_name,
+            phone=payload.phone,
+            subject=payload.subject,
+            verification_status=TeacherVerificationStatus.PENDING.value,
+        )
+        session.add(teacher)
+        session.flush()
+    except IntegrityError as exc:
+        constraint_text = str(exc.orig)
+        if (
+            _DUPLICATE_EMAIL_CONSTRAINT in constraint_text
+            or _DUPLICATE_EMAIL_CI_CONSTRAINT in constraint_text
+        ):
+            logger.warning("duplicate email race lost for a new teacher account")
+            raise AuthConflictError(_REGISTER_EMAIL_TAKEN_DETAIL) from exc
+        if _DUPLICATE_TEACHER_PROFILE_CONSTRAINT in constraint_text:
+            logger.warning("duplicate profile race lost for a new teacher account")
+            raise AuthConflictError(
+                "teacher profile already exists for this user"
+            ) from exc
+        raise  # an unexpected integrity problem must stay visible (500)
+
+    # Audit: the signup *is* the verification request (self-service
+    # creation is attributed to the new account itself, no actor).
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type="teacher_verification_submitted",
+    )
+    logger.info(
+        "teacher account registered",
+        extra={"user_id": str(user.id)},
+    )
+    return _issue_session(session, user, datetime.now(timezone.utc))
 
 
 # --- login (Step 21) -----------------------------------------------------------------

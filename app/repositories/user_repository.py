@@ -169,6 +169,37 @@ def create_student_user(
     return user
 
 
+def create_teacher_user(
+    session: Session,
+    *,
+    email: str,
+    password_hash: str,
+) -> User:
+    """Insert a user row with the ``teacher`` role (not committed).
+
+    Deliberately separate from :func:`create_student_user`, whose role is
+    hard-coded to ``student`` by design: the public teacher signup path
+    must not share a helper that silently forces another role, and the
+    student path must not grow a role parameter. The account is ``active``
+    — unlike the administrator-invited flow, a self-registered teacher can
+    log in immediately (their *profile* starts unverified, which is what
+    gates publishing). ``users.phone`` stays empty; the profile row carries
+    the contact number, exactly like the administrative creation path.
+
+    ``password_hash`` is an already-hashed PHC Argon2id string; callers
+    validate the plaintext against the password policy before hashing.
+    """
+    user = User(
+        email=email,
+        role=UserRole.TEACHER.value,
+        status="active",
+        password_hash=password_hash,
+    )
+    session.add(user)
+    session.flush()  # assign the PK so the caller can link the profile
+    return user
+
+
 def create_admin_user(
     session: Session,
     *,

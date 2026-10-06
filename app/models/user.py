@@ -63,3 +63,4 @@ class User(TimestampMixin, Base):
     auth_sessions = relationship(
         "AuthSession", back_populates="user", cascade="all, delete-orphan"
     )
+    file_assets = relationship("FileAsset", back_populates="uploaded_by")

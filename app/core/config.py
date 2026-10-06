@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     # Frontend URL — base URL for password reset links.
     FRONTEND_URL: str = "http://localhost:5173"
 
+    # Teaching-material uploads (Phase 2, slice 2B).
+    # Hard ceiling on one uploaded file (bytes). Content-type allowlist and
+    # magic-byte checks live in app.services.file_validation.
+    MATERIAL_MAX_FILE_BYTES: int = 20 * 1024 * 1024  # 20 MiB
+    # Root directory for the local StorageBackend. Relative paths resolve
+    # against the process working directory (backend/ in development).
+    STORAGE_LOCAL_ROOT: str = "var/storage"
+
     # Connection pool tuning (SQLAlchemy engine).
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10

@@ -10,3 +10,4 @@ argon2-cffi>=23.1,<26
 PyJWT>=2.8,<3
 slowapi>=0.1.9,<1
 resend>=2.0,<3
+python-multipart>=0.0.9,<1

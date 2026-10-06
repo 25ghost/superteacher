@@ -25,10 +25,8 @@ TAG_AUTHENTICATION = "Authentication"
 TAG_ACCOUNT = "Account"
 TAG_STUDENT = "Student"
 TAG_TEACHER = "Teacher"
-TAG_ADMIN_STUDENTS = "Admin - Students"
-TAG_ADMIN_REGISTRATIONS = "Admin - Registrations"
-TAG_ADMIN_TEACHERS = "Admin - Teachers"
-TAG_ADMIN_USERS = "Admin - Users"
+TAG_MARKETPLACE = "Marketplace"
+TAG_ADMIN = "Admin"
 TAG_CATALOG = "Catalog"
 TAG_HEALTH = "Health"
 
@@ -52,48 +50,52 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {
         "name": TAG_STUDENT,
         "description": (
-            "Student-only self-service under /me/student and "
-            "/me/registrations: maintain your own profile, enroll yourself, "
-            "and read your own registrations."
+            "Student-only self-service under /me/student, "
+            "/me/registrations and /me/learning-enrollments: maintain your "
+            "own profile, enroll yourself in an academic year, read your "
+            "own registrations, and read or leave your own marketplace "
+            "learning enrollments."
         ),
     },
     {
         "name": TAG_TEACHER,
         "description": (
             "Teacher-only self-service under /me/teacher: read and update "
-            "your own teacher profile."
+            "your own teacher profile, publish, list, read and amend your "
+            "own teaching offerings (Phase 1), maintain the topics and "
+            "lessons beneath one of those offerings (Phase 2, slice 2A), "
+            "and author teaching materials — upload a validated file, "
+            "submit for review, revise rejections and archive published "
+            "works (Phase 2, slice 2B). Curriculum and material rows stay "
+            "inside the offering's educational context; only the owning "
+            "teacher may touch them. Publication itself is administrator-"
+            "only."
         ),
     },
     {
-        "name": TAG_ADMIN_STUDENTS,
+        "name": TAG_MARKETPLACE,
         "description": (
-            "Administrator-only maintenance of student profiles under "
-            "/admin/students: create, list, retrieve and patch profiles, and "
-            "read their field-level change history."
+            "Student-only marketplace under /marketplace: discover live "
+            "teaching offerings (active offers by approved teachers) and "
+            "enroll yourself into one. Enrolling twice in the same learning "
+            "context requires leaving the first enrollment first."
         ),
     },
     {
-        "name": TAG_ADMIN_REGISTRATIONS,
+        "name": TAG_ADMIN,
         "description": (
-            "Administrator-only enrollment administration under "
-            "/admin/registrations: register a student on their behalf, list "
-            "and retrieve registrations, change a registration's status and "
-            "list any student's registrations."
-        ),
-    },
-    {
-        "name": TAG_ADMIN_TEACHERS,
-        "description": (
-            "Administrator-only teacher account lifecycle under "
-            "/admin/teachers: create an account, list them, re-send "
-            "invitations, activate and deactivate."
-        ),
-    },
-    {
-        "name": TAG_ADMIN_USERS,
-        "description": (
-            "Administrator-only account administration under /admin/users: "
-            "change an account's role and clear a failed-login lockout."
+            "Administrator-only maintenance under /admin/*: student "
+            "profiles and their field-level change history "
+            "(/admin/students), enrollment administration "
+            "(/admin/registrations), the teacher account lifecycle "
+            "(/admin/teachers) — create, invite, activate, deactivate, "
+            "school assignment, verification status (Phase 1) — user "
+            "account administration (/admin/users): list, retrieve, "
+            "activate, deactivate, change an account's role and clear a "
+            "failed-login lockout, and teaching-material moderation "
+            "(/admin/materials): review the pending queue, approve "
+            "(publish) or reject with a recorded reason, and archive "
+            "published works (Phase 2, slice 2B)."
         ),
     },
     {

@@ -54,6 +54,7 @@ from app.schemas.teacher_admin import (
     TeacherCreate,
     TeacherRead,
     TeacherSchoolUpdate,
+    TeacherVerificationUpdate,
 )
 from app.services.auth_service import (
     AuthConflictError,
@@ -111,6 +112,7 @@ def _build_teacher_read(
         subject=profile.subject,
         role=user.role,
         status=user.status,
+        verification_status=profile.verification_status,
         created_at=user.created_at,
         updated_at=user.updated_at,
     )
@@ -333,6 +335,66 @@ def set_teacher_school(
             "user_id": str(user.id),
             "actor_id": str(actor.id),
             "school_id": str(payload.school_id) if payload.school_id else None,
+        },
+    )
+    return _build_teacher_read(user, profile, school)
+
+
+# --- teacher verification (Phase 1) ---------------------------------------------------
+
+
+def set_teacher_verification(
+    session: Session,
+    user_id: uuid.UUID,
+    payload: TeacherVerificationUpdate,
+    *,
+    actor: User,
+) -> TeacherRead:
+    """Record an administrator's vetting decision on a teacher profile.
+
+    ``pending``/``approved``/``rejected``/``suspended`` all move freely —
+    an administrator may reopen or reverse a decision — but a repeat of the
+    current value is a 409 (no silent no-op), exactly like the account
+    activate/deactivate routes. The account status is deliberately left
+    alone: vetting and the ability to log in are independent axes, so
+    suspending a *teacher* hides their offerings without locking the person
+    out of their account (and vice versa).
+
+    Profile and school come from one joined statement; every accepted
+    change writes exactly one ``auth_events`` row naming both the subject
+    and the acting administrator. The caller commits.
+    """
+    user = _load_teacher_user(session, user_id)
+    row = teacher_repo.get_profile_with_school(session, user.id)
+    if row is None:
+        raise AuthNotFoundError("teacher profile not found")
+    profile, school = row
+
+    new_status = payload.status.value
+    previous_status = profile.verification_status
+    if new_status == previous_status:
+        raise AuthConflictError(
+            f"teacher verification is already {new_status!r}"
+        )
+
+    profile.verification_status = new_status
+    auth_event_repo.log_event(
+        session,
+        user_id=user.id,
+        event_type=f"teacher_verification_{new_status}",
+        actor_user_id=actor.id,
+        metadata_json=json.dumps(
+            {"status": new_status, "previous_status": previous_status}
+        ),
+    )
+    session.flush()
+    logger.info(
+        "teacher verification changed",
+        extra={
+            "user_id": str(user.id),
+            "actor_id": str(actor.id),
+            "status": new_status,
+            "previous_status": previous_status,
         },
     )
     return _build_teacher_read(user, profile, school)

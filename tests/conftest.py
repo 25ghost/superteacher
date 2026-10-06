@@ -41,6 +41,17 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 # The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
+    # Phase 2 slice 2B — materials: moderation rows before materials before
+    # file assets before the offerings they hang off, then slice 2A's
+    # curriculum and Phase 1's marketplace tables.
+    "material_moderations",
+    "materials",
+    "file_assets",
+    "lessons",
+    "topics",
+    "learning_enrollments",
+    "teaching_offerings",
+    "learning_contexts",
     "student_subjects",
     "student_enrollments",
     "student_profile_history",

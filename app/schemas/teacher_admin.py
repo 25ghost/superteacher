@@ -20,7 +20,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models.enums import UserRole
+from app.models.enums import TeacherVerificationStatus, UserRole
 from app.schemas.student_profile import _validate_full_name
 
 
@@ -60,6 +60,10 @@ class TeacherRead(BaseModel):
     subject: str | None = None
     role: str
     status: str
+    #: Phase 1 vetting axis (pending/approved/rejected/suspended) — a
+    #: separate column from ``status``, surfaced everywhere a teacher row
+    #: is read so an administrator sees what is blocking an account.
+    verification_status: str
     created_at: datetime
     updated_at: datetime
 
@@ -145,6 +149,7 @@ class TeacherMeRead(BaseModel):
     subject: str | None = None
     role: str
     status: str
+    verification_status: str
     created_at: datetime
     updated_at: datetime
 
@@ -187,3 +192,19 @@ class TeacherMeUpdate(BaseModel):
         if value is None:
             raise ValueError("full_name must not be cleared")
         return _validate_full_name(value)
+
+
+class TeacherVerificationUpdate(BaseModel):
+    """Administrative vetting decision (``PATCH /admin/teachers/{id}/verification``).
+
+    The one body that moves ``teachers.verification_status``. It carries a
+    single enum field — no account status, no role, no school: vetting and
+    the account lifecycle stay independent axes, and an explicit
+    ``pending`` lets an administrator reopen a decision. The requested
+    value is validated here, so an unknown status is a 422 rather than a
+    database CHECK failure.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: TeacherVerificationStatus

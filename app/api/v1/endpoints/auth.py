@@ -3,7 +3,9 @@
 Role-split routers — every endpoint lives under exactly one guard:
 
 - ``router`` (prefix ``/auth``, tag ``Authentication``) — public/token ops:
-  ``POST /auth/register`` (student account creation), ``POST /auth/login``,
+  ``POST /auth/register`` (student account creation),
+  ``POST /auth/register-teacher`` (teacher account creation, Phase 1),
+  ``POST /auth/login``,
   ``POST /auth/refresh``, ``POST /auth/logout``,
   ``POST /auth/forgot-password``, ``POST /auth/reset-password``, plus the
   authenticated ``GET /auth/me`` (same payload as ``GET /me``, kept under
@@ -61,6 +63,7 @@ from app.schemas.auth import (
     RefreshTokenRequest,
     ResetPasswordRequest,
     StudentAccountCreate,
+    TeacherAccountCreate,
     TokenResponse,
 )
 from app.schemas.student_profile import (
@@ -141,6 +144,45 @@ def register_student_account(
 ) -> TokenResponse:
     try:
         _, tokens = auth_service.register_student_account(session, payload)
+    except auth_service.AuthError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    session.commit()
+    return tokens
+
+
+@router.post(
+    "/register-teacher",
+    response_model=TokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a teacher account (user + profile)",
+    description=(
+        "Creates the user identity (role fixed to 'teacher' — callers "
+        "cannot choose any other role) and the teacher profile atomically, "
+        "then issues an access + refresh token pair. The account starts "
+        "'active' so the teacher can log in immediately; the PROFILE starts "
+        "'pending' verification and cannot publish teaching offerings until "
+        "an administrator approves it (PATCH "
+        "/admin/teachers/{user_id}/verification). Password policy: minimum "
+        "length (see PASSWORD_MIN_LENGTH), never logged or stored in "
+        "plaintext (Argon2id). Duplicate email → 409. Policy violation → "
+        "422. The response contains tokens only — no password material."
+    ),
+    responses={
+        201: {"description": "Account created and tokens issued"},
+        409: {"description": "A user with this email already exists"},
+        422: {"description": "Validation error (password policy, profile fields)"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_REGISTER)
+def register_teacher_account(
+    request: Request,
+    payload: TeacherAccountCreate,
+    session: Session = Depends(get_db),
+) -> TokenResponse:
+    try:
+        tokens = auth_service.register_teacher_account(session, payload)
     except auth_service.AuthError as exc:
         session.rollback()
         raise _http_error(exc) from exc

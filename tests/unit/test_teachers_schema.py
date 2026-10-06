@@ -1,11 +1,10 @@
 """Unit tests: the ``teachers`` table, the ``pending`` status, migration 0006.
 
 Slice 3 introduces the teacher profile row (1:1 with ``users``) and the
-``pending`` account status used by the invite flow. Model, migration and the
-offline verification script must agree — the drift test below runs
-``scripts/verify_database.py``'s structural checks, which compare the ORM
-metadata against the parsed migration DDL column by column, constraint by
-constraint.
+``pending`` account status used by the invite flow. Phase 1 adds the
+``verification_status`` column (teacher marketplace vetting) — the columns
+assertion below covers it, and the drift tests prove the model still
+matches the migration DDL column by column, constraint by constraint.
 """
 from __future__ import annotations
 
@@ -46,6 +45,7 @@ def test_teachers_table_registered_with_expected_columns() -> None:
         "phone",
         "school_id",
         "subject",
+        "verification_status",
         "created_at",
         "updated_at",
     }
@@ -57,6 +57,9 @@ def test_teachers_table_registered_with_expected_columns() -> None:
     assert columns["subject"].type.length == 120
     assert columns["user_id"].nullable is False
     assert columns["school_id"].nullable is True
+    # Phase 1: vetting axis — required, short enum code, never nullable.
+    assert columns["verification_status"].nullable is False
+    assert columns["verification_status"].type.length == 32
     # Both timestamps present and required (verify_database checks the pair).
     assert columns["created_at"].nullable is False
     assert columns["updated_at"].nullable is False

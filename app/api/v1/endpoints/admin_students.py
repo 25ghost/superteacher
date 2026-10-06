@@ -44,7 +44,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.v1.tags import TAG_ADMIN_STUDENTS
+from app.api.v1.tags import TAG_ADMIN
 from app.core.auth_dependencies import require_admin
 from app.core.config import get_settings
 from app.core.database import get_db
@@ -63,7 +63,7 @@ from app.services.student_service import ProfileError
 
 _settings = get_settings()
 
-router = APIRouter(prefix="/admin/students", tags=[TAG_ADMIN_STUDENTS])
+router = APIRouter(prefix="/admin/students", tags=[TAG_ADMIN])
 
 
 def _http_error(exc: ProfileError) -> HTTPException:

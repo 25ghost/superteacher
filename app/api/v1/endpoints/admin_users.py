@@ -18,6 +18,9 @@ before any logic runs, and anonymous callers get 401.
 - ``PATCH /admin/teachers/{user_id}/school`` — assign or clear the
   teacher's school (404 unknown teacher *or* school; the audit event is
   written even when the value does not change).
+- ``PATCH /admin/teachers/{user_id}/verification`` — record the Phase 1
+  vetting decision (pending/approved/rejected/suspended); only an
+  approved teacher may publish teaching offerings.
 - ``GET /admin/users`` — list every account (paginated ``Page[T]``
   envelope) with role/status filters and an email search.
 - ``GET /admin/users/{user_id}`` — one account with its profiles, live
@@ -44,7 +47,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.api.v1.tags import TAG_ADMIN_TEACHERS, TAG_ADMIN_USERS
+from app.api.v1.tags import TAG_ADMIN
 from app.core.auth_dependencies import require_admin
 from app.core.config import get_settings
 from app.core.database import get_db
@@ -59,15 +62,17 @@ from app.schemas.teacher_admin import (
     TeacherCreate,
     TeacherRead,
     TeacherSchoolUpdate,
+    TeacherVerificationUpdate,
 )
 from app.services import admin_user_service
 from app.services.auth_service import AuthError
 
 _settings = get_settings()
 
-# No router-level tags: this router mixes two groups, so every route below
-# declares its own single tag (Admin - Teachers vs Admin - Users).
-router = APIRouter(prefix="/admin")
+# One tag for the whole administration surface (teachers and users alike):
+# Swagger shows a single Admin group, so no route may repeat it here — a
+# router-level plus a route-level tag would combine into two.
+router = APIRouter(prefix="/admin", tags=[TAG_ADMIN])
 
 
 def _error(exc: AuthError) -> HTTPException:
@@ -77,7 +82,6 @@ def _error(exc: AuthError) -> HTTPException:
 
 @router.post(
     "/teachers",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     status_code=status.HTTP_201_CREATED,
     summary="Create a teacher account and send its invitation (administrative)",
@@ -115,7 +119,6 @@ def create_teacher(
 
 @router.get(
     "/teachers",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=list[TeacherRead],
     summary="List teacher accounts (administrative)",
     description=(
@@ -140,7 +143,6 @@ def list_teachers(
 
 @router.get(
     "/users",
-    tags=[TAG_ADMIN_USERS],
     response_model=Page[AdminUserListRead],
     summary="List user accounts (administrative)",
     description=(
@@ -187,7 +189,6 @@ def list_users(
 
 @router.get(
     "/users/{user_id}",
-    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserDetailRead,
     summary="Retrieve one user account with its profiles and recent activity (administrative)",
     description=(
@@ -228,7 +229,6 @@ def get_user(
 
 @router.post(
     "/users/{user_id}/deactivate",
-    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserListRead,
     summary="Deactivate any user account, revoking its sessions (administrative)",
     description=(
@@ -271,7 +271,6 @@ def deactivate_user(
 
 @router.post(
     "/users/{user_id}/activate",
-    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserListRead,
     summary="Reactivate a suspended user account (administrative)",
     description=(
@@ -312,7 +311,6 @@ def activate_user(
 
 @router.post(
     "/teachers/{user_id}/invite",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Re-send a teacher invitation (administrative)",
     description=(
@@ -346,7 +344,6 @@ def resend_invite(
 
 @router.post(
     "/teachers/{user_id}/activate",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Activate a teacher account (administrative)",
     description=(
@@ -379,7 +376,6 @@ def activate_teacher(
 
 @router.post(
     "/teachers/{user_id}/deactivate",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Deactivate a teacher account (administrative)",
     description=(
@@ -414,7 +410,6 @@ def deactivate_teacher(
 
 @router.patch(
     "/teachers/{user_id}/school",
-    tags=[TAG_ADMIN_TEACHERS],
     response_model=TeacherRead,
     summary="Assign or clear a teacher's school (administrative)",
     description=(
@@ -458,8 +453,53 @@ def assign_teacher_school(
 
 
 @router.patch(
+    "/teachers/{user_id}/verification",
+    response_model=TeacherRead,
+    summary="Set a teacher's verification status (administrative)",
+    description=(
+        "Body {status}: pending | approved | rejected | suspended — the "
+        "Phase 1 vetting axis, deliberately INDEPENDENT from the account "
+        "status. Only an approved teacher may publish teaching offerings "
+        "(POST /me/teacher/offerings); suspending the teacher hides their "
+        "marketplace offerings without locking them out of their account, "
+        "and approving does not activate a suspended account. All four "
+        "values may be set freely — an administrator can reopen or reverse "
+        "a decision — but repeating the current value is 409 (no silent "
+        "no-op). Unknown teacher id → 404; unknown status → 422. Every "
+        "accepted change writes one teacher_verification_* audit event "
+        "naming this administrator. Administrator-only."
+    ),
+    responses={
+        200: {"description": "The teacher account with its verification status"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown user id (or not a teacher account)"},
+        409: {"description": "Verification is already that value"},
+        422: {"description": "Missing/unknown fields in the body"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def set_teacher_verification(
+    request: Request,
+    user_id: uuid.UUID,
+    payload: TeacherVerificationUpdate,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TeacherRead:
+    try:
+        updated = admin_user_service.set_teacher_verification(
+            session, user_id, payload, actor=admin
+        )
+    except AuthError as exc:
+        session.rollback()
+        raise _error(exc) from exc
+    session.commit()
+    return updated
+
+
+@router.patch(
     "/users/{user_id}/role",
-    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserRead,
     summary="Change an account's role (administrative)",
     description=(
@@ -501,7 +541,6 @@ def change_role(
 
 @router.post(
     "/users/{user_id}/unlock",
-    tags=[TAG_ADMIN_USERS],
     response_model=AdminUserRead,
     summary="Clear a login lockout (administrative)",
     description=(

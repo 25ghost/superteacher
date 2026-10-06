@@ -86,6 +86,45 @@ class StudentAccountCreate(BaseModel):
             raise ValueError(str(exc)) from exc
 
 
+class TeacherAccountCreate(BaseModel):
+    """Public teacher account registration (Phase 1).
+
+    Creates the ``users`` identity (role forced to ``teacher``, account
+    ``active`` so the new teacher can log in immediately) and the
+    ``teachers`` profile atomically — the profile starts ``pending``
+    verification and cannot publish teaching offerings until an
+    administrator approves it. Tokens are issued on the spot, exactly like
+    student registration.
+
+    Profile validation reuses the shared ``full_name`` charset rule; the
+    password policy runs in the validator below and again in the service,
+    so the boundary never accepts a policy-violating password.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(max_length=128)  # policy enforced by security.validate_password_policy
+    full_name: str = Field(min_length=1, max_length=200)
+    phone: str | None = Field(default=None, max_length=32)
+    subject: str | None = Field(default=None, max_length=120)
+
+    @field_validator("full_name")
+    @classmethod
+    def _full_name_valid(cls, value: str) -> str:
+        return _validate_full_name(value)
+
+    @field_validator("password", mode="after")
+    @classmethod
+    def _password_policy(cls, value: str) -> str:
+        from app.core.security import PasswordPolicyError, validate_password_policy
+
+        try:
+            return validate_password_policy(value)
+        except PasswordPolicyError as exc:
+            raise ValueError(str(exc)) from exc
+
+
 class ChangePasswordRequest(BaseModel):
     """Authenticated password change (self-service)."""
 

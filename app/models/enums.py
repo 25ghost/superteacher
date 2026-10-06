@@ -97,3 +97,94 @@ class StudentSubjectStatus(str, enum.Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
     COMPLETED = "completed"
+
+
+class TeacherVerificationStatus(str, enum.Enum):
+    """Teacher vetting state, independent of the account status.
+
+    ``teachers.verification_status`` is a separate axis from
+    ``users.status``: an account can be active (able to log in) while its
+    profile is still ``pending`` an administrator's decision. Only
+    ``approved`` teachers may publish teaching offerings. Enforced by the
+    ``teachers_verification_status_check`` database CHECK.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    SUSPENDED = "suspended"
+
+
+class TeachingOfferingStatus(str, enum.Enum):
+    """Lifecycle of one teacher's offering of a learning context.
+
+    ``active`` offerings are the only ones the marketplace shows and the
+    only ones a teacher may hold at a time for a given context (the partial
+    unique index ``uq_teaching_offerings_teacher_context_active_key``).
+    """
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class LearningEnrollmentStatus(str, enum.Enum):
+    """A student's membership of one teaching offering.
+
+    ``active`` → ``ended`` only, through ``POST /me/learning-enrollments/
+    {id}/leave``: a student holds at most one active enrollment per
+    learning context (partial unique index), so leaving is the explicit
+    step before joining another offering of the same context.
+    """
+
+    ACTIVE = "active"
+    ENDED = "ended"
+
+
+class MaterialType(str, enum.Enum):
+    """What kind of teaching material a ``materials`` row describes.
+
+    Exactly three types exist in slice 2B: ``book``, ``note`` and
+    ``exercise``. Assignments are a Phase 3 concern and must never appear
+    here. Enforced by ``materials_material_type_check``.
+    """
+
+    BOOK = "book"
+    NOTE = "note"
+    EXERCISE = "exercise"
+
+
+class MaterialStatus(str, enum.Enum):
+    """Moderation lifecycle of one teacher-authored material.
+
+    DRAFT → PENDING_REVIEW → (PUBLISHED | REJECTED) → ARCHIVED. Only an
+    administrator approves or rejects; a teacher cannot publish directly.
+    A rejected material returns to DRAFT through the revision flow before
+    it may be submitted again. Published materials are effectively
+    immutable in the MVP: any change is a new revision (slice 2C). The
+    ``published → archived`` step is the retirement path. Enforced by
+    ``materials_status_check``.
+    """
+
+    DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
+    REJECTED = "rejected"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class FileAssetStatus(str, enum.Enum):
+    """Upload/validation pipeline state for one stored file asset.
+
+    UPLOAD → VALIDATING → (INVALID | VALID) → STORED. ``INVALID`` is a
+    terminal refusal (size, content type or magic-bytes check failed);
+    the teacher must upload a different file. No malware-scanning
+    infrastructure is bundled — this is the abstraction point for one.
+    Enforced by ``file_assets_validation_status_check``.
+    """
+
+    UPLOAD = "upload"
+    VALIDATING = "validating"
+    INVALID = "invalid"
+    VALID = "valid"
+    STORED = "stored"

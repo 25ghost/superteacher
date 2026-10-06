@@ -65,6 +65,7 @@ def _read(session: Session, user: User, profile: Teacher) -> TeacherMeRead:
         subject=profile.subject,
         role=user.role,
         status=user.status,
+        verification_status=profile.verification_status,
         created_at=user.created_at,
         updated_at=profile.updated_at,
     )
