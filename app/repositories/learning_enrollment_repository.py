@@ -94,6 +94,24 @@ def find_active_for_student_context(
     return session.scalar(stmt)
 
 
+def find_active_for_student_offering(
+    session: Session, student_id: uuid.UUID, teaching_offering_id: uuid.UUID
+) -> LearningEnrollment | None:
+    """The student's *active* enrollment in one teaching offering, if any.
+
+    Slice 2C authorization keys on the *offering* (not the context): a
+    student may only read content belonging to the offering they are
+    actively enrolled in — another teacher's offering of the same context
+    answers exactly like an unknown material (L6 existence leak).
+    """
+    stmt = select(LearningEnrollment).where(
+        LearningEnrollment.student_id == student_id,
+        LearningEnrollment.teaching_offering_id == teaching_offering_id,
+        LearningEnrollment.status == LearningEnrollmentStatus.ACTIVE.value,
+    )
+    return session.scalar(stmt)
+
+
 def list_for_student(
     session: Session, student_id: uuid.UUID
 ) -> list[LearningEnrollment]:

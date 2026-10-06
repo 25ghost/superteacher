@@ -63,6 +63,15 @@ STUDENT_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/me/learning-enrollments", None),
     ("GET", "/api/v1/me/learning-enrollments/{enrollment_id}", None),
     ("POST", "/api/v1/me/learning-enrollments/{enrollment_id}/leave", None),
+    # Phase 2 slice 2C — student content access + basic progress.
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/topics", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/lessons", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/content", None),
+    ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/progress", None),
+    ("PUT", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/progress", {"status": "in_progress"}),
 ]
 
 TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -284,7 +293,7 @@ def test_public_routes_never_answer_401_or_403(
 def test_route_inventory_is_exactly_the_matrix() -> None:
     """No v1 endpoint may exist outside the role matrix — and vice versa.
 
-    The count pin (88) makes adding or removing a route a conscious
+    The count pin (96) makes adding or removing a route a conscious
     decision: a new endpoint must be listed in one of the five groups
     above or this test names it as unlisted.
     """
@@ -303,7 +312,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 88, f"route count changed: {len(actual)} != 88"
+    assert len(actual) == 96, f"route count changed: {len(actual)} != 96"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------

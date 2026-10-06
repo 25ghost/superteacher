@@ -188,3 +188,17 @@ class FileAssetStatus(str, enum.Enum):
     INVALID = "invalid"
     VALID = "valid"
     STORED = "stored"
+
+
+class MaterialProgressStatus(str, enum.Enum):
+    """A student's progress on ONE material (slice 2C, basic progress).
+
+    Progress belongs to ``(student, material)``, never to the material
+    itself. Transitions are forward-only: not_started → in_progress →
+    completed. Setting the same status again is idempotent (200); moving
+    backwards is a 409. Enforced by ``material_progress_status_check``.
+    """
+
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"

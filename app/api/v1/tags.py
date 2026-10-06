@@ -51,10 +51,16 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         "name": TAG_STUDENT,
         "description": (
             "Student-only self-service under /me/student, "
-            "/me/registrations and /me/learning-enrollments: maintain your "
-            "own profile, enroll yourself in an academic year, read your "
-            "own registrations, and read or leave your own marketplace "
-            "learning enrollments."
+            "/me/registrations, /me/learning-enrollments and "
+            "/me/learning-content: maintain your own profile, enroll "
+            "yourself in an academic year, read your own registrations, "
+            "read or leave your own marketplace learning enrollments, and "
+            "(Phase 2, slice 2C) read published teaching content for an "
+            "ACTIVE learning enrollment -- topics, lessons, materials and "
+            "your own basic material progress, plus authorized file "
+            "delivery. Every content read re-checks the enrollment chain; "
+            "you never see another teacher's drafts or another student's "
+            "progress."
         ),
     },
     {

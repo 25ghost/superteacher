@@ -217,9 +217,19 @@ def test_material_tables_appear_in_verify_database_expectations() -> None:
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES
         assert table in verify_database.LATER_MIGRATION_TABLES
-    assert verify_database.EXPECTED_REVISION == "0012"
+    # Head may advance beyond slice 2B (slice 2C added material_progress).
+    assert verify_database.EXPECTED_REVISION >= "0012"
+    assert verify_database.EXPECTED_REVISION in {
+        p.stem.split("_")[0]
+        for p in (verify_database.MIGRATION_DIR).glob("0*.py")
+        if p.name != "__init__.py"
+    }
     assert "materials_teaching_offering_id_idx" in verify_database.EXPECTED_FK_INDEXES
     assert "file_assets_uploaded_by_user_id_idx" in verify_database.EXPECTED_FK_INDEXES
+    assert (
+        "material_progress_student_id_idx" in verify_database.EXPECTED_FK_INDEXES
+    )
+    assert "material_progress" in verify_database.EXPECTED_TABLES
 
 
 def test_material_tables_appear_in_application_truncation_order() -> None:

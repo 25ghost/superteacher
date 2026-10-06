@@ -17,6 +17,7 @@ from app.models.learning_enrollment import LearningEnrollment
 from app.models.lesson import Lesson
 from app.models.material import Material
 from app.models.material_moderation import MaterialModeration
+from app.models.material_progress import MaterialProgress
 from app.models.password_reset_token import PasswordResetToken
 from app.models.pathway import Pathway
 from app.models.pathway_level import PathwayLevel
@@ -49,6 +50,7 @@ __all__ = [
     "Lesson",
     "Material",
     "MaterialModeration",
+    "MaterialProgress",
     "PasswordResetToken",
     "StudentEnrollment",
     "Pathway",

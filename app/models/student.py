@@ -60,3 +60,9 @@ class Student(TimestampMixin, Base):
         back_populates="student",
         cascade="all, delete-orphan",
     )
+    # Personal material-progress rows (slice 2C) -- owned by this student.
+    material_progress_rows = relationship(
+        "MaterialProgress",
+        back_populates="student",
+        cascade="all, delete-orphan",
+    )

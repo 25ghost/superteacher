@@ -84,9 +84,11 @@ EXPECTED_TABLES = {
     "file_assets",
     "materials",
     "material_moderations",
+    # created by 0013 (Phase 2 slice 2C: student content access + progress)
+    "material_progress",
 }
 
-EXPECTED_REVISION = "0012"
+EXPECTED_REVISION = "0013"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -135,6 +137,9 @@ EXPECTED_FK_INDEXES = {
         "material_moderations",
         ("reviewer_user_id",),
     ),
+    # Phase 2 slice 2C: personal material progress FKs.
+    "material_progress_student_id_idx": ("material_progress", ("student_id",)),
+    "material_progress_material_id_idx": ("material_progress", ("material_id",)),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------
@@ -762,6 +767,8 @@ LATER_MIGRATION_TABLES = {
     "file_assets",
     "materials",
     "material_moderations",
+    # created by 0013 (Phase 2 slice 2C: student content + progress)
+    "material_progress",
 }
 
 

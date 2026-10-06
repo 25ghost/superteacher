@@ -72,3 +72,10 @@ class Material(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="MaterialModeration.created_at.desc()",
     )
+    # Personal per-student progress rows (never shared, never deleted with
+    # a material archive -- history stays with the material id).
+    progress_rows = relationship(
+        "MaterialProgress",
+        back_populates="material",
+        cascade="all, delete-orphan",
+    )
