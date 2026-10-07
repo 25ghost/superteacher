@@ -11,7 +11,11 @@ and the repository only writes rows:
   ``archived`` is terminal and a no-op transition is a 409, never a
   silent 200;
 - every mutation writes exactly one ``auth_events`` row about the *teacher*
-  (``actor_user_id`` is None: the teacher acts on their own record).
+  (``actor_user_id`` is None: the teacher acts on their own record);
+- a teacher's student visibility ends at their own offerings: the roster
+  of one offering is the ACTIVE ``learning_enrollments`` rows of that
+  offering, never a query over users, names or emails. There is no global
+  student search, directory or profile browse anywhere in this service.
 
 Nothing commits here — the API layer owns the transaction.
 """
@@ -30,8 +34,10 @@ from app.models.teacher import Teacher
 from app.models.teaching_offering import TeachingOffering
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
+from app.repositories import learning_enrollment_repository as enrollment_repo
 from app.repositories import teaching_offering_repository as offering_repo
 from app.schemas.learning import (
+    OfferingStudentRead,
     TeachingOfferingCreate,
     TeachingOfferingRead,
     TeachingOfferingUpdate,
@@ -198,6 +204,41 @@ def get_my_offering(
     """Read one of the caller's offerings (404 for unknown *or* foreign)."""
     profile = _load_profile(session, user)
     return _read(_owned_offering(session, profile, offering_id))
+
+
+def list_offering_students(
+    session: Session, user: User, offering_id: uuid.UUID
+) -> list[OfferingStudentRead]:
+    """The ACTIVE students of ONE of the caller's offerings, newest first.
+
+    The relationship is strictly::
+
+        Teacher → own TeachingOffering → LearningEnrollment → Student
+
+    Ownership is proven first (a foreign or unknown offering id answers
+    the same 404 as an unknown one, L6), then the repository keys only on
+    that offering id. A teacher can therefore never reach a student who
+    did not join this offering — there is no student id, name, email or
+    pagination parameter on this surface, so it cannot widen into a
+    directory or a search either.
+    """
+    profile = _load_profile(session, user)
+    _owned_offering(session, profile, offering_id)
+
+    return [
+        OfferingStudentRead(
+            enrollment_id=enrollment.id,
+            student_id=enrollment.student_id,
+            full_name=enrollment.student.full_name,
+            email=enrollment.student.user.email,
+            enrollment_status=enrollment.status,
+            started_at=enrollment.started_at,
+            ended_at=enrollment.ended_at,
+        )
+        for enrollment in enrollment_repo.list_active_students_for_offering(
+            session, offering_id
+        )
+    ]
 
 
 def update_my_offering(

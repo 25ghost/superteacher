@@ -188,6 +188,35 @@ def test_material_check_constraints_match_the_enum_vocabulary() -> None:
     ]  # already sorted
 
 
+def test_material_tables_have_no_model_migration_drift() -> None:
+    """Migration 0014's data migration + CHECK swap must land on the models.
+
+    0012 creates ``materials`` with the old ``book/note/exercise`` CHECK and
+    0014 swaps it for the MVP vocabulary; the *combined* chain (what
+    ``alembic upgrade head`` produces) has to match the ORM exactly.
+    """
+    metadata_schema = verify_database.schema_from_metadata()
+    migration_schema = verify_database._combined_migration_schema(
+        verify_database._migration_files()
+    )
+
+    problems = verify_database.diff_schemas(
+        {t: metadata_schema[t] for t in _NEW_TABLES},
+        {t: migration_schema[t] for t in _NEW_TABLES},
+        "models",
+        "migrations",
+    )
+    assert problems == [], problems
+
+    assert verify_database._checks_match(
+        metadata_schema["materials"]["checks"]["materials_material_type_check"],
+        migration_schema["materials"]["checks"]["materials_material_type_check"],
+    )
+    assert verify_database._check_literals(
+        migration_schema["materials"]["checks"]["materials_material_type_check"]
+    ) == ("pdf_document", "video")
+
+
 def test_material_indexes_are_declared() -> None:
     expectations = {
         "file_assets": {"file_assets_uploaded_by_user_id_idx"},
@@ -271,7 +300,7 @@ def test_material_schemas_reject_unknown_keys_and_require_reason() -> None:
 
 
 def test_material_enums_use_the_expected_values() -> None:
-    assert [m.value for m in MaterialType] == ["book", "note", "exercise"]
+    assert [m.value for m in MaterialType] == ["video", "pdf_document"]
     assert [m.value for m in MaterialStatus] == [
         "draft",
         "pending_review",
@@ -286,4 +315,4 @@ def test_material_enums_use_the_expected_values() -> None:
         "valid",
         "stored",
     ]
-    assert sql_in_list(MaterialType) == "'book', 'note', 'exercise'"
+    assert sql_in_list(MaterialType) == "'video', 'pdf_document'"

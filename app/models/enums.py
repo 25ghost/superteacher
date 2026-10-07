@@ -144,14 +144,21 @@ class LearningEnrollmentStatus(str, enum.Enum):
 class MaterialType(str, enum.Enum):
     """What kind of teaching material a ``materials`` row describes.
 
-    Exactly three types exist in slice 2B: ``book``, ``note`` and
-    ``exercise``. Assignments are a Phase 3 concern and must never appear
-    here. Enforced by ``materials_material_type_check``.
+    The MVP accepts exactly two kinds of teacher-uploaded study content:
+
+    - ``video`` — a study video (mp4/webm/quicktime);
+    - ``pdf_document`` — a real PDF document. Books, notes and worksheets
+      are simply PDFs with their own title and lesson placement; there is
+      no separate book/note/exercise row, table or upload category.
+
+    Photos and other images are never teaching material. Assignments are a
+    later domain and must never appear here. Enforced by
+    ``materials_material_type_check`` and cross-checked against the stored
+    file's content type by the upload pipeline.
     """
 
-    BOOK = "book"
-    NOTE = "note"
-    EXERCISE = "exercise"
+    VIDEO = "video"
+    PDF_DOCUMENT = "pdf_document"
 
 
 class MaterialStatus(str, enum.Enum):

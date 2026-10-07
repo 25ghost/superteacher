@@ -8,6 +8,8 @@ rows:
   its topics/lessons — a foreign offering/topic/lesson id answers the
   same 404 as an unknown one (L6 existence leak), never a 403 that would
   confirm the row exists;
+- authoring additionally requires an **approved** teacher verification
+  (403 otherwise), so Admin vetting keeps gating what a teacher may teach;
 - students and administrators are refused at the route guard; if the
   service is reached directly it refuses a non-teacher caller with the
   shared ``LearningForbiddenError``;
@@ -33,7 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.enums import UserRole
+from app.models.enums import TeacherVerificationStatus, UserRole
 from app.models.lesson import Lesson
 from app.models.teacher import Teacher
 from app.models.topic import Topic
@@ -66,6 +68,28 @@ def _load_profile(session: Session, user: User) -> Teacher:
     profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
     if profile is None:
         raise LearningNotFoundError("no teacher profile for this account")
+    return profile
+
+
+def _require_approved(profile: Teacher) -> None:
+    """Veto every authoring attempt by a teacher who is not approved.
+
+    Mirrors ``teaching_offering_service._require_approved``: the Admin
+    vetting decision lives on the database row, so suspending a teacher
+    stops curriculum edits immediately. Checked *before* any offering
+    lookup, so it never confirms whether an id exists.
+    """
+    if profile.verification_status != TeacherVerificationStatus.APPROVED.value:
+        raise LearningForbiddenError(
+            f"teacher verification is {profile.verification_status!r}; "
+            "only an approved teacher may create or change teaching content"
+        )
+
+
+def _load_approved_profile(session: Session, user: User) -> Teacher:
+    """Profile of an authoring caller: teacher role + Admin approval."""
+    profile = _load_profile(session, user)
+    _require_approved(profile)
     return profile
 
 
@@ -144,7 +168,7 @@ def create_topic(
     session: Session, user: User, offering_id: uuid.UUID, payload: TopicCreate
 ) -> TopicRead:
     """Add one topic under the caller's own offering, then audit it."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
 
     display_order = _resolve_order(
@@ -217,7 +241,7 @@ def update_topic(
     payload: TopicUpdate,
 ) -> TopicRead:
     """Amend title, description and/or position of one of the caller's topics."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     topic = _owned_topic(session, offering_id, topic_id)
 
@@ -261,7 +285,7 @@ def delete_topic(
     session: Session, user: User, offering_id: uuid.UUID, topic_id: uuid.UUID
 ) -> None:
     """Remove one of the caller's topics — and every lesson beneath it."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     topic = _owned_topic(session, offering_id, topic_id)
 
@@ -299,7 +323,7 @@ def create_lesson(
     payload: LessonCreate,
 ) -> LessonRead:
     """Add one lesson under the caller's own topic, then audit it."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     _owned_topic(session, offering_id, topic_id)
 
@@ -382,7 +406,7 @@ def update_lesson(
     payload: LessonUpdate,
 ) -> LessonRead:
     """Amend title, description and/or position of one of the caller's lessons."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     _owned_topic(session, offering_id, topic_id)
     lesson = _owned_lesson(session, topic_id, lesson_id)
@@ -432,7 +456,7 @@ def delete_lesson(
     lesson_id: uuid.UUID,
 ) -> None:
     """Remove one of the caller's lessons."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     _owned_topic(session, offering_id, topic_id)
     lesson = _owned_lesson(session, topic_id, lesson_id)

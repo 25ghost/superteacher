@@ -3,7 +3,7 @@
 Three levels:
 
 1. STRUCTURAL (always runs, no database needed):
-   - all 22 expected application tables exist in the ORM metadata, with the
+   - all 31 expected application tables exist in the ORM metadata, with the
      plural ``students`` name and no singular ``student`` table;
    - every table that has ``created_at`` also has ``updated_at``;
    - the ``users_role_check`` vocabulary equals ``UserRole``, and the
@@ -19,7 +19,7 @@ Three levels:
 2. LIVE (read-only, ``--live``):
    - connects to PostgreSQL using the configured DB_* settings;
    - checks the live ``alembic_version`` equals the expected revision;
-   - checks every one of the 22 tables exists (and singular ``student`` does
+   - checks every one of the 31 tables exists (and singular ``student`` does
      not);
    - compares the LIVE schema against the ORM metadata with the same
      column/constraint/index comparison used for drift detection, so live
@@ -31,7 +31,7 @@ Three levels:
    - refuses to run when any application table contains rows (this is what
      keeps it from destroying data);
    - then ``alembic downgrade base`` -> verify empty -> ``alembic upgrade
-     head`` -> verify all 22 tables and the expected revision again.
+     head`` -> verify all 31 tables and the expected revision again.
    Use it only on a disposable development database.
 
 Usage (from ``backend/``):
@@ -88,7 +88,7 @@ EXPECTED_TABLES = {
     "material_progress",
 }
 
-EXPECTED_REVISION = "0013"
+EXPECTED_REVISION = "0014"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)

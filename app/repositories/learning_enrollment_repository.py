@@ -17,7 +17,9 @@ from app.models.enums import LearningEnrollmentStatus
 from app.models.learning_context import LearningContext
 from app.models.learning_enrollment import LearningEnrollment
 from app.models.program_version import ProgramVersion
+from app.models.student import Student
 from app.models.teaching_offering import TeachingOffering
+from app.models.user import User
 
 #: Everything an enrollment summary reads: the context and its catalog rows
 #: (via the enrollment's own context FK) plus the offering and its teacher.
@@ -121,6 +123,29 @@ def list_for_student(
         .options(*EAGER_OPTIONS)
         .where(LearningEnrollment.student_id == student_id)
         .order_by(LearningEnrollment.created_at.desc(), LearningEnrollment.id)
+    )
+    return list(session.execute(stmt).unique().scalars())
+
+
+def list_active_students_for_offering(
+    session: Session, teaching_offering_id: uuid.UUID
+) -> list[LearningEnrollment]:
+    """The ACTIVE enrollments of ONE teaching offering, newest first.
+
+    This is the entire student visibility a teacher has: the query keys on
+    a *teaching offering* (already proven to belong to the caller by the
+    service) and never on a student id, name or email, so no path through
+    this repository can reach a student who did not join that offering.
+    The student profile and its user account are eager-loaded for the read.
+    """
+    stmt = (
+        select(LearningEnrollment)
+        .options(joinedload(LearningEnrollment.student).joinedload(Student.user))
+        .where(
+            LearningEnrollment.teaching_offering_id == teaching_offering_id,
+            LearningEnrollment.status == LearningEnrollmentStatus.ACTIVE.value,
+        )
+        .order_by(LearningEnrollment.started_at.desc(), LearningEnrollment.id)
     )
     return list(session.execute(stmt).unique().scalars())
 

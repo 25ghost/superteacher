@@ -17,8 +17,10 @@ teacher owns, then descends into its curriculum:
 
 Only the teacher who owns the offering may touch its curriculum; a
 foreign offering/topic/lesson id answers the same 404 as an unknown one
-(L6 existence leak). Students and administrators are refused by the
-route guard — this namespace is teacher-only, one role per endpoint.
+(L6 existence leak). Authoring (create/amend/remove) additionally
+requires an **approved** teacher verification (403 otherwise); reads stay
+open to the owning teacher. Students and administrators are refused by
+the route guard — this namespace is teacher-only, one role per endpoint.
 Unpublished-content exposure is deferred to slice 2C: there are no
 student read routes here yet.
 

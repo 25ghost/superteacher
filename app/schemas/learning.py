@@ -119,3 +119,26 @@ class LearningEnrollmentRead(LearningContextRead):
     offering_status: str
     offering_description: str | None = None
     teacher_name: str
+
+
+class OfferingStudentRead(BaseModel):
+    """One student enrolled in ONE of the caller's own offerings.
+
+    The whole of a teacher's student visibility: the row exists only
+    because this student joined this teaching offering. It carries no
+    contact/PII beyond the name and login email, no search/filter fields,
+    and it can never describe a student of another offering — the offering
+    id comes from the path and is ownership-checked by the service. Reads
+    never expose another student's data: progress, registrations and
+    material access stay on the student's own surface.
+    """
+
+    enrollment_id: UUID
+    student_id: UUID
+    full_name: str
+    #: The account email of the enrolled student (``users.email`` is
+    #: nullable in the schema, so this may be null).
+    email: str | None = None
+    enrollment_status: str
+    started_at: datetime
+    ended_at: datetime | None = None

@@ -599,3 +599,87 @@ def test_lesson_read_and_update_roundtrip(
         curriculum_service.get_lesson(
             session, approved_teacher, offering_id, topic.topic_id, created.lesson_id
         )
+
+
+# --- MVP authoring rules: approval gate ---------------------------------------------------
+
+
+def test_unapproved_teacher_can_read_curriculum_but_never_write_it(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID
+) -> None:
+    topic = curriculum_service.create_topic(
+        session,
+        approved_teacher,
+        offering_id,
+        TopicCreate(title="Linear equations", display_order=1),
+    )
+    lesson = curriculum_service.create_lesson(
+        session,
+        approved_teacher,
+        offering_id,
+        topic.topic_id,
+        LessonCreate(title="Balancing both sides", display_order=1),
+    )
+    session.commit()
+
+    profile = session.scalar(select(Teacher).where(Teacher.user_id == approved_teacher.id))
+    profile.verification_status = TeacherVerificationStatus.SUSPENDED.value
+    session.commit()
+
+    # Reads of the teacher's own curriculum stay open.
+    assert [t.topic_id for t in curriculum_service.list_topics(
+        session, approved_teacher, offering_id
+    )] == [topic.topic_id]
+    assert curriculum_service.get_lesson(
+        session, approved_teacher, offering_id, topic.topic_id, lesson.lesson_id
+    ).lesson_id == lesson.lesson_id
+
+    attempts = [
+        lambda: curriculum_service.create_topic(
+            session, approved_teacher, offering_id, TopicCreate(title="nope")
+        ),
+        lambda: curriculum_service.update_topic(
+            session,
+            approved_teacher,
+            offering_id,
+            topic.topic_id,
+            TopicUpdate(title="renamed while suspended"),
+        ),
+        lambda: curriculum_service.delete_topic(
+            session, approved_teacher, offering_id, topic.topic_id
+        ),
+        lambda: curriculum_service.create_lesson(
+            session,
+            approved_teacher,
+            offering_id,
+            topic.topic_id,
+            LessonCreate(title="nope"),
+        ),
+        lambda: curriculum_service.update_lesson(
+            session,
+            approved_teacher,
+            offering_id,
+            topic.topic_id,
+            lesson.lesson_id,
+            LessonUpdate(title="renamed while suspended"),
+        ),
+        lambda: curriculum_service.delete_lesson(
+            session, approved_teacher, offering_id, topic.topic_id, lesson.lesson_id
+        ),
+    ]
+    for attempt in attempts:
+        with pytest.raises(LearningForbiddenError) as excinfo:
+            attempt()
+        message = str(excinfo.value)
+        assert "approved teacher" in message
+        assert str(topic.topic_id) not in message
+        assert str(lesson.lesson_id) not in message
+        assert str(offering_id) not in message
+    session.rollback()
+
+    # The curriculum that existed before the suspension is untouched.
+    topics = curriculum_service.list_topics(session, approved_teacher, offering_id)
+    assert [(t.title, t.display_order) for t in topics] == [("Linear equations", 1)]
+    assert curriculum_service.list_lessons(
+        session, approved_teacher, offering_id, topic.topic_id
+    )[0].title == "Balancing both sides"

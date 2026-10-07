@@ -16,10 +16,13 @@ lessons):
 
 Only the teacher who owns the offering may touch its materials; a
 foreign offering/material id answers the same 404 as an unknown one
-(L6 existence leak). Students and administrators are refused by the
-route guard — this namespace is teacher-only, one role per endpoint.
-Publication is *not* possible here: approving/rejecting is admin-only
-(slice 2B), and students read published materials in slice 2C.
+(L6 existence leak). Authoring additionally requires an **approved**
+teacher verification (403 otherwise) and the file must be a study video
+or a real PDF — never a photo/image (422). Students and administrators
+are refused by the route guard — this namespace is teacher-only, one
+role per endpoint. Publication is *not* possible here: approving/
+rejecting is admin-only (slice 2B), and students read published
+materials in slice 2C.
 
 Endpoint bodies stay thin: validate schema → delegate to the service →
 map the Phase 1 error family onto HTTP → commit on success.
@@ -64,19 +67,23 @@ def _http_error(exc: LearningError) -> HTTPException:
     status_code=status.HTTP_201_CREATED,
     summary="Upload a file and create a draft material",
     description=(
-        "multipart/form-data: title, material_type (book|note|exercise), "
+        "multipart/form-data: title, material_type (video|pdf_document), "
         "optional description, optional lesson_id, and one file. The file "
-        "is validated (size, content type, magic bytes), written through "
-        "the storage backend and recorded as a file asset; the material "
-        "is created in ``draft`` — publication is administrator-only. "
-        "Unknown or foreign offering id → 404; an unknown lesson id or a "
-        "lesson outside this offering → 404; a disallowed file → 422. "
-        "Teachers only."
+        "is validated (size, content type, magic bytes): study documents "
+        "must be real PDFs and study videos must be mp4/webm/quicktime — "
+        "photos and other images, text and office files are refused. The "
+        "declared material_type must match the uploaded bytes. The file "
+        "is written through the storage backend and recorded as a file "
+        "asset; the material is created in ``draft`` — publication is "
+        "administrator-only. Requires an APPROVED teacher verification "
+        "(403 otherwise). Unknown or foreign offering id → 404; an unknown "
+        "lesson id or a lesson outside this offering → 404; a disallowed "
+        "file → 422. Teachers only."
     ),
     responses={
         201: {"description": "Material created (draft) with its file asset"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown offering/lesson id, or not one of yours"},
         422: {"description": "Invalid upload or metadata"},
         429: {"description": "Rate limit exceeded"},
@@ -183,13 +190,15 @@ def read_my_material(
     description=(
         "Change title, description, material_type and/or lesson_id. "
         "Draft and rejected materials only — published materials are "
-        "effectively immutable (409). Unknown or foreign id → 404. "
+        "effectively immutable (409). material_type must still describe "
+        "the stored file (422 otherwise). Unknown or foreign id → 404. "
+        "Requires an APPROVED teacher verification (403 otherwise). "
         "Teachers only."
     ),
     responses={
         200: {"description": "Material updated"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown material id, or not under an offering of yours"},
         409: {"description": "Material is pending_review/published/archived"},
         422: {"description": "Invalid request (no fields, null title, unknown keys)"},
@@ -230,7 +239,7 @@ def update_my_material(
     responses={
         200: {"description": "Material moved to pending_review"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown material id, or not under an offering of yours"},
         409: {"description": "Material is not in draft"},
         429: {"description": "Rate limit exceeded"},
@@ -268,7 +277,7 @@ def submit_my_material(
     responses={
         200: {"description": "Material returned to draft"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown material id, or not under an offering of yours"},
         409: {"description": "Material is not rejected"},
         429: {"description": "Rate limit exceeded"},
@@ -306,7 +315,7 @@ def revise_my_material(
     responses={
         200: {"description": "Material archived"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown material id, or not under an offering of yours"},
         409: {"description": "Material is not published"},
         429: {"description": "Rate limit exceeded"},
@@ -345,7 +354,7 @@ def archive_my_material(
     responses={
         204: {"description": "Material removed"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown material id, or not under an offering of yours"},
         409: {"description": "Material is pending_review/published/archived"},
         429: {"description": "Rate limit exceeded"},

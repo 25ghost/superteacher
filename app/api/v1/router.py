@@ -6,7 +6,9 @@ Role-split layout (no endpoint serves two roles):
 - ``auth.student_me_router`` — student self-service (`/me/student`),
 - ``auth.teacher_me_router`` — teacher self-service (`/me/teacher`),
 - ``teacher_offerings.router`` — teacher self-service
-  (`/me/teacher/offerings`, Phase 1),
+  (`/me/teacher/offerings`, Phase 1, plus the offering-scoped
+  `/offerings/{id}/students` roster: a teacher sees only the students
+  who joined their own offering),
 - ``teacher_curriculum.router`` — teacher self-service topics/lessons
   under an offering (`/me/teacher/offerings/{id}/topics/...`, Phase 2 2A),
 - ``teacher_materials.router`` — teacher self-service teaching materials

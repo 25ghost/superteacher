@@ -234,7 +234,7 @@ def _publish_material(
     admin: User,
     *,
     title: str = "Algebra worksheet",
-    material_type: MaterialType = MaterialType.EXERCISE,
+    material_type: MaterialType = MaterialType.PDF_DOCUMENT,
 ) -> uuid.UUID:
     created = material_service.create_material(
         session,
@@ -470,7 +470,7 @@ def test_enrolled_student_reads_published_material(
     )
     assert read.material_id == published_material
     assert read.status == MaterialStatus.PUBLISHED.value
-    assert read.material_type == MaterialType.EXERCISE
+    assert read.material_type == MaterialType.PDF_DOCUMENT
     assert read.file.original_filename == "worksheet.pdf"
     assert read.progress is None or read.progress.status != MaterialProgressStatus.COMPLETED
     assert str(active_enrollment.id) in read.content_url
@@ -496,7 +496,7 @@ def test_list_materials_returns_only_published_for_offering(
         alice,
         alice_offering,
         title="Draft notes",
-        material_type=MaterialType.NOTE,
+        material_type=MaterialType.PDF_DOCUMENT,
         description=None,
         lesson_id=None,
         file_bytes=_PDF_BYTES,
@@ -534,7 +534,7 @@ def test_pending_and_rejected_materials_are_invisible(
         alice,
         alice_offering,
         title="Pending work",
-        material_type=MaterialType.BOOK,
+        material_type=MaterialType.PDF_DOCUMENT,
         description=None,
         lesson_id=None,
         file_bytes=_PDF_BYTES,
@@ -553,7 +553,7 @@ def test_pending_and_rejected_materials_are_invisible(
         alice,
         alice_offering,
         title="Rejected work",
-        material_type=MaterialType.BOOK,
+        material_type=MaterialType.PDF_DOCUMENT,
         description=None,
         lesson_id=None,
         file_bytes=_PDF_BYTES,
@@ -793,7 +793,7 @@ def test_progress_cannot_be_created_for_unpublished_or_foreign_material(
         alice,
         alice_offering,
         title="Draft progress target",
-        material_type=MaterialType.NOTE,
+        material_type=MaterialType.PDF_DOCUMENT,
         description=None,
         lesson_id=None,
         file_bytes=_PDF_BYTES,

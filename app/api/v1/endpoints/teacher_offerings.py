@@ -7,8 +7,13 @@ guarded by ``require_teacher``:
   validated against the catalog (and created the first time it is seen),
   then the offer is stored as ``active``.
 - ``GET /me/teacher/offerings`` — every offering you own, newest first.
-- ``GET /me/teacher/offerings/{offering_id}`` — one of yours; a foreign id
+- ``GET  /me/teacher/offerings/{offering_id}`` — one of yours; a foreign id
   answers the same 404 as an unknown one (L6 existence leak).
+- ``GET  /me/teacher/offerings/{offering_id}/students`` — the students who
+  actually joined THIS offering (ACTIVE ``learning_enrollments`` rows).
+  This is the only student visibility a teacher has: there is no student
+  search, no directory, no lookup by name/email and no id parameter that
+  could reach anyone else's students.
 - ``PATCH /me/teacher/offerings/{offering_id}`` — amend the description
   and/or move active → paused → archived.
 
@@ -31,6 +36,7 @@ from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.learning import (
+    OfferingStudentRead,
     TeachingOfferingCreate,
     TeachingOfferingRead,
     TeachingOfferingUpdate,
@@ -144,6 +150,43 @@ def read_my_offering(
 ) -> TeachingOfferingRead:
     try:
         return teaching_offering_service.get_my_offering(session, user, offering_id)
+    except LearningError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/offerings/{offering_id}/students",
+    response_model=list[OfferingStudentRead],
+    summary="List the students enrolled in one of your offerings",
+    description=(
+        "Every student who joined THIS offering (ACTIVE learning "
+        "enrollments), newest first — name, account email, enrollment "
+        "state and dates. This is the full extent of a teacher's student "
+        "visibility: the offering id is ownership-checked, and there is no "
+        "student id, name, email, search, autocomplete or pagination "
+        "parameter here, so the list can never widen into the student "
+        "population. Students of other offerings are not reachable. "
+        "Unknown or foreign offering id → 404 (same answer as an unknown "
+        "id). Teachers only."
+    ),
+    responses={
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not a teacher account"},
+        404: {"description": "Unknown offering id, or not one of yours"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def list_my_offering_students(
+    request: Request,
+    offering_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    user: User = Depends(require_teacher),
+) -> list[OfferingStudentRead]:
+    # Read path: translate domain errors only; no commit/rollback.
+    try:
+        return teaching_offering_service.list_offering_students(
+            session, user, offering_id
+        )
     except LearningError as exc:
         raise _http_error(exc) from exc
 

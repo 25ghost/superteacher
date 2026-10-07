@@ -7,6 +7,10 @@ marketplace); the endpoint stays thin and the repositories only write rows:
   its materials — a foreign offering/material id answers the same 404 as
   an unknown one (L6 existence leak), never a 403 that would confirm the
   row exists;
+- authoring additionally requires an **approved** teacher verification:
+  a pending/rejected/suspended teacher may read their own material but
+  may not create, amend or submit anything (403), so Admin vetting stays
+  meaningful after an offering was published;
 - students and administrators are refused at the route guard; if the
   service is reached directly it refuses a non-teacher caller with the
   shared ``LearningForbiddenError``;
@@ -14,6 +18,10 @@ marketplace); the endpoint stays thin and the repositories only write rows:
   ``teaching_offerings`` (and optionally a lesson) and never re-declare
   the Admin-owned catalog — teacher/year/pathway/level/subject are
   derivable through the offering;
+- a material is either a study **video** or a **PDF document**: the
+  declared ``material_type`` must match the actual bytes uploaded (and
+  any later type change must match the stored file), so an image, a text
+  file or a renamed extension can never become learning content;
 - the upload pipeline is: validate (size, content type, magic bytes) →
   write bytes through the ``StorageBackend`` → record a ``file_assets``
   row (storage_key is opaque; never a public path) → create the material
@@ -43,6 +51,7 @@ from app.models.enums import (
     FileAssetStatus,
     MaterialStatus,
     MaterialType,
+    TeacherVerificationStatus,
     UserRole,
 )
 from app.models.file_asset import FileAsset
@@ -95,6 +104,29 @@ def _load_profile(session: Session, user: User) -> Teacher:
     profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
     if profile is None:
         raise LearningNotFoundError("no teacher profile for this account")
+    return profile
+
+
+def _require_approved(profile: Teacher) -> None:
+    """Veto every authoring attempt by a teacher who is not approved.
+
+    Mirrors ``teaching_offering_service._require_approved``: Admin vetting
+    (``teachers.verification_status``) is checked on the database row, so
+    suspending a teacher stops content creation immediately. Answered
+    *before* any offering lookup, so it never confirms whether an id
+    exists.
+    """
+    if profile.verification_status != TeacherVerificationStatus.APPROVED.value:
+        raise LearningForbiddenError(
+            f"teacher verification is {profile.verification_status!r}; "
+            "only an approved teacher may create or change teaching content"
+        )
+
+
+def _load_approved_profile(session: Session, user: User) -> Teacher:
+    """Profile of an authoring caller: teacher role + Admin approval."""
+    profile = _load_profile(session, user)
+    _require_approved(profile)
     return profile
 
 
@@ -218,7 +250,7 @@ def create_material(
     materials row (draft). Any refusal leaves no material row; a storage
     failure after the asset insert rolls back via the API transaction.
     """
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
 
     # Optional lesson must sit under this same offering.
@@ -240,10 +272,22 @@ def create_material(
     except file_validation.ValidationError as exc:
         raise LearningValidationError(str(exc)) from exc
 
-    normalized_type = (content_type or "").split(";")[0].strip().lower()
+    normalized_type = file_validation.normalize_content_type(content_type)
+
+    # 2. The declared type must describe the actual bytes: a PDF document
+    #    row may only carry a PDF, a video row only a study video. An
+    #    image, a renamed extension or any other payload is refused here
+    #    even when its media type was somehow allowlisted.
+    category = file_validation.category_for(normalized_type)
+    if category != material_type.value:
+        raise LearningValidationError(
+            f"material_type {material_type.value!r} does not match the "
+            f"uploaded file ({normalized_type or 'unknown'!r})"
+        )
+
     checksum = hashlib.sha256(file_bytes).hexdigest()
 
-    # 2. File-asset row in validating state; storage key uses the PK once
+    # 3. File-asset row in validating state; storage key uses the PK once
     #    the row is inserted, so the backend never sees a client-supplied path.
     backend = storage or get_storage_backend()
     asset = file_asset_repo.create(
@@ -273,7 +317,7 @@ def create_material(
     asset.validation_status = FileAssetStatus.STORED.value
     session.flush()
 
-    # 3. Material row, always born as draft.
+    # 4. Material row, always born as draft.
     material = material_repo.create(
         session,
         teaching_offering_id=offering_id,
@@ -343,7 +387,7 @@ def update_material(
     payload: MaterialUpdate,
 ) -> MaterialRead:
     """Amend metadata of a draft/rejected material (published is immutable)."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     material = _owned_material(session, profile, material_id)
     if material.teaching_offering_id != offering_id:
@@ -359,6 +403,9 @@ def update_material(
     if "description" in payload.model_fields_set:
         material.description = payload.description
     if "material_type" in payload.model_fields_set:
+        # The type describes the stored bytes and cannot drift away from
+        # them: a PDF row stays a PDF row, a video row stays a video row.
+        _assert_type_matches_file(material, payload.material_type)  # type: ignore[arg-type]
         material.material_type = payload.material_type.value  # type: ignore[union-attr]
     if "lesson_id" in payload.model_fields_set:
         _assert_lesson_in_offering(session, offering_id, payload.lesson_id)
@@ -396,11 +443,22 @@ def _assert_lesson_in_offering(
         raise LearningNotFoundError(f"no lesson with id {lesson_id}")
 
 
+def _assert_type_matches_file(material: Material, new_type: MaterialType) -> None:
+    """Refuse a type change that would contradict the stored file bytes."""
+    asset = material.file_asset
+    category = file_validation.category_for(asset.content_type)
+    if category != new_type.value:
+        raise LearningValidationError(
+            f"material_type {new_type.value!r} does not match the stored file "
+            f"({asset.content_type or 'unknown'!r})"
+        )
+
+
 def submit_material(
     session: Session, user: User, offering_id: uuid.UUID, material_id: uuid.UUID
 ) -> MaterialRead:
     """draft → pending_review: put the material in the admin queue."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     material = _owned_material(session, profile, material_id)
     if material.teaching_offering_id != offering_id:
@@ -430,7 +488,7 @@ def revise_material(
     session: Session, user: User, offering_id: uuid.UUID, material_id: uuid.UUID
 ) -> MaterialRead:
     """rejected → draft: the revision flow before resubmission."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     material = _owned_material(session, profile, material_id)
     if material.teaching_offering_id != offering_id:
@@ -460,7 +518,7 @@ def archive_material(
     session: Session, user: User, offering_id: uuid.UUID, material_id: uuid.UUID
 ) -> MaterialRead:
     """published → archived: retire without deleting history."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     material = _owned_material(session, profile, material_id)
     if material.teaching_offering_id != offering_id:
@@ -490,7 +548,7 @@ def delete_material(
     session: Session, user: User, offering_id: uuid.UUID, material_id: uuid.UUID
 ) -> None:
     """Remove a draft/rejected material (moderation rows cascade)."""
-    profile = _load_profile(session, user)
+    profile = _load_approved_profile(session, user)
     _owned_offering(session, profile, offering_id)
     material = _owned_material(session, profile, material_id)
     if material.teaching_offering_id != offering_id:

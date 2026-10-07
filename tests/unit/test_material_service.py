@@ -62,6 +62,7 @@ PASSWORD = "correct horse battery staple"
 
 _PDF_BYTES = b"%PDF-1.4 fake pdf content"
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 32
 
 
 class MemoryStorage(StorageBackend):
@@ -246,7 +247,7 @@ def _upload(
     storage: MemoryStorage,
     *,
     title: str = "Algebra worksheet",
-    material_type: MaterialType = MaterialType.EXERCISE,
+    material_type: MaterialType = MaterialType.PDF_DOCUMENT,
     data: bytes = _PDF_BYTES,
     content_type: str = "application/pdf",
     filename: str = "worksheet.pdf",
@@ -281,7 +282,7 @@ def test_teacher_can_upload_and_get_a_draft_material(
 
     assert read.offering_id == offering_id
     assert read.title == "Algebra worksheet"
-    assert read.material_type == MaterialType.EXERCISE
+    assert read.material_type == MaterialType.PDF_DOCUMENT
     assert read.status == MaterialStatus.DRAFT
     assert read.file_asset.validation_status == "stored"
     assert read.file_asset.original_filename == "worksheet.pdf"
@@ -634,3 +635,168 @@ def test_admin_list_defaults_to_the_moderation_queue(
     detail = material_service.admin_get_material(session, admin, pending.material_id)
     assert detail.status == MaterialStatus.PENDING_REVIEW
     assert detail.moderations == []
+
+
+# --- MVP authoring rules: approval gate + content vocabulary --------------------------
+
+
+def _set_verification(session: Session, teacher: User, status: str) -> None:
+    """Admin vetting is a DB row, so tests move it directly."""
+    profile = session.scalar(select(Teacher).where(Teacher.user_id == teacher.id))
+    profile.verification_status = status
+    session.commit()
+
+
+def test_unapproved_teacher_can_read_but_never_author(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    storage: MemoryStorage,
+) -> None:
+    created = _upload(session, approved_teacher, offering_id, storage)
+    session.commit()
+
+    _set_verification(
+        session, approved_teacher, TeacherVerificationStatus.PENDING.value
+    )
+
+    # Reads stay open to the owning teacher.
+    assert material_service.list_materials(session, approved_teacher, offering_id)
+    assert (
+        material_service.get_material(
+            session, approved_teacher, offering_id, created.material_id
+        ).material_id
+        == created.material_id
+    )
+
+    refusals = [
+        lambda: _upload(session, approved_teacher, offering_id, storage),
+        lambda: material_service.update_material(
+            session,
+            approved_teacher,
+            offering_id,
+            created.material_id,
+            MaterialUpdate(title="renamed while suspended"),
+        ),
+        lambda: material_service.submit_material(
+            session, approved_teacher, offering_id, created.material_id
+        ),
+        lambda: material_service.revise_material(
+            session, approved_teacher, offering_id, created.material_id
+        ),
+        lambda: material_service.archive_material(
+            session, approved_teacher, offering_id, created.material_id
+        ),
+        lambda: material_service.delete_material(
+            session, approved_teacher, offering_id, created.material_id
+        ),
+    ]
+    for attempt in refusals:
+        with pytest.raises(LearningForbiddenError) as excinfo:
+            attempt()
+        message = str(excinfo.value)
+        assert "approved teacher" in message
+        # Veto happens before any id lookup, so nothing is disclosed.
+        assert str(offering_id) not in message
+        assert str(created.material_id) not in message
+    session.rollback()
+
+    # Nothing was written: the material survives untouched.
+    session.rollback()
+    survivors = session.scalars(select(Material)).all()
+    assert [m.title for m in survivors] == ["Algebra worksheet"]
+    assert survivors[0].status == MaterialStatus.DRAFT.value
+
+
+def test_material_type_must_describe_the_uploaded_bytes(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    storage: MemoryStorage,
+) -> None:
+    # A video row carrying a real study video is fine.
+    video = _upload(
+        session,
+        approved_teacher,
+        offering_id,
+        storage,
+        title="Lesson clip",
+        material_type=MaterialType.VIDEO,
+        data=_MP4_BYTES,
+        content_type="video/mp4",
+        filename="lesson.mp4",
+    )
+    session.commit()
+    assert video.material_type == MaterialType.VIDEO
+    assert video.file_asset.content_type == "video/mp4"
+
+    # A video row may not carry PDF bytes, and vice versa.
+    with pytest.raises(LearningValidationError) as mismatched:
+        _upload(
+            session,
+            approved_teacher,
+            offering_id,
+            storage,
+            title="Lies about its type",
+            material_type=MaterialType.VIDEO,
+            data=_PDF_BYTES,
+            content_type="application/pdf",
+            filename="notes.pdf",
+        )
+    assert "does not match the uploaded file" in str(mismatched.value)
+    session.rollback()
+
+    with pytest.raises(LearningValidationError) as image_refused:
+        _upload(
+            session,
+            approved_teacher,
+            offering_id,
+            storage,
+            title="Photo of the whiteboard",
+            material_type=MaterialType.PDF_DOCUMENT,
+            data=_PNG_BYTES,
+            content_type="image/png",
+            filename="whiteboard.png",
+        )
+    assert "not allowed" in str(image_refused.value)
+    session.rollback()
+
+
+def test_material_type_cannot_be_changed_away_from_the_stored_file(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    storage: MemoryStorage,
+) -> None:
+    created = _upload(session, approved_teacher, offering_id, storage)
+    session.commit()
+
+    with pytest.raises(LearningValidationError) as excinfo:
+        material_service.update_material(
+            session,
+            approved_teacher,
+            offering_id,
+            created.material_id,
+            MaterialUpdate(material_type=MaterialType.VIDEO),
+        )
+    assert "does not match the stored file" in str(excinfo.value)
+    session.rollback()
+    assert session.get(Material, created.material_id).material_type == "pdf_document"
+
+
+def test_declared_type_round_trips_through_the_api_vocabulary(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    storage: MemoryStorage,
+) -> None:
+    """No retired type may survive anywhere in the authoring path."""
+    created = _upload(session, approved_teacher, offering_id, storage)
+    session.commit()
+
+    assert created.material_type == MaterialType.PDF_DOCUMENT
+    assert MaterialType(created.material_type.value) is MaterialType.PDF_DOCUMENT
+    assert {t.value for t in MaterialType} == {"video", "pdf_document"}
+    for retired in ("book", "note", "exercise"):
+        with pytest.raises(ValueError):
+            MaterialType(retired)
