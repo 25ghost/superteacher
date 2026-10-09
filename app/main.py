@@ -38,6 +38,7 @@ from fastapi.security import HTTPBearer
 from fastapi.openapi.utils import get_openapi
 from slowapi.errors import RateLimitExceeded
 
+from app.api.v1.endpoints.classroom_ws import router as classroom_ws_router
 from app.api.v1.router import api_router
 from app.api.v1.tags import OPENAPI_TAGS, access_note_for, generate_operation_id
 from app.core.config import get_settings
@@ -264,3 +265,10 @@ def custom_openapi() -> dict:
 app.openapi = custom_openapi
 
 app.include_router(api_router, prefix="/api/v1")
+
+# The classroom WebSocket (Phase 3, slice 3C) lives at the app root on
+# purpose: ``/ws/classes/{class_id}`` is not an HTTP resource, is not part
+# of the OpenAPI document, and authenticates with a single-use ticket
+# instead of a Bearer header. Its contract is documented in
+# ``app.api.v1.endpoints.classroom_ws`` (§47), not in the schema.
+app.include_router(classroom_ws_router)

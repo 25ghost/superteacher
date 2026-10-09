@@ -4,6 +4,7 @@ pydantic==2.12.5
 pydantic-settings==2.13.0
 email-validator>=2.0,<3
 SQLAlchemy==2.0.44
+websockets==17.2
 alembic==1.17.0
 psycopg[binary]==3.2.13
 argon2-cffi>=23.1,<26
