@@ -1315,18 +1315,21 @@ def test_invalid_frames_are_refused(
     with api_client.websocket_connect(_ws_url(class_id, ticket)) as websocket:
         assert websocket.receive_json()["participant"]["participant_ref"] == student_ref
 
+        # A frame that is not a recognized control frame is refused...
         websocket.send_text("this is not json")
         assert websocket.receive_json() == {
             "type": "error",
             "code": "INVALID_CONTROL_MESSAGE",
         }
 
-        # 3C implements exactly one control frame — message.send is NOT
-        # executed, never audited, never persisted (§28).
+        # ...but message.send IS the classroom's own frame (slice 3D):
+        # this payload is merely invalid (no client_message_id), so the
+        # refusal is the advisory INVALID_MESSAGE — never executed,
+        # never persisted (§5).
         websocket.send_json({"type": "message.send", "body": "hello"})
         assert websocket.receive_json() == {
             "type": "error",
-            "code": "INVALID_CONTROL_MESSAGE",
+            "code": "INVALID_MESSAGE",
         }
         assert _class_message_count(engine, class_id) == 0
 

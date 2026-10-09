@@ -59,10 +59,24 @@ Events (client-visible vocabulary, nothing else ever crosses the wire)
       (manual End, overdue auto-end, and the teacher's Start alike —
       §22/§25/§36). On ``class.ended`` every socket is closed 1000 in
       the order: event → close → unregister.
+    * ``message.created`` — one committed classroom message (slice 3D):
+      ``{"type", "message_id", "sequence", "sender": {"role",
+      "display_name"}, "body", "sent_at", "client_message_id"}``. It
+      reaches every participant of the class only AFTER the row is
+      durably committed (the publish rides the insert's transaction) and
+      exactly once per participant (class-scoped bus, no local dispatch
+      alongside the notification). The sender sees the same frame — its
+      ``message_id``/``sequence`` are the canonical identity it
+      reconciles against.
     * ``error`` — ``{"type": "error", "code": ...}`` from a small fixed
-      set (INVALID_CONTROL_MESSAGE, CLASS_NOT_LIVE, NOT_AUTHORIZED,
-      HEARTBEAT_REJECTED, INTERNAL_ERROR), always followed by a close
-      when it is not merely advisory.
+      set (INVALID_CONTROL_MESSAGE, INVALID_MESSAGE,
+      CLIENT_MESSAGE_ID_CONFLICT, RATE_LIMITED, CLASS_NOT_LIVE,
+      NOT_AUTHORIZED, HEARTBEAT_REJECTED, INTERNAL_ERROR). Most are
+      advisory — the socket stays open (a bad payload or a full quota is
+      not a protocol violation) — but a refusal that invalidates the
+      socket's own precondition terminates it: NOT_AUTHORIZED closes 4003
+      and CLASS_NOT_LIVE closes 4008, both through the one idempotent
+      cleanup path.
 
 Heartbeat (§32/§33)
     The client sends ``{"type": "presence.heartbeat"}`` every
@@ -85,9 +99,23 @@ Teardown (one idempotent path — §21/§22/§29)
     ``cleanup`` hook, so double-fires (watchdog vs disconnect, event vs
     crash) are harmless.
 
-Forbidden here (§16/§28): message creation of any kind (3D owns that),
-    Redis, WebRTC, audio/video, generic chat, a second auth system —
-    and no internal event name or detail ever reaches a client.
+Messages (slice 3D — transport only, the rules live in the service)
+    One new client frame, ``{"type": "message.send",
+    "client_message_id", "body"}``. This module parses it with the
+    ``MessageSendFrame`` schema (a payload failure is the advisory
+    ``INVALID_MESSAGE`` — framing failures stay
+    ``INVALID_CONTROL_MESSAGE``), then delegates everything else to
+    ``classroom_service.send_class_message`` through a thread worker with
+    its OWN short-lived session: authorization, class state, the retry
+    key, the quota and the sequence are service decisions, never this
+    endpoint's. A first submission answers with the broadcast
+    ``message.created`` (the sender included); an idempotent retry is
+    acknowledged directly to the requesting socket with the canonical
+    message and is NEVER broadcast twice.
+
+Forbidden here (§16/§28): domain rules for messages (the service owns
+    them), Redis, WebRTC, audio/video, generic chat, a second auth
+    system — and no internal event name or detail ever reaches a client.
 """
 from __future__ import annotations
 
@@ -99,6 +127,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, WebSocket
+from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from app.core.config import get_settings
@@ -109,6 +138,7 @@ from app.models.user import User
 from app.realtime import close_codes as cc
 from app.realtime.connections import LiveConnection, participant_ref, registry
 from app.realtime.event_bus import get_event_bus
+from app.schemas.online_class import MessageSendFrame
 from app.services import classroom_service
 from app.services.learning_context_service import (
     LearningConflictError,
@@ -287,6 +317,55 @@ def _heartbeat_worker(connection: LiveConnection) -> str:
         session.close()
 
 
+def _send_message_worker(connection: LiveConnection, frame: MessageSendFrame) -> dict:
+    """Commit one ``message.send`` in its own short-lived session (§3D).
+
+    The socket never holds a session: this worker opens one, delegates
+    every rule to ``classroom_service.send_class_message`` and commits
+    (or rolls back) the transaction the service prepared. The class-end
+    sweep discovered while refusing a message is persisted exactly like
+    the handshake persists it — an auto-ended class must broadcast
+    ``class.ended`` even though THIS send failed.
+
+    Returns a transport-neutral verdict; it never raises, so a database
+    hiccup becomes the advisory INTERNAL_ERROR frame instead of killing
+    the loop. Bodies, tickets and exception text are never logged.
+    """
+    session = SessionLocal()
+    try:
+        user = session.get(User, connection.user_id)
+        if user is None:
+            return {"outcome": "error", "code": cc.ERROR_NOT_AUTHORIZED}
+        try:
+            kind, event = classroom_service.send_class_message(
+                session,
+                user,
+                connection.class_id,
+                frame.client_message_id,
+                frame.body,
+            )
+        except classroom_service.MessageRejected as exc:
+            if exc.code == cc.ERROR_CLASS_NOT_LIVE:
+                # Persist an overdue sweep this call may have triggered.
+                session.commit()
+            else:
+                session.rollback()
+            return {"outcome": "error", "code": exc.code}
+        session.commit()
+        if kind == "duplicate":
+            return {"outcome": "duplicate", "event": event}
+        return {"outcome": "created"}
+    except Exception:  # noqa: BLE001 — advisory INTERNAL_ERROR, never a traceback
+        session.rollback()
+        logger.exception(
+            "websocket message send failed",
+            extra={"class_id": str(connection.class_id)},
+        )
+        return {"outcome": "error", "code": cc.ERROR_INTERNAL_ERROR}
+    finally:
+        session.close()
+
+
 # --- connection lifecycle (async, event-loop side) -------------------------------------
 
 
@@ -308,6 +387,66 @@ def _presence_of(connection: LiveConnection) -> dict:
         "display_name": connection.display_name,
         "participant_ref": connection.participant_ref,
     }
+
+
+#: Keys of ``message.created`` that may reach a client. The bus payload
+#: also carries ``class_id`` (its routing key) — routing keys never
+#: reach the wire (§19), so delivery always goes through this picker.
+_CLIENT_EVENT_KEYS = (
+    "type",
+    "message_id",
+    "sequence",
+    "sender",
+    "body",
+    "sent_at",
+    "client_message_id",
+)
+
+
+def _client_event(event: dict) -> dict:
+    """The wire view of a ``message.created`` payload (no routing keys)."""
+    return {key: event[key] for key in _CLIENT_EVENT_KEYS if key in event}
+
+
+async def _handle_message_send(connection: LiveConnection, payload: dict) -> None:
+    """One ``message.send`` frame: validate, delegate, deliver the answer.
+
+    Validation happens HERE (transport parsing, §19) so a malformed
+    payload never opens a database session; every domain decision is the
+    service's. Outcomes:
+
+    - ``created`` — silent: the committed ``message.created`` broadcast
+      is already on its way to everyone, the sender included;
+    - ``duplicate`` — the canonical message, sent ONLY to this socket so
+      a retry is acknowledged without a second room-wide broadcast;
+    - refusal — the stable error code; NOT_AUTHORIZED and
+      CLASS_NOT_LIVE additionally terminate the socket (4003 / 4008)
+      through the one idempotent cleanup path, because an authorization
+      or lifecycle change invalidates the connection itself (§18),
+      while payload/quota/conflict failures are merely advisory.
+    """
+    try:
+        frame = MessageSendFrame.model_validate(payload)
+    except ValidationError:
+        await connection.send_json(
+            {"type": cc.EVENT_ERROR, "code": cc.ERROR_INVALID_MESSAGE}
+        )
+        return
+
+    result = await asyncio.to_thread(_send_message_worker, connection, frame)
+    if result["outcome"] == "duplicate":
+        await connection.send_json(_client_event(result["event"]))
+        return
+    if result["outcome"] == "error":
+        code = result["code"]
+        if code == cc.ERROR_NOT_AUTHORIZED:
+            await _reject(
+                connection, error_code=code, close_code=cc.WS_NOT_AUTHORIZED
+            )
+        elif code == cc.ERROR_CLASS_NOT_LIVE:
+            await _reject(connection, error_code=code, close_code=cc.CLASS_NOT_LIVE)
+        else:
+            await connection.send_json({"type": cc.EVENT_ERROR, "code": code})
 
 
 async def _cleanup(connection: LiveConnection, close_code: int | None) -> None:
@@ -391,6 +530,11 @@ def _install_hooks(connection: LiveConnection) -> None:
                 # §22 order: the event arrived, now close 1000 → cleanup
                 # unregisters (segments were finalized by the transition).
                 await connection.cleanup(close_code=cc.NORMAL_CLOSURE)
+        elif event_type == cc.EVENT_MESSAGE_CREATED:
+            # Already committed (the publish rode its transaction); the
+            # sender's own echo takes this exact path, so a participant
+            # sees each message once regardless of worker locality.
+            await connection.send_json(_client_event(event))
         elif event_type == cc.EVENT_CONNECTION_REVOKE:
             # §29: the student's enrollment ended — say something safe,
             # then close 4003 and finalize their segment.
@@ -407,7 +551,7 @@ def _install_hooks(connection: LiveConnection) -> None:
 
 
 async def _handle_frame(connection: LiveConnection, message: dict) -> None:
-    """One client frame: heartbeat control, or an advisory error (§34)."""
+    """One client frame: heartbeat, ``message.send``, or a refused frame (§34)."""
     text = message.get("text")
     if text is None:
         await connection.send_json(
@@ -420,9 +564,13 @@ async def _handle_frame(connection: LiveConnection, message: dict) -> None:
     except ValueError:
         event_type = None
 
+    if event_type == cc.EVENT_MESSAGE_SEND:
+        await _handle_message_send(connection, payload)
+        return
+
     if event_type != cc.EVENT_HEARTBEAT:
-        # 3C implements exactly one control frame; anything else (chat,
-        # message.send, random JSON) is refused, never executed (§28).
+        # Unrecognized frames (chat, random JSON, wrong-shaped objects)
+        # are refused, never executed (§28).
         await connection.send_json(
             {"type": cc.EVENT_ERROR, "code": cc.ERROR_INVALID_CONTROL_MESSAGE}
         )
