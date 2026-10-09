@@ -52,6 +52,21 @@ here, only the rules the WebSocket handshake and heartbeat delegate to:
 - :func:`heartbeat_teacher` — the teacher-side probe: sweep + "still
   live?", no segment to touch.
 
+Slice 3D adds the message path — still service-owned, still no session
+kept across WebSocket frames:
+
+- :func:`send_class_message` — commit ONE text message under the class
+  row lock (authorization → idempotency → rate limit → sequence →
+  insert → ``message.created`` published on the SAME transaction, so the
+  event fires only with a durable row). Retries resolve to the canonical
+  message; refusals raise :class:`MessageRejected` carrying one of the
+  stable client-safe codes.
+- :func:`read_messages_for_teacher` / :func:`read_messages_for_student`
+  — the reconnect cursor read (``after_sequence`` exclusive, bounded
+  page, ``sequence`` ASC) for a LIVE or ENDED class: live reads demand
+  current authorization (owner / ACTIVE enrollment), ended reads keep the
+  slice 3B historical policy exactly, SCHEDULED and CANCELLED answer 409.
+
 Audits: exactly one ``auth_events`` row per join/leave (subject = the
 acting student, ``actor_user_id`` None, metadata = class + student ids);
 heartbeats, ticket issuance/consumption and the class-end bulk close are
@@ -126,10 +141,17 @@ from app.repositories import teaching_offering_repository as offering_repo
 from app.repositories import ws_ticket_repository as ticket_repo
 from app.realtime.connections import participant_ref
 from app.realtime.close_codes import (
+    ERROR_CLASS_NOT_LIVE,
+    ERROR_CLIENT_MESSAGE_ID_CONFLICT,
+    ERROR_INVALID_MESSAGE,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_RATE_LIMITED,
+    EVENT_MESSAGE_CREATED,
     REASON_CLASS_NOT_LIVE,
     REASON_DUPLICATE,
     REASON_NOT_AUTHORIZED,
 )
+from app.realtime.event_bus import MAX_PAYLOAD_BYTES, get_event_bus
 from app.schemas.online_class import (
     AttendanceSegmentRead,
     ClassAttendanceRead,
@@ -144,6 +166,7 @@ from app.services.learning_context_service import (
     LearningForbiddenError,
     LearningNotFoundError,
 )
+from app.services.message_rate_limiter import message_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -1107,3 +1130,320 @@ def _message_reads(
             )
         )
     return reads
+
+
+# --- sending (slice 3D: durable, ordered, idempotent, recoverable) --------------------
+
+
+class MessageRejected(Exception):
+    """A ``message.send`` refused with a stable, client-safe error code.
+
+    ``code`` is always one of the small vocabulary in
+    ``app.realtime.close_codes`` — ``INVALID_MESSAGE``,
+    ``CLIENT_MESSAGE_ID_CONFLICT``, ``RATE_LIMITED``,
+    ``CLASS_NOT_LIVE``, ``NOT_AUTHORIZED`` — so the endpoint can relay it
+    verbatim inside ``{"type": "error", "code": ...}``. The exception
+    text is the code itself: no SQL, no stack, no ids ever reach a
+    client, and the endpoint never has to translate (§45/§18).
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _message_created_event(
+    *,
+    class_id: uuid.UUID,
+    message_id: uuid.UUID,
+    sequence: int,
+    role: str,
+    display_name: str,
+    body: str,
+    sent_at: datetime,
+    client_message_id: str,
+) -> dict:
+    """The ``message.created`` payload — routing key included.
+
+    ``class_id`` is the bus's routing key (class-scoped fan-out); the
+    endpoint strips it before a byte reaches a client (§19: routing keys
+    never reach the wire). Everything else is presentation-safe: the
+    server id, the authoritative sequence, role + display name (never an
+    email or user id), the body, the database timestamp and the client's
+    own retry key so it can reconcile a local echo.
+    """
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    return {
+        "type": EVENT_MESSAGE_CREATED,
+        "class_id": str(class_id),
+        "message_id": str(message_id),
+        "sequence": sequence,
+        "sender": {"role": role, "display_name": display_name},
+        "body": body,
+        "sent_at": sent_at.isoformat(),
+        "client_message_id": client_message_id,
+    }
+
+
+def _authorize_message_send(
+    session: Session, user: User, class_session: OnlineClassSession
+) -> tuple[str, str]:
+    """Recheck, for ONE message, everything that justified this socket.
+
+    A ticket is not permanent authorization (§9): before every new
+    message the account must still be active, the teacher still approved
+    and still the owner of this class's offering, the student still
+    actively enrolled in exactly this offering — a student enrolled
+    through ANOTHER teacher's offering never passes, and Admin gains
+    nothing from its role (§6). Read-only, with no side effects: unlike
+    ``authorize_ws_connection`` this opens no segment and registers
+    nothing, because a send must never touch attendance.
+
+    Every refusal is the same client-safe ``NOT_AUTHORIZED`` so a probe
+    cannot tell "unknown class" from "not your class".
+    """
+    if user.status != UserStatus.ACTIVE.value:
+        raise MessageRejected(ERROR_NOT_AUTHORIZED)
+
+    if user.role == UserRole.TEACHER.value:
+        profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+        if (
+            profile is None
+            or profile.verification_status != TeacherVerificationStatus.APPROVED.value
+        ):
+            raise MessageRejected(ERROR_NOT_AUTHORIZED)
+        offering = offering_repo.get_by_id(
+            session, class_session.teaching_offering_id
+        )
+        if offering is None or offering.teacher_id != profile.id:
+            raise MessageRejected(ERROR_NOT_AUTHORIZED)
+        return "teacher", profile.full_name
+
+    if user.role == UserRole.STUDENT.value:
+        try:
+            student = _student_profile(session, user)
+        except LearningForbiddenError as exc:
+            raise MessageRejected(ERROR_NOT_AUTHORIZED) from exc
+        enrollment = enrollment_repo.find_active_for_student_offering(
+            session, student.id, class_session.teaching_offering_id
+        )
+        if enrollment is None:
+            raise MessageRejected(ERROR_NOT_AUTHORIZED)
+        return "student", student.full_name
+
+    raise MessageRejected(ERROR_NOT_AUTHORIZED)
+
+
+def send_class_message(
+    session: Session,
+    user: User,
+    class_id: uuid.UUID,
+    client_message_id: str,
+    body: str,
+) -> tuple[str, dict]:
+    """Commit ONE new classroom message, or acknowledge a retried one.
+
+    Returns ``("created", event)`` for a first submission — the event is
+    queued on THIS transaction's NOTIFY, so it fires on commit and dies
+    with a rollback: a ``message.created`` can never describe a row that
+    was not durably written (§11), and the Postgres path delivers it
+    exactly once (no local dispatch alongside the notification, so no
+    participant sees it twice). Returns ``("duplicate", event)`` for an
+    idempotent retry: the canonical message, meant ONLY for the
+    requesting connection — no new row, no new sequence, no rate token,
+    no second room-wide broadcast.
+
+    Order (§7/§10):
+
+        sweep overdue → lock the class row → LIVE? → authorize
+        → idempotency → payload size → rate limit
+        → allocate sequence → insert → publish (same transaction)
+
+    The class-row lock (``get_by_id_for_update``) is the keystone: every
+    concurrent sender of this class AND the class-end transition lock the
+    SAME row, so sequence allocation is PostgreSQL-safe across workers,
+    "still live?" and ordering are one atomic decision, and two
+    concurrent identical retries cannot both miss the idempotency lookup
+    — the loser waits, then sees the winner's committed row. Sequence
+    comes from ``MAX(sequence) + 1`` recomputed under that lock, so a
+    failed transaction consumes nothing and committed sequences stay
+    contiguous.
+
+    Raises :class:`MessageRejected` with a stable client-safe code. No
+    commit here — the WebSocket handler owns the transaction (§53), and
+    an overdue sweep discovered along the way is committed by the caller
+    exactly like the handshake does.
+    """
+    online_class_service.ensure_not_overdue(session, class_id)
+    class_session = class_repo.get_by_id_for_update(session, class_id)
+    if class_session is None:
+        raise MessageRejected(ERROR_NOT_AUTHORIZED)
+    if class_session.status != OnlineClassStatus.LIVE.value:
+        # End-of-class race (§17): a submission that reaches us after the
+        # transition must never enter the transcript.
+        raise MessageRejected(ERROR_CLASS_NOT_LIVE)
+
+    role, display_name = _authorize_message_send(session, user, class_session)
+
+    existing = message_repo.find_by_idempotency_key(
+        session,
+        class_session_id=class_id,
+        sender_user_id=user.id,
+        client_message_id=client_message_id,
+    )
+    if existing is not None:
+        if existing.body != body:
+            # Same key, different text: refuse, never silently replace.
+            raise MessageRejected(ERROR_CLIENT_MESSAGE_ID_CONFLICT)
+        return "duplicate", _message_created_event(
+            class_id=class_id,
+            message_id=existing.id,
+            sequence=existing.sequence,
+            role=role,
+            display_name=display_name,
+            body=existing.body,
+            sent_at=existing.created_at,
+            client_message_id=existing.client_message_id,
+        )
+
+    # Size probe BEFORE anything is written: the NOTIFY payload cap is
+    # 8000 bytes and the body is client-controlled. Placeholders match
+    # the real event's fixed widths (uuid 36, timestamp 32, sequence
+    # <= 9 digits), so a body that passes here always fits for real.
+    probe = _message_created_event(
+        class_id=class_id,
+        message_id=uuid.uuid4(),
+        sequence=999_999_999,
+        role=role,
+        display_name=display_name,
+        body=body,
+        sent_at=datetime(2000, 1, 1, 0, 0, 0, 999999, tzinfo=timezone.utc),
+        client_message_id=client_message_id,
+    )
+    if len(json.dumps(probe, separators=(",", ":")).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise MessageRejected(ERROR_INVALID_MESSAGE)
+
+    if not message_rate_limiter.allow(class_id, user.id):
+        raise MessageRejected(ERROR_RATE_LIMITED)
+
+    sequence = message_repo.next_sequence(session, class_id)
+    message = message_repo.create_message(
+        session,
+        class_session_id=class_id,
+        sender_user_id=user.id,
+        client_message_id=client_message_id,
+        body=body,
+        sequence=sequence,
+    )
+    # created_at is the database clock (server default) — refresh it so
+    # the event reports the authoritative sent time.
+    session.refresh(message)
+    event = _message_created_event(
+        class_id=class_id,
+        message_id=message.id,
+        sequence=message.sequence,
+        role=role,
+        display_name=display_name,
+        body=message.body,
+        sent_at=message.created_at,
+        client_message_id=message.client_message_id,
+    )
+    get_event_bus().publish(session, event)
+    return "created", event
+
+
+# --- live recovery (slice 3D: the cursor read for reconnects) -------------------------
+
+
+def read_messages_for_teacher(
+    session: Session,
+    user: User,
+    offering_id: uuid.UUID,
+    class_id: uuid.UUID,
+    *,
+    after_sequence: int = 0,
+    limit: int = 100,
+) -> tuple[list[ClassMessageRead], bool]:
+    """Messages after one exclusive cursor, LIVE or ENDED (§14).
+
+    The reconnecting participant's read: same exclusive
+    ``after_sequence`` / bounded ``limit`` / ``sequence`` ASC contract as
+    the historical transcript, but reachable while the class is still
+    live so a client that lost its socket can close the gap between its
+    last processed sequence and the live stream.
+
+    Authorization rides ``get_my_class`` (403 role, 404
+    unknown-or-foreign, overdue sweep): OWNING the class is the
+    entitlement at every status — for a LIVE class that is exactly the
+    owner-teacher rule, for an ENDED one it is the unchanged slice 3B
+    policy. SCHEDULED and CANCELLED classes expose nothing (409): a class
+    that never happened has no classroom history.
+    """
+    read, auto_ended = online_class_service.get_my_class(
+        session, user, offering_id, class_id
+    )
+    if read.status not in (
+        OnlineClassStatus.LIVE.value,
+        OnlineClassStatus.ENDED.value,
+    ):
+        raise LearningConflictError(
+            "class messages are only available while the class is live or "
+            f"after it has ended; status is {read.status!r}"
+        )
+    messages = message_repo.list_messages_after(
+        session, class_id, after_sequence=after_sequence, limit=limit
+    )
+    return _message_reads(session, messages), auto_ended
+
+
+def read_messages_for_student(
+    session: Session,
+    student: Student,
+    class_id: uuid.UUID,
+    *,
+    after_sequence: int = 0,
+    limit: int = 100,
+) -> tuple[list[ClassMessageRead], bool]:
+    """Messages after one exclusive cursor, LIVE or ENDED (§14).
+
+    Two policies, decided by the class's real status AFTER the overdue
+    sweep (a class whose window passed is read as the ENDED class it
+    effectively is):
+
+    - LIVE — current authorization only: an ACTIVE enrollment in THIS
+      class's offering. No segment requirement (the reader may be about
+      to reconnect), no enrollment ⇒ the SAME 404 as an unknown class id
+      (L6 existence leak): a class id alone never grants access;
+    - ENDED — the exact slice 3B historical policy, untouched: a durable
+      participation segment for THIS student in THIS class, regardless of
+      current enrollment, teacher switch or the 50% attendance verdict;
+    - SCHEDULED / CANCELLED — 409, no transcript to read.
+    """
+    class_session = class_repo.get_by_id(session, class_id)
+    if class_session is None:
+        raise LearningNotFoundError(f"no online class with id {class_id}")
+
+    auto_ended = online_class_service.ensure_not_overdue(session, class_id)
+
+    if class_session.status == OnlineClassStatus.LIVE.value:
+        enrollment = enrollment_repo.find_active_for_student_offering(
+            session, student.id, class_session.teaching_offering_id
+        )
+        if enrollment is None:
+            raise LearningNotFoundError(f"no online class with id {class_id}")
+    elif class_session.status == OnlineClassStatus.ENDED.value:
+        if not segment_repo.has_participation(
+            session, class_session_id=class_id, student_id=student.id
+        ):
+            raise LearningNotFoundError(f"no online class with id {class_id}")
+    else:
+        raise LearningConflictError(
+            "class messages are only available while the class is live or "
+            f"after it has ended; status is {class_session.status!r}"
+        )
+
+    messages = message_repo.list_messages_after(
+        session, class_id, after_sequence=after_sequence, limit=limit
+    )
+    return _message_reads(session, messages), auto_ended
