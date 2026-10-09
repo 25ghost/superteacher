@@ -141,6 +141,17 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_RECYCLE: int = 1800  # seconds (30 minutes)
 
+    # WebSocket classroom (Phase 3, slice 3C).
+    # Lifetime of one freshly minted single-use class ticket (§37): long
+    # enough to survive a slow handshake, short enough that a leaked
+    # ticket is worthless almost immediately.
+    WS_TICKET_TTL_SECONDS: int = 120
+    # Client heartbeat cadence (§32) and how long a silent socket may
+    # stay registered before the server terminates it (§33). Overridable
+    # in tests (staleness is asserted with a sub-second timeout).
+    WS_HEARTBEAT_INTERVAL_SECONDS: int = 20
+    WS_STALE_TIMEOUT_SECONDS: int = 60
+
     @property
     def jwt_secret(self) -> str:
         """The JWT signing secret, validated against the environment.
