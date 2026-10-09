@@ -8,6 +8,9 @@ from app.core.database import Base
 from app.models.academic_year import AcademicYear
 from app.models.auth_event import AuthEvent
 from app.models.auth_session import AuthSession
+from app.models.class_attendance_segment import ClassAttendanceSegment
+from app.models.class_message import ClassMessage
+from app.models.class_ws_ticket import ClassWsTicket
 from app.models.education_level import EducationLevel
 from app.models.enrollment import StudentEnrollment
 from app.models.file_asset import FileAsset
@@ -18,6 +21,7 @@ from app.models.lesson import Lesson
 from app.models.material import Material
 from app.models.material_moderation import MaterialModeration
 from app.models.material_progress import MaterialProgress
+from app.models.online_class_session import OnlineClassSession
 from app.models.password_reset_token import PasswordResetToken
 from app.models.pathway import Pathway
 from app.models.pathway_level import PathwayLevel
@@ -42,6 +46,9 @@ __all__ = [
     "AcademicYear",
     "AuthEvent",
     "AuthSession",
+    "ClassAttendanceSegment",
+    "ClassMessage",
+    "ClassWsTicket",
     "EducationLevel",
     "FileAsset",
     "InviteToken",
@@ -51,6 +58,7 @@ __all__ = [
     "Material",
     "MaterialModeration",
     "MaterialProgress",
+    "OnlineClassSession",
     "PasswordResetToken",
     "StudentEnrollment",
     "Pathway",

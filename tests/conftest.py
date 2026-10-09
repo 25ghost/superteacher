@@ -41,7 +41,13 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 # The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
-    # Phase 2 slice 2C — personal material progress (children of materials).
+    # Phase 3 slice 3A - classroom children before the class sessions they
+    # hang off (messages/segments/tickets cascade from online_class_sessions).
+    "class_messages",
+    "class_attendance_segments",
+    "class_ws_tickets",
+    "online_class_sessions",
+    # Phase 2 slice 2C - personal material progress (children of materials).
     "material_progress",
     # Phase 2 slice 2B — materials: moderation rows before materials before
     # file assets before the offerings they hang off, then slice 2A's

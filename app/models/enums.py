@@ -209,3 +209,20 @@ class MaterialProgressStatus(str, enum.Enum):
     NOT_STARTED = "not_started"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+
+
+class OnlineClassStatus(str, enum.Enum):
+    """Lifecycle of one live online class session (Phase 3).
+
+    ``scheduled`` → ``live`` → ``ended`` and ``scheduled`` → ``cancelled``
+    only; both ``ended`` and ``cancelled`` are terminal and a class is
+    never reopened. A class is the classroom unit a WebSocket classroom
+    binds to — messages, presence and attendance exist only while the
+    status is ``live``. Enforced by ``online_class_sessions_status_check``
+    plus the service's transition map.
+    """
+
+    SCHEDULED = "scheduled"
+    LIVE = "live"
+    ENDED = "ended"
+    CANCELLED = "cancelled"
