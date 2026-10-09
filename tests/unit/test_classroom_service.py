@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core import security
+from app.core.config import get_settings
 from app.core.database import Base
 import app.models  # noqa: F401
 from app.models.academic_year import AcademicYear
@@ -68,6 +69,7 @@ from app.models.student import Student
 from app.models.subject import Subject
 from app.models.teacher import Teacher
 from app.models.user import User
+from app.realtime import close_codes as cc
 from app.schemas.learning import TeachingOfferingCreate
 from app.schemas.online_class import OnlineClassSessionCreate
 from app.services import (
@@ -81,6 +83,7 @@ from app.services.learning_context_service import (
     LearningForbiddenError,
     LearningNotFoundError,
 )
+from app.services.message_rate_limiter import message_rate_limiter
 
 PASSWORD = "correct horse battery staple"
 
@@ -1332,3 +1335,430 @@ def test_a_sender_without_a_profile_degrades_to_a_placeholder(
     assert ghost.email not in json.dumps(
         [m.model_dump(mode="json") for m in messages], default=str
     )
+
+
+# --- sending (slice 3D: durable, ordered, idempotent) --------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_quota():
+    """Every test starts with a full message quota (the limiter is global)."""
+    message_rate_limiter.reset()
+    yield
+    message_rate_limiter.reset()
+
+
+def _rows(session: Session, class_id: uuid.UUID) -> list[ClassMessage]:
+    stmt = (
+        select(ClassMessage)
+        .where(ClassMessage.class_session_id == class_id)
+        .order_by(ClassMessage.sequence)
+    )
+    return list(session.scalars(stmt))
+
+
+def test_a_live_class_commits_messages_in_sequence_and_returns_the_event(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+
+    for expected, body in enumerate(("first", "second", "third"), start=1):
+        outcome, event = classroom_service.send_class_message(
+            session, enrolled_student, class_id, f"cid-{expected}", body
+        )
+        assert outcome == "created"
+        assert event["type"] == "message.created"
+        assert event["sequence"] == expected
+        assert event["class_id"] == str(class_id)  # routing key, stripped at the wire
+        assert event["sender"] == {"role": "student", "display_name": "Test Student"}
+        assert event["body"] == body
+        assert event["client_message_id"] == f"cid-{expected}"
+        assert event["sent_at"].endswith("+00:00") or "Z" in event["sent_at"]
+        session.commit()
+
+    rows = _rows(session, class_id)
+    assert [r.sequence for r in rows] == [1, 2, 3]  # contiguous, per-class, from 1
+    assert [r.body for r in rows] == ["first", "second", "third"]
+    assert all(r.sender_user_id == enrolled_student.id for r in rows)
+    assert all(r.client_message_id == f"cid-{i + 1}" for i, r in enumerate(rows))
+
+
+def test_a_retry_returns_the_canonical_message_without_a_second_row(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    """Same key + same body ? the SAME message, no new sequence, no fan-out."""
+    class_id = _start(session, approved_teacher, offering_id)
+
+    first_outcome, first = classroom_service.send_class_message(
+        session, enrolled_student, class_id, "retry-me", "hello"
+    )
+    session.commit()
+    retry_outcome, retry = classroom_service.send_class_message(
+        session, enrolled_student, class_id, "retry-me", "hello"
+    )
+    session.commit()
+
+    assert (first_outcome, retry_outcome) == ("created", "duplicate")
+    assert retry["message_id"] == first["message_id"]
+    assert retry["sequence"] == first["sequence"] == 1
+    assert _rows(session, class_id) and len(_rows(session, class_id)) == 1
+
+
+def test_the_same_key_with_a_different_body_is_refused_not_replaced(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-1", "the original"
+    )
+    session.commit()
+
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, class_id, "cid-1", "a rewritten body"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_CLIENT_MESSAGE_ID_CONFLICT
+    rows = _rows(session, class_id)
+    assert [r.body for r in rows] == ["the original"]  # never silently replaced
+
+
+def test_a_send_is_refused_once_the_class_is_not_live(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    scheduled = _create(session, approved_teacher, offering_id)
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, scheduled.class_id, "cid-1", "too early"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_CLASS_NOT_LIVE
+    assert _rows(session, scheduled.class_id) == []
+
+    live = _start(session, approved_teacher, offering_id, offset=4)
+    _end(session, approved_teacher, offering_id, live)
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, live, "cid-1", "too late"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_CLASS_NOT_LIVE
+    assert _rows(session, live) == []
+
+
+def test_sending_rechecks_authorization_on_every_message(
+    session: Session,
+    approved_teacher: User,
+    other_teacher: User,
+    offering_id: uuid.UUID,
+    enrolled_student: User,
+    other_student: User,
+) -> None:
+    """A ticket is not permanent authorization (�9): each send is rechecked."""
+    class_id = _start(session, approved_teacher, offering_id)
+
+    # Not enrolled in this offering: same refusal as an unknown class.
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, other_student, class_id, "cid-1", "outsider"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_NOT_AUTHORIZED
+
+    # Another teacher does not own this class.
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, other_teacher, class_id, "cid-1", "not mine"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_NOT_AUTHORIZED
+
+    # ...while the participants really inside the class do send.
+    assert classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-1", "hi"
+    )[0] == "created"
+    assert classroom_service.send_class_message(
+        session, approved_teacher, class_id, "cid-t", "welcome"
+    )[0] == "created"
+    session.commit()
+    assert [r.sequence for r in _rows(session, class_id)] == [1, 2]
+
+
+def test_a_send_never_creates_or_extends_attendance(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    """Authorization for a message must not have join side effects (�5)."""
+    class_id = _start(session, approved_teacher, offering_id)
+
+    classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-1", "talking without joining"
+    )
+    session.commit()
+    assert _segments(session, class_id) == []  # no segment invented by a send
+
+    segment = _join(session, enrolled_student, class_id, "conn-1")
+    classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-2", "now joined"
+    )
+    session.commit()
+    session.refresh(segment)
+    assert segment.left_at is None  # and an open segment is untouched
+    assert len(_segments(session, class_id)) == 1
+
+
+def test_an_overdue_live_class_is_ended_and_refuses_the_send(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    _force_overdue(session, class_id)
+
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, class_id, "cid-1", "still here?"
+        )
+    # The sweep found along the way is committed by the caller (�53)...
+    session.commit()
+    assert excinfo.value.code == cc.ERROR_CLASS_NOT_LIVE
+    row = session.get(OnlineClassSession, class_id)
+    assert row.status == "ended"  # ...so the class really did end
+    assert _rows(session, class_id) == []
+
+
+def test_the_quota_counts_new_messages_but_never_a_retry(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    limit = get_settings().WS_MESSAGE_RATE_LIMIT
+
+    for index in range(limit):
+        assert classroom_service.send_class_message(
+            session, enrolled_student, class_id, f"cid-{index}", f"msg {index}"
+        )[0] == "created"
+    session.commit()
+
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, class_id, "cid-overflow", "one too many"
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_RATE_LIMITED
+
+    # A retry still gets its canonical acknowledgement past the quota,
+    # because idempotency is answered BEFORE the quota (�10).
+    outcome, _ = classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-0", "msg 0"
+    )
+    assert outcome == "duplicate"
+    assert len(_rows(session, class_id)) == limit  # exactly 10 rows survive
+
+
+def test_a_payload_beyond_the_notify_cap_is_refused_before_any_write(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+
+    # 2000 astral-plane characters are 8000 UTF-8 bytes on their own �
+    # the body limit is characters, the bus limit is bytes (�41).
+    huge = "\U0001F600" * 2000
+    with pytest.raises(classroom_service.MessageRejected) as excinfo:
+        classroom_service.send_class_message(
+            session, enrolled_student, class_id, "cid-big", huge
+        )
+    session.rollback()
+    assert excinfo.value.code == cc.ERROR_INVALID_MESSAGE
+    assert _rows(session, class_id) == []  # refused before insert AND publish
+
+    # The maximum ordinary body still fits comfortably.
+    ascii_body = "x" * 2000
+    assert classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-ok", ascii_body
+    )[0] == "created"
+    session.commit()
+    assert _rows(session, class_id)[0].body == ascii_body
+
+
+# --- live recovery (slice 3D: the cursor read for reconnects) ------------------------
+
+
+def test_live_recovery_reads_after_the_cursor_for_an_enrolled_student(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    for index in (1, 2, 3):
+        classroom_service.send_class_message(
+            session, enrolled_student, class_id, f"cid-{index}", f"m{index}"
+        )
+    session.commit()
+
+    profile = _student_profile(session, enrolled_student)
+    messages, auto_ended = classroom_service.read_messages_for_student(
+        session, profile, class_id
+    )
+    assert auto_ended is False
+    assert [m.sequence for m in messages] == [1, 2, 3]
+
+    # EXCLUSIVE cursor + bounded page: replay the last seen sequence.
+    page, _ = classroom_service.read_messages_for_student(
+        session, profile, class_id, after_sequence=1, limit=1
+    )
+    assert [m.sequence for m in page] == [2]
+    tail, _ = classroom_service.read_messages_for_student(
+        session, profile, class_id, after_sequence=3
+    )
+    assert tail == []
+
+    dump = json.dumps([m.model_dump(mode="json") for m in messages], default=str)
+    assert "@example.com" not in dump
+    assert "client_message_id" not in dump  # the retry key is not part of a record
+    assert set(messages[0].model_dump()) == {
+        "message_id",
+        "sequence",
+        "sender",
+        "body",
+        "sent_at",
+    }
+
+
+def test_live_recovery_never_answers_a_class_id_alone(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    enrolled_student: User,
+    other_student: User,
+) -> None:
+    """No ACTIVE enrollment ? the SAME 404 as an unknown class (L6)."""
+    class_id = _start(session, approved_teacher, offering_id)
+    outsider = _student_profile(session, other_student)
+
+    for target in (class_id, uuid.uuid4()):
+        with pytest.raises(LearningNotFoundError) as excinfo:
+            classroom_service.read_messages_for_student(session, outsider, target)
+        session.rollback()
+        assert str(excinfo.value) == f"no online class with id {target}"
+
+
+def test_ended_recovery_keeps_the_participation_policy_verbatim(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    enrolled_student: User,
+    quiet_enrolled_student: User,
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    _join(session, enrolled_student, class_id, "conn-1")
+    classroom_service.send_class_message(
+        session, enrolled_student, class_id, "cid-1", "said during class"
+    )
+    session.commit()
+    _end(session, approved_teacher, offering_id, class_id)
+    session.expire_all()
+
+    profile = _student_profile(session, enrolled_student)
+    enrollment = learning_enrollment_service.list_my_enrollments(session, profile)[0]
+    learning_enrollment_service.leave(session, profile, enrollment.enrollment_id)
+    session.commit()
+
+    # Participation, not enrollment, is the entitlement after the end.
+    messages, auto_ended = classroom_service.read_messages_for_student(
+        session, profile, class_id
+    )
+    assert auto_ended is False
+    assert [m.sequence for m in messages] == [1]
+
+    # Enrolled but never joined: the SAME 404 as an unknown class.
+    quiet = _student_profile(session, quiet_enrolled_student)
+    for target in (class_id, uuid.uuid4()):
+        with pytest.raises(LearningNotFoundError) as excinfo:
+            classroom_service.read_messages_for_student(session, quiet, target)
+        session.rollback()
+        assert str(excinfo.value) == f"no online class with id {target}"
+
+
+def test_scheduled_and_cancelled_recovery_is_a_conflict(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    profile = _student_profile(session, enrolled_student)
+
+    scheduled = _create(session, approved_teacher, offering_id)
+    with pytest.raises(LearningConflictError) as excinfo:
+        classroom_service.read_messages_for_student(session, profile, scheduled.class_id)
+    session.rollback()
+    assert "status is 'scheduled'" in str(excinfo.value)
+
+    live = _start(session, approved_teacher, offering_id, offset=4)
+    cancelled = _create(session, approved_teacher, offering_id, *_window(8))
+    online_class_service.cancel_my_class(
+        session, approved_teacher, offering_id, cancelled.class_id
+    )
+    session.commit()
+    with pytest.raises(LearningConflictError) as excinfo:
+        classroom_service.read_messages_for_student(session, profile, cancelled.class_id)
+    session.rollback()
+    assert "status is 'cancelled'" in str(excinfo.value)
+
+    # A live class of the same offering answers � this read IS for
+    # reconnects, unlike the historical transcript.
+    messages, _ = classroom_service.read_messages_for_student(session, profile, live)
+    assert messages == []
+
+
+def test_recovery_reads_never_create_messages(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID, enrolled_student: User
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    profile = _student_profile(session, enrolled_student)
+
+    for _ in range(3):
+        classroom_service.read_messages_for_student(session, profile, class_id)
+    session.commit()
+    assert _rows(session, class_id) == []
+    assert session.scalar(
+        select(ClassMessage).where(ClassMessage.class_session_id == class_id)
+    ) is None
+
+
+def test_teacher_live_recovery_is_owner_scoped(
+    session: Session,
+    approved_teacher: User,
+    other_teacher: User,
+    offering_id: uuid.UUID,
+    other_offering_id: uuid.UUID,
+    enrolled_student: User,
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    classroom_service.send_class_message(
+        session, approved_teacher, class_id, "cid-1", "teaching"
+    )
+    session.commit()
+
+    # The owning teacher reads a LIVE class � the whole point of 3D.
+    messages, auto_ended = classroom_service.read_messages_for_teacher(
+        session, approved_teacher, offering_id, class_id
+    )
+    assert auto_ended is False
+    assert [m.sequence for m in messages] == [1]
+    assert messages[0].sender.role == "teacher"
+
+    # Another teacher gets the SAME 404 as an unknown class (L6).
+    for target in (class_id, uuid.uuid4()):
+        with pytest.raises(LearningNotFoundError):
+            classroom_service.read_messages_for_teacher(
+                session, other_teacher, other_offering_id, target
+            )
+        session.rollback()
+
+    # A scheduled class has no classroom history (409), a cancelled one
+    # neither � and the cursor stays exclusive and ordered.
+    scheduled = _create(session, approved_teacher, offering_id, *_window(6))
+    with pytest.raises(LearningConflictError) as excinfo:
+        classroom_service.read_messages_for_teacher(
+            session, approved_teacher, offering_id, scheduled.class_id
+        )
+    session.rollback()
+    assert "status is 'scheduled'" in str(excinfo.value)
+
+    _end(session, approved_teacher, offering_id, class_id)
+    ended, _ = classroom_service.read_messages_for_teacher(
+        session, approved_teacher, offering_id, class_id, after_sequence=1
+    )
+    assert ended == []
