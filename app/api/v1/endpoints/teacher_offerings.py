@@ -88,7 +88,7 @@ def create_my_offering(
     user: User = Depends(require_teacher),
 ) -> TeachingOfferingRead:
     try:
-        return teaching_offering_service.create_offering(session, user, payload)
+        created = teaching_offering_service.create_offering(session, user, payload)
     except LearningError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -96,6 +96,7 @@ def create_my_offering(
         session.rollback()
         raise
     session.commit()
+    return created
 
 
 @router.get(
