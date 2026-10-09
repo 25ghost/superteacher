@@ -34,6 +34,7 @@ from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
 from app.repositories import learning_enrollment_repository as enrollment_repo
 from app.repositories import teaching_offering_repository as offering_repo
+from app.realtime.event_bus import get_event_bus
 from app.schemas.learning import LearningEnrollmentRead
 from app.services import learning_context_service
 from app.services.learning_context_service import (
@@ -162,7 +163,11 @@ def leave(
     The row is locked while the decision is made, so two concurrent leaves
     cannot both succeed — the loser sees ``ended`` and gets 409. The
     offering is *not* touched: leaving is a property of the student's own
-    membership, and the teacher keeps their row.
+    membership, and the teacher keeps their row. Leaving also publishes
+    ``connection.revoke`` (§29) in the same transaction: any live
+    classroom socket of this student in this offering is closed by the
+    worker that owns it, their open attendance segment is finalized, and
+    nobody else is told anything (no ids, no reasons, over the wire).
     """
     enrollment = _owned_enrollment(session, student, enrollment_id)
     if enrollment.status != LearningEnrollmentStatus.ACTIVE.value:
@@ -174,6 +179,20 @@ def leave(
     enrollment.status = LearningEnrollmentStatus.ENDED.value
     enrollment.ended_at = datetime.now(timezone.utc)
     session.flush()
+
+    # §29: leaving revokes live classroom access, not just future reads.
+    # Published on the caller's transaction so the revoke reaches other
+    # workers if and only if this commit lands; the endpoint that serves
+    # the socket does the closing (it owns the transport).
+    get_event_bus().publish(
+        session,
+        {
+            "type": "connection.revoke",
+            "class_id": None,
+            "student_id": str(student.id),
+            "teaching_offering_id": str(enrollment.teaching_offering_id),
+        },
+    )
 
     auth_event_repo.log_event(
         session,
