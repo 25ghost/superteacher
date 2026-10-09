@@ -72,6 +72,14 @@ STUDENT_ROUTES: list[tuple[str, str, dict | None]] = [
     ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/content", None),
     ("GET", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/progress", None),
     ("PUT", "/api/v1/me/learning-content/{enrollment_id}/materials/{material_id}/progress", {"status": "in_progress"}),
+    # Phase 3 slice 3A — the student's view of online classes (student-only).
+    ("GET", "/api/v1/me/classes", None),
+    ("GET", "/api/v1/me/classes/{class_id}", None),
+    # Phase 3 slice 3B — own attendance + class transcript (student-only).
+    ("GET", "/api/v1/me/classes/{class_id}/attendance", None),
+    ("GET", "/api/v1/me/classes/{class_id}/transcript", None),
+    # Phase 3 slice 3C — single-use WebSocket ticket (student-only).
+    ("POST", "/api/v1/me/classes/{class_id}/ws-ticket", None),
 ]
 
 TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -104,6 +112,21 @@ TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}/revise", None),
     ("POST", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}/archive", None),
     ("DELETE", "/api/v1/me/teacher/offerings/{offering_id}/materials/{material_id}", None),
+    # Phase 3 slice 3A — online classes under an offering (teacher-only).
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes", {}),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}", None),
+    ("PATCH", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}", {}),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/start", None),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/end", None),
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/cancel", None),
+    # Phase 3 slice 3B — participant roster + derived attendance +
+    # historical transcript of an ENDED class (teacher-only).
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/participants", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/attendance", None),
+    ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/transcript", None),
+    # Phase 3 slice 3C — single-use WebSocket ticket (teacher-only).
+    ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/ws-ticket", None),
 ]
 
 ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -255,6 +278,7 @@ def _path(template: str) -> str:
         topic_id=uuid.uuid4(),
         lesson_id=uuid.uuid4(),
         material_id=uuid.uuid4(),
+        class_id=uuid.uuid4(),
         school_code="MISSING",
     )
 
@@ -295,7 +319,7 @@ def test_public_routes_never_answer_401_or_403(
 def test_route_inventory_is_exactly_the_matrix() -> None:
     """No v1 endpoint may exist outside the role matrix — and vice versa.
 
-    The count pin (97) makes adding or removing a route a conscious
+    The count pin (113) makes adding or removing a route a conscious
     decision: a new endpoint must be listed in one of the five groups
     above or this test names it as unlisted.
     """
@@ -314,7 +338,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 97, f"route count changed: {len(actual)} != 97"
+    assert len(actual) == 113, f"route count changed: {len(actual)} != 113"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------
