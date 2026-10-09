@@ -33,9 +33,16 @@ guarded by ``get_current_student``:
   — regardless of length (5 minutes qualifies), regardless of the 50%
   attendance verdict, and it survives leaving the enrollment or switching
   teachers. Never-joined students and unknown ids get the SAME 404 (L6).
-  409 while the class is scheduled/live/cancelled: the live classroom
-  reads through the WebSocket (3C/3D), never this endpoint. Senders
-  expose role and display name only — never an email address.
+   409 while the class is scheduled/live/cancelled: the live classroom
+   reads through the WebSocket (3C/3D), never this endpoint. Senders
+   expose role and display name only — never an email address.
+- ``GET /me/classes/{class_id}/messages`` — the slice 3D RECOVERY read:
+   the same exclusive ``after_sequence`` cursor, but reachable while the
+   class is LIVE so a reconnecting client can close the gap between its
+   last processed sequence and the live stream. Live reads demand an
+   ACTIVE enrollment in this class's offering (a class id alone grants
+   nothing), ENDED reads keep the participation policy above verbatim,
+   and SCHEDULED/CANCELLED answer 409.
 
 Every class read mechanically ends an overdue ``live`` class
 (``reason: "auto"``) and commits that transition — the system must not
@@ -237,6 +244,69 @@ def read_my_transcript(
 ) -> list[ClassMessageRead]:
     try:
         messages, auto_ended = classroom_service.get_transcript_for_student(
+            session,
+            student,
+            class_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+    except LearningError as exc:
+        raise _http_error(exc) from exc
+    if auto_ended:
+        # The read mechanically ended an overdue class: persist it.
+        session.commit()
+    return messages
+
+
+@router.get(
+    "/{class_id}/messages",
+    response_model=list[ClassMessageRead],
+    summary="Recover classroom messages after your last processed sequence",
+    description=(
+        "The reconnection cursor read of the LIVE classroom (slice 3D): "
+        "every message with ``sequence`` strictly greater than "
+        "``after_sequence`` (EXCLUSIVE — replay the last sequence you saw "
+        "and nothing duplicates), bounded by ``limit`` and ordered "
+        "``sequence`` ASC, the ONLY authoritative order (unique per class, "
+        "so it is total and stable). Use it after a fresh WebSocket "
+        "connection is already open — subscribe first, then fetch this "
+        "page, then deduplicate against live ``message.created`` events by "
+        "sequence: a message committed while your socket was down stays "
+        "discoverable here even if its notification was lost, and recovery "
+        "itself never creates a message. While the class is LIVE this "
+        "requires CURRENT authorization: an ACTIVE enrollment in this "
+        "class's offering (no enrollment ⇒ the SAME 404 as an unknown "
+        "class id, L6 existence leak). For an ENDED class the exact slice "
+        "3B historical policy applies: a durable participation segment "
+        "for you in this class, regardless of current enrollment, teacher "
+        "switch or the 50% attendance verdict. SCHEDULED and CANCELLED "
+        "classes expose nothing (409). Each message exposes only "
+        "presentation-safe data — id, sequence, sender role + display "
+        "name, body, timestamp — never an email address, user id or "
+        "connection id. Read-only: messages are immutable once written. "
+        "An overdue live class is ended mechanically (reason: auto) "
+        "first, and this read commits that transition."
+    ),
+    responses={
+        200: {"description": "A page of messages (possibly empty)"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not a student account"},
+        404: {"description": "Unknown class id, or you are not (or never were) inside it"},
+        409: {"description": "The class never happened (scheduled/cancelled)"},
+        422: {"description": "Invalid cursor or limit"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def read_class_messages(
+    request: Request,
+    class_id: uuid.UUID,
+    after_sequence: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
+    session: Session = Depends(get_db),
+    student: Student = Depends(get_current_student),
+) -> list[ClassMessageRead]:
+    try:
+        messages, auto_ended = classroom_service.read_messages_for_student(
             session,
             student,
             class_id,

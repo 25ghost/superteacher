@@ -437,6 +437,22 @@ def test_students_are_only_reachable_through_their_own_offering() -> None:
 
 
 def test_no_messaging_payments_ratings_or_assignments_exist() -> None:
+    """No DMs, payments, ratings or assignments — with ONE narrow carve-out.
+
+    Slice 3D made classroom chat a real (single-class) product surface,
+    read through the WebSocket or through its two dedicated
+    ``/messages`` recovery cursors — those two routes are the carve-out
+    and the set is asserted EXACT, so a third route carrying a banned
+    segment still fails here. Everything else named below (DMs,
+    conversations, payments, ratings, assignments, ...) must not exist.
+    """
+    allowed = {
+        ("GET", "/me/classes/{class_id}/messages"),
+        (
+            "GET",
+            "/me/teacher/offerings/{offering_id}/classes/{class_id}/messages",
+        ),
+    }
     banned_segments = (
         "message",
         "conversation",
@@ -455,9 +471,24 @@ def test_no_messaging_payments_ratings_or_assignments_exist() -> None:
         "search",
         "directory",
     )
-    for method, path in _v1_route_table():
-        for banned in banned_segments:
-            assert banned not in path, f"{method} {path} introduces '{banned}'"
+    violations = [
+        (method, path, banned)
+        for method, path in _v1_route_table()
+        if (method, path) not in allowed
+        for banned in banned_segments
+        if banned in path
+    ]
+    assert not violations, f"banned-segment routes: {violations}"
+    # The carve-out itself must stay exact: no stale allowances, and no
+    # slice-3D route silently added twice.
+    carved = {
+        (method, path)
+        for method, path in _v1_route_table()
+        if "message" in path
+    }
+    assert carved == allowed, (
+        f"message routes drifted: {sorted(carved ^ allowed)}"
+    )
 
 
 def test_the_material_vocabulary_is_video_and_pdf_only() -> None:
