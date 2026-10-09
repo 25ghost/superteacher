@@ -61,6 +61,8 @@ EVENT_CLASS_ENDED = "class.ended"
 #: enrollment ends. Never forwarded to a client as-is (§28).
 EVENT_CONNECTION_REVOKE = "connection.revoke"
 EVENT_HEARTBEAT = "presence.heartbeat"
+EVENT_MESSAGE_SEND = "message.send"
+EVENT_MESSAGE_CREATED = "message.created"
 EVENT_ERROR = "error"
 
 # --- client-facing error codes -------------------------------------------------------
@@ -69,6 +71,14 @@ ERROR_CLASS_NOT_LIVE = "CLASS_NOT_LIVE"
 ERROR_NOT_AUTHORIZED = "NOT_AUTHORIZED"
 ERROR_HEARTBEAT_REJECTED = "HEARTBEAT_REJECTED"
 ERROR_INTERNAL_ERROR = "INTERNAL_ERROR"
+#: Slice 3D — message submission failures (advisory unless the class or
+#: the authorization that justified the socket is gone, which closes):
+#: a frame that is not a valid ``message.send`` payload.
+ERROR_INVALID_MESSAGE = "INVALID_MESSAGE"
+#: same ``client_message_id`` from the same sender with a different body.
+ERROR_CLIENT_MESSAGE_ID_CONFLICT = "CLIENT_MESSAGE_ID_CONFLICT"
+#: over the per-participant-per-class message quota (10 / 10 s).
+ERROR_RATE_LIMITED = "RATE_LIMITED"
 
 __all__ = [
     "NORMAL_CLOSURE",
@@ -87,10 +97,15 @@ __all__ = [
     "EVENT_CLASS_ENDED",
     "EVENT_CONNECTION_REVOKE",
     "EVENT_HEARTBEAT",
+    "EVENT_MESSAGE_SEND",
+    "EVENT_MESSAGE_CREATED",
     "EVENT_ERROR",
     "ERROR_INVALID_CONTROL_MESSAGE",
     "ERROR_CLASS_NOT_LIVE",
     "ERROR_NOT_AUTHORIZED",
     "ERROR_HEARTBEAT_REJECTED",
     "ERROR_INTERNAL_ERROR",
+    "ERROR_INVALID_MESSAGE",
+    "ERROR_CLIENT_MESSAGE_ID_CONFLICT",
+    "ERROR_RATE_LIMITED",
 ]

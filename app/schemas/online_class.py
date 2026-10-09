@@ -153,6 +153,42 @@ class ClassMessageRead(BaseModel):
     sent_at: datetime
 
 
+class MessageSendFrame(BaseModel):
+    """One ``message.send`` frame of the live classroom (slice 3D).
+
+    The ONLY client-originated application message of the WebSocket: the
+    connection itself decides sender, role and class, so this schema
+    carries no identity field at all — a client-supplied ``sender``,
+    ``sequence``, ``message_id`` or timestamp is simply ignored
+    (``extra="ignore"``; unlike HTTP bodies this frame must stay
+    forward-compatible, and an unknown key must never influence the
+    record). The two client-chosen values are both bounded:
+
+    - ``client_message_id`` — the retry/idempotency key, trimmed and
+      1..64 characters; the same value from the same sender in the same
+      class can never create a second message;
+    - ``body`` — 1..2000 characters, whitespace-only rejected.
+
+    A payload that fails validation is refused with the stable client
+    code ``INVALID_MESSAGE`` before any database work happens.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["message.send"]
+    client_message_id: str = Field(min_length=1, max_length=64)
+    body: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _reject_blank_values(self) -> "MessageSendFrame":
+        self.client_message_id = self.client_message_id.strip()
+        if not self.client_message_id:
+            raise ValueError("client_message_id must not be blank")
+        if not self.body.strip():
+            raise ValueError("body must not be blank")
+        return self
+
+
 class AttendanceSegmentRead(BaseModel):
     """One participation interval of one student in one class."""
 

@@ -151,6 +151,13 @@ class Settings(BaseSettings):
     # in tests (staleness is asserted with a sub-second timeout).
     WS_HEARTBEAT_INTERVAL_SECONDS: int = 20
     WS_STALE_TIMEOUT_SECONDS: int = 60
+    # Message quota of the live classroom (Phase 3, slice 3D, §41):
+    # at most WS_MESSAGE_RATE_LIMIT new messages from ONE participant in
+    # ONE class per sliding WS_MESSAGE_RATE_WINDOW_SECONDS. Enforced by a
+    # process-local limiter (see app.services.message_rate_limiter for its
+    # honest scope); an idempotent retry never consumes quota.
+    WS_MESSAGE_RATE_LIMIT: int = 10
+    WS_MESSAGE_RATE_WINDOW_SECONDS: int = 10
 
     @property
     def jwt_secret(self) -> str:
