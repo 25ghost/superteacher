@@ -49,6 +49,12 @@ here, only the rules the WebSocket handshake and heartbeat delegate to:
   single owner of segment rules). Refusals raise
   :class:`ClassroomConnectionRefused` with a transport-neutral reason the
   endpoint maps to a close code.
+- :func:`revalidate_live_connection` — the same identity/teaching
+  authority re-read for a socket that is ALREADY OPEN (account still
+  active; a teacher still an eligible owner of this class's offering):
+  read-only, no sweep, no segment, and it never reports ``class_not_live``
+  — the heartbeat sweep owns the class lifecycle. Refusals reuse
+  ``REASON_NOT_AUTHORIZED`` so the live loop closes revoked sockets 4003.
 - :func:`heartbeat_teacher` — the teacher-side probe: sweep + "still
   live?", no segment to touch.
 
@@ -835,6 +841,61 @@ def authorize_ws_connection(
 
     # Administrator (or any other role): not a classroom participant (§6).
     raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
+
+
+def revalidate_live_connection(
+    session: Session, user: User, class_id: uuid.UUID
+) -> None:
+    """Recheck an OPEN socket's entitlement — mid-session revocation.
+
+    The handshake (:func:`authorize_ws_connection`) and the ticket before
+    it proved identity and teaching authority ONCE, yet a socket outlives
+    that proof: the live loop therefore re-reads the durable state while
+    the connection is still open — the account must still be ACTIVE, and
+    a teacher must still be an eligible owner of this class's offering
+    (verification status + category + approved application, ownership,
+    approved context). Read-only, with no sweep, no segment and no
+    registration side effects, so the WebSocket may call it both from a
+    heartbeat probe and from a broadcast fan-out.
+
+    Refusals carry the handshake's transport-neutral
+    ``REASON_NOT_AUTHORIZED`` (the endpoint maps it to 4003, §29).
+    ``class_not_live`` is deliberately NEVER raised here: the class
+    lifecycle stays the heartbeat sweep's decision, and mixing the two
+    would let an authorization probe end a class.
+
+    The caller owns the transaction; nothing is committed here.
+    """
+    # §11 step 5 again, mid-session: an account revoked after the
+    # handshake never keeps its socket.
+    if user.status != UserStatus.ACTIVE.value:
+        raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
+
+    if user.role != UserRole.TEACHER.value:
+        # Students: account state is the only durable fact this probe
+        # re-reads — enrollment revocation already owns the §29
+        # ``connection.revoke`` path, and attendance is the segment's.
+        return
+
+    profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+    if profile is None or not teaching_authorization.is_eligible_teacher(
+        session, profile
+    ):
+        raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
+    class_session = class_repo.get_by_id(session, class_id)
+    offering = (
+        None
+        if class_session is None
+        else offering_repo.get_by_id(session, class_session.teaching_offering_id)
+    )
+    if (
+        offering is None
+        or offering.teacher_id != profile.id
+        or not teaching_authorization.has_approved_context(
+            session, profile.id, offering.learning_context_id
+        )
+    ):
+        raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
 
 
 def heartbeat_teacher(session: Session, class_id: uuid.UUID) -> bool:

@@ -66,15 +66,33 @@ class LiveConnection:
     #: Monotonic timestamp of the last received client frame (§32).
     last_activity: float = field(default_factory=time.monotonic)
     cleaned: bool = False
+    #: Set the moment a live revalidation finds this identity's
+    #: entitlement gone (§11 step 5 re-run while the socket is open —
+    #: deactivated account, revoked teaching authorization, ended
+    #: enrollment). From that instant NO broadcast reaches this socket;
+    #: only the teardown frame, sent with ``force=True``, may still go
+    #: out on the way to the close.
+    revoked: bool = False
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-    async def send_json(self, payload: dict) -> bool:
-        """Send one frame; False when the socket is already gone."""
+    async def send_json(self, payload: dict, *, force: bool = False) -> bool:
+        """Send one frame; False when the socket is gone or revoked.
+
+        ``force`` exists for the revocation teardown alone: the safe
+        ``error`` frame that precedes a 4003 must still reach the client
+        after ``revoked`` was set, while every fan-out frame is refused
+        from that moment on (checked again under the send lock, so a
+        broadcast can never slip in behind a detected revocation).
+        """
         if self.cleaned and self.websocket is None:  # pragma: no cover - defensive
+            return False
+        if self.revoked and not force:
             return False
         try:
             async with self._send_lock:
+                if self.revoked and not force:
+                    return False
                 await self.websocket.send_json(payload)
             return True
         except Exception:  # noqa: BLE001 — a dead socket must never break fan-out

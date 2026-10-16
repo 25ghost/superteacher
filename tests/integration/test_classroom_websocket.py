@@ -22,9 +22,12 @@ Slice 3C end-to-end contract (§38-§45, §54) against ``super_teacher_db_test``
 - **teardown paths**: stale sockets (1008 + segment closed), invalid
   frames (advisory ``error`` then class.ended still arrives), enrollment
   revocation (``error NOT_AUTHORIZED`` + 4003 for the student and
-  ``presence.left`` for the teacher), heartbeat auto-end of an overdue
-  class (class.ended + 1000), and ``class.started`` reaching a raw
-  PostgreSQL LISTEN consumer (§25).
+  ``presence.left`` for the teacher), teaching authorization or the
+  account revoked WHILE the socket is open (heartbeat-driven and
+  broadcast-driven alike — ``error NOT_AUTHORIZED`` + 4003, never a
+  further broadcast), heartbeat auto-end of an overdue class
+  (class.ended + 1000), and ``class.started`` reaching a raw PostgreSQL
+  LISTEN consumer (§25).
 
 The app client is ENTERED (``with TestClient``): HTTP requests and every
 WebSocket then share ONE portal event loop. The realtime bus binds the
@@ -1444,6 +1447,198 @@ def test_enrollment_leave_revokes_the_socket(
     )
     assert response.status_code == 404
     assert response.json()["detail"] == f"no online class with id {class_id}"
+
+
+def test_a_revoked_teaching_authorization_closes_the_live_teacher_socket(
+    api_client: TestClient, classroom: dict
+) -> None:
+    """A teacher's live socket dies WITH the teaching authorization (§11/§29).
+
+    The ticket proves eligibility at handshake time only: revoking
+    ``teachers.verification_status`` afterwards must end the already-open
+    socket at its NEXT heartbeat — ``error NOT_AUTHORIZED`` then 4003 —
+    with ``presence.left`` for everyone else, attendance untouched
+    (teachers own no segment) and no reconnect anywhere.
+    """
+    engine = classroom["engine"]
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+    teacher_ref = _ref(class_id, classroom["teacher"]["user_id"])
+    student_ref = _ref(class_id, classroom["student"]["user_id"])
+    teacher_ticket = _mint_teacher(api_client, classroom, class_id)["ticket"]
+    student_ticket = _mint_student(api_client, classroom, class_id)["ticket"]
+
+    with api_client.websocket_connect(_ws_url(class_id, teacher_ticket)) as teacher_ws:
+        assert teacher_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+        with api_client.websocket_connect(
+            _ws_url(class_id, student_ticket)
+        ) as student_ws:
+            assert student_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+            assert student_ws.receive_json()["participant"]["participant_ref"] == student_ref
+            assert teacher_ws.receive_json()["participant"]["participant_ref"] == student_ref
+
+            # Teaching authorization revoked while the socket stays open.
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE teachers SET verification_status = 'suspended' "
+                        "WHERE user_id = :id"
+                    ),
+                    {"id": uuid.UUID(classroom["teacher"]["user_id"])},
+                )
+
+            # No message.send anywhere: the heartbeat probe alone revalidates.
+            teacher_ws.send_json({"type": "presence.heartbeat"})
+            assert teacher_ws.receive_json() == {
+                "type": "error",
+                "code": "NOT_AUTHORIZED",
+            }
+            _expect_close(teacher_ws, 4003)
+            _wait_gone(class_id, teacher_ref)
+
+            # The room heard exactly one thing about it: presence.left.
+            assert student_ws.receive_json() == {
+                "type": "presence.left",
+                "participant": {
+                    "role": "teacher",
+                    "display_name": "Classroom Teacher",
+                    "participant_ref": teacher_ref,
+                },
+            }
+
+            # The class itself is untouched and still serves the student.
+            student_ws.send_json(
+                {
+                    "type": "message.send",
+                    "client_message_id": "cid-after-teacher-revoke",
+                    "body": "still live",
+                }
+            )
+            created = student_ws.receive_json()
+            assert created["type"] == "message.created"
+            assert created["body"] == "still live"
+            assert created["sender"]["role"] == "student"
+
+    assert _class_row(engine, class_id).status == "live"
+
+
+def test_a_deactivated_teacher_is_closed_by_the_next_broadcast(
+    api_client: TestClient, classroom: dict
+) -> None:
+    """A socket that only RECEIVES loses its broadcast stream too (§29).
+
+    This teacher never sends a frame — no heartbeat, no ``message.send``
+    — so the revocation can only be caught by the fan-out itself: the
+    next ``message.created`` must first close the socket (``error
+    NOT_AUTHORIZED`` + 4003) and must never be delivered to it, while the
+    committed message still reaches the class.
+    """
+    engine = classroom["engine"]
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+    teacher_ref = _ref(class_id, classroom["teacher"]["user_id"])
+    student_ref = _ref(class_id, classroom["student"]["user_id"])
+    teacher_ticket = _mint_teacher(api_client, classroom, class_id)["ticket"]
+    student_ticket = _mint_student(api_client, classroom, class_id)["ticket"]
+
+    with api_client.websocket_connect(_ws_url(class_id, teacher_ticket)) as teacher_ws:
+        assert teacher_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+        with api_client.websocket_connect(
+            _ws_url(class_id, student_ticket)
+        ) as student_ws:
+            assert student_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+            assert student_ws.receive_json()["participant"]["participant_ref"] == student_ref
+            assert teacher_ws.receive_json()["participant"]["participant_ref"] == student_ref
+
+            # The teacher's account is deactivated; the socket stays open
+            # and the teacher's client goes completely silent.
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE users SET status = 'disabled' WHERE id = :id"),
+                    {"id": uuid.UUID(classroom["teacher"]["user_id"])},
+                )
+
+            # The student's message is exactly what the revoked teacher
+            # would have heard: delivery revalidates BEFORE handing the
+            # frame over, so the refusal is the teacher's next frame.
+            student_ws.send_json(
+                {
+                    "type": "message.send",
+                    "client_message_id": "cid-while-silent",
+                    "body": "hello?",
+                }
+            )
+            assert teacher_ws.receive_json() == {
+                "type": "error",
+                "code": "NOT_AUTHORIZED",
+            }
+            _expect_close(teacher_ws, 4003)
+            _wait_gone(class_id, teacher_ref)
+
+    # The broadcast was never stolen by the revocation: the message the
+    # revoked teacher must not hear is committed exactly once.
+    assert _class_message_count(engine, class_id) == 1
+
+
+def test_a_deactivated_student_closes_its_socket_and_segment(
+    api_client: TestClient, classroom: dict
+) -> None:
+    """Account status is revalidated for students, with attendance cleanup.
+
+    Same 4003 contract as the teacher path; the ONE teardown path still
+    closes the open attendance segment even though the account behind it
+    is already disabled.
+    """
+    engine = classroom["engine"]
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+    student_id = _student_profile_id(engine, classroom["student"]["user_id"])
+    teacher_ref = _ref(class_id, classroom["teacher"]["user_id"])
+    student_ref = _ref(class_id, classroom["student"]["user_id"])
+    teacher_ticket = _mint_teacher(api_client, classroom, class_id)["ticket"]
+    student_ticket = _mint_student(api_client, classroom, class_id)["ticket"]
+
+    with api_client.websocket_connect(_ws_url(class_id, teacher_ticket)) as teacher_ws:
+        assert teacher_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+        with api_client.websocket_connect(
+            _ws_url(class_id, student_ticket)
+        ) as student_ws:
+            assert student_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+            assert student_ws.receive_json()["participant"]["participant_ref"] == student_ref
+            assert teacher_ws.receive_json()["participant"]["participant_ref"] == student_ref
+
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE users SET status = 'disabled' WHERE id = :id"),
+                    {"id": uuid.UUID(classroom["student"]["user_id"])},
+                )
+
+            student_ws.send_json({"type": "presence.heartbeat"})
+            assert student_ws.receive_json() == {
+                "type": "error",
+                "code": "NOT_AUTHORIZED",
+            }
+            _expect_close(student_ws, 4003)
+            _wait_gone(class_id, student_ref)
+
+            # The class is still live, so the room hears presence.left.
+            assert teacher_ws.receive_json() == {
+                "type": "presence.left",
+                "participant": {
+                    "role": "student",
+                    "display_name": "Classroom Student",
+                    "participant_ref": student_ref,
+                },
+            }
+
+    segments = _segments(engine, class_id)
+    assert len(segments) == 1
+    assert segments[0].student_id == student_id
+    assert segments[0].left_at is not None
+    assert _class_row(engine, class_id).status == "live"
 
 
 # --- lifecycle (§22/§36/§54) --------------------------------------------------------------------

@@ -85,9 +85,22 @@ Heartbeat (§32/§33)
     rides the existing ``heartbeat`` service (last-seen touch AND the
     auto-end sweep: a class whose window passed ends here, persists, and
     its ``class.ended`` event closes every socket). For teachers it is a
-    class-still-live probe. Any frame counts as liveness; a socket silent
-    for ``WS_STALE_TIMEOUT_SECONDS`` (60 s) is terminated with 1008 and
-    its segment closed (§33).
+    class-still-live probe. Every probe FIRST re-reads the connection's
+    durable authorization (``revalidate_live_connection``: account still
+    active, teacher still an eligible owner) — connection-time
+    authentication never outlives a revocation. Any frame counts as
+    liveness; a socket silent for ``WS_STALE_TIMEOUT_SECONDS`` (60 s) is
+    terminated with 1008 and its segment closed (§33).
+
+Revocation while the socket is open (§11 step 5 / §29)
+    Teaching authorization and account status are re-read at two points
+    without any polling loop: on every heartbeat probe, and on every
+    fan-out delivery (a socket that only RECEIVES still revalidates
+    before a single frame is handed over). A refusal marks the connection
+    revoked — from that instant no broadcast reaches it (the flag is
+    re-checked under the send lock, so nothing slips in behind a
+    detected revocation) — and the one teardown path closes it 4003 after
+    a safe ``error`` frame, exactly like the enrollment revoke below.
 
 Teardown (one idempotent path — §21/§22/§29)
     Close student segment (tolerating "already closed" — the class-end
@@ -287,6 +300,19 @@ def _heartbeat_worker(connection: LiveConnection) -> str:
     try:
         user = session.get(User, connection.user_id)
         if user is None:
+            connection.revoked = True
+            return "not_authorized"
+        # §11 step 5 again, mid-session: the account (and, for a teacher,
+        # the teaching authorization behind this socket) may have been
+        # revoked since the handshake — the probe re-reads the durable
+        # state instead of trusting connection-time authentication.
+        try:
+            classroom_service.revalidate_live_connection(
+                session, user, connection.class_id
+            )
+        except classroom_service.ClassroomConnectionRefused:
+            session.rollback()
+            connection.revoked = True
             return "not_authorized"
         if connection.role == "teacher":
             auto_ended = classroom_service.heartbeat_teacher(
@@ -312,6 +338,45 @@ def _heartbeat_worker(connection: LiveConnection) -> str:
     except Exception:
         session.rollback()
         logger.exception("websocket heartbeat failed")
+        return "error"
+    finally:
+        session.close()
+
+
+def _revalidate_worker(connection: LiveConnection) -> str:
+    """Delivery-side revocation probe for an OPEN socket (§11 step 5+).
+
+    A socket that only RECEIVES broadcasts never reaches the heartbeat
+    path on its own, so the fan-out re-reads the same durable state the
+    heartbeat checks (``classroom_service.revalidate_live_connection``)
+    before handing over an event — this is the probe that keeps a
+    revoked teacher from hearing one more word of the classroom.
+
+    Returns ``"not_authorized"`` only when the database itself says the
+    entitlement is gone (the connection is marked revoked here, the
+    earliest possible moment, so no later fan-out can start); a database
+    hiccup returns ``"error"`` and delivery continues — a probe must
+    never kill a healthy socket.
+    """
+    session = SessionLocal()
+    try:
+        user = session.get(User, connection.user_id)
+        if user is None:
+            connection.revoked = True
+            return "not_authorized"
+        try:
+            classroom_service.revalidate_live_connection(
+                session, user, connection.class_id
+            )
+        except classroom_service.ClassroomConnectionRefused:
+            connection.revoked = True
+            return "not_authorized"
+        return "ok"
+    except Exception:
+        logger.exception(
+            "websocket revalidation failed",
+            extra={"class_id": str(connection.class_id)},
+        )
         return "error"
     finally:
         session.close()
@@ -512,36 +577,63 @@ async def _cleanup_now(connection: LiveConnection, close_code: int | None) -> No
 
 def _install_hooks(connection: LiveConnection) -> None:
     """Wire bus delivery and cleanup onto a freshly registered socket."""
+    #: One event at a time per connection: the delivery-side revalidation
+    #: below runs in a thread, and without this lock two bus events could
+    #: resume out of publication order.
+    event_lock = asyncio.Lock()
 
     async def handle_event(event: dict) -> None:
-        event_type = event.get("type")
-        if event_type in (cc.EVENT_PRESENCE_JOINED, cc.EVENT_PRESENCE_LEFT):
-            participant = event.get("participant")
-            if isinstance(participant, dict):
-                # §19 shape exactly — routing keys never reach a client.
-                await connection.send_json(
-                    {"type": event_type, "participant": participant}
+        if connection.revoked:
+            # Revocation was already detected (heartbeat, an earlier
+            # event): nothing may reach this socket again (§29).
+            return
+        async with event_lock:
+            if connection.revoked:
+                return
+            # Re-read the durable authorization before ANY delivery: a
+            # revoked identity must not hear one more broadcast, even if
+            # its client never sends a single frame.
+            verdict = await asyncio.to_thread(_revalidate_worker, connection)
+            if verdict == "not_authorized":
+                await _reject(
+                    connection,
+                    error_code=cc.ERROR_NOT_AUTHORIZED,
+                    close_code=cc.WS_NOT_AUTHORIZED,
                 )
-        elif event_type in (cc.EVENT_CLASS_STARTED, cc.EVENT_CLASS_ENDED):
-            await connection.send_json(
-                {"type": event_type, "class_id": event.get("class_id")}
-            )
-            if event_type == cc.EVENT_CLASS_ENDED:
-                # §22 order: the event arrived, now close 1000 → cleanup
-                # unregisters (segments were finalized by the transition).
-                await connection.cleanup(close_code=cc.NORMAL_CLOSURE)
-        elif event_type == cc.EVENT_MESSAGE_CREATED:
-            # Already committed (the publish rode its transaction); the
-            # sender's own echo takes this exact path, so a participant
-            # sees each message once regardless of worker locality.
-            await connection.send_json(_client_event(event))
-        elif event_type == cc.EVENT_CONNECTION_REVOKE:
-            # §29: the student's enrollment ended — say something safe,
-            # then close 4003 and finalize their segment.
-            await connection.send_json(
-                {"type": cc.EVENT_ERROR, "code": cc.ERROR_NOT_AUTHORIZED}
-            )
-            await connection.cleanup(close_code=cc.WS_NOT_AUTHORIZED)
+                return
+            if connection.revoked:
+                # Revoked while this probe was in flight: the frame in
+                # hand is refused, not delivered.
+                return
+            event_type = event.get("type")
+            if event_type in (cc.EVENT_PRESENCE_JOINED, cc.EVENT_PRESENCE_LEFT):
+                participant = event.get("participant")
+                if isinstance(participant, dict):
+                    # §19 shape exactly — routing keys never reach a client.
+                    await connection.send_json(
+                        {"type": event_type, "participant": participant}
+                    )
+            elif event_type in (cc.EVENT_CLASS_STARTED, cc.EVENT_CLASS_ENDED):
+                await connection.send_json(
+                    {"type": event_type, "class_id": event.get("class_id")}
+                )
+                if event_type == cc.EVENT_CLASS_ENDED:
+                    # §22 order: the event arrived, now close 1000 → cleanup
+                    # unregisters (segments were finalized by the transition).
+                    await connection.cleanup(close_code=cc.NORMAL_CLOSURE)
+            elif event_type == cc.EVENT_MESSAGE_CREATED:
+                # Already committed (the publish rode its transaction); the
+                # sender's own echo takes this exact path, so a participant
+                # sees each message once regardless of worker locality.
+                await connection.send_json(_client_event(event))
+            elif event_type == cc.EVENT_CONNECTION_REVOKE:
+                # §29: the student's enrollment ended — say something safe,
+                # then close 4003 and finalize their segment.
+                await _reject(
+                    connection,
+                    error_code=cc.ERROR_NOT_AUTHORIZED,
+                    close_code=cc.WS_NOT_AUTHORIZED,
+                )
 
     async def cleanup(*, close_code: int | None = None) -> None:
         await _cleanup(connection, close_code)
@@ -597,8 +689,18 @@ async def _handle_frame(connection: LiveConnection, message: dict) -> None:
 
 
 async def _reject(connection: LiveConnection, *, error_code: str, close_code: int) -> None:
-    """Send a safe error frame, then close with the mapped code (§35)."""
-    await connection.send_json({"type": cc.EVENT_ERROR, "code": error_code})
+    """Send a safe error frame, then close with the mapped code (§35).
+
+    A NOT_AUTHORIZED refusal is a REVOCATION (§29): the connection is
+    marked revoked BEFORE the error frame goes out, so no fan-out can be
+    delivered behind it, while the frame itself — a teardown frame, never
+    a broadcast — still reaches the client through ``force=True``.
+    """
+    if error_code == cc.ERROR_NOT_AUTHORIZED:
+        connection.revoked = True
+    await connection.send_json(
+        {"type": cc.EVENT_ERROR, "code": error_code}, force=True
+    )
     await connection.cleanup(close_code=close_code)
 
 
