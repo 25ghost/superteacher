@@ -335,3 +335,22 @@ def _reset_rate_limiter(request: pytest.FixtureRequest) -> Iterator[None]:
 
         limiter.reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _class_end_sweeper_idle() -> Iterator[None]:
+    """Keep the slice 3E background class-end sweeper out of every test.
+
+    The sweeper starts with the application lifespan, which the
+    integration fixtures enter (``with TestClient(app)``). Left running it
+    would race tests that deliberately make a class overdue and assert a
+    specific transition — the same isolation the stale-socket timeout gets
+    from its own fixture. Tests that exercise automatic ending start the
+    sweeper explicitly (after shrinking its interval) or call
+    ``sweep_once()`` directly, so every sweep in the suite is deliberate.
+    """
+    from app.services.class_end_sweeper import class_end_sweeper
+
+    class_end_sweeper.stop()
+    yield
+    class_end_sweeper.stop()

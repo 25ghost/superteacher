@@ -17,7 +17,12 @@ endpoint stays thin and the repository only writes rows:
 - an overdue ``live`` class is ended mechanically (``reason: "auto"``) by
   :func:`ensure_not_overdue`, which every class touchpoint runs — the
   system must not stay LIVE because a teacher forgot to press End. A read
-  that performs this transition reports it so the API layer can commit;
+  that performs this transition reports it so the API layer can commit.
+  Slice 3E adds :func:`end_due_classes`, the bounded batch the
+  application-lifecycle sweeper (``app.services.class_end_sweeper``) runs
+  even when nobody touches the class — both paths share one rule: an
+  automatic end records ``actual_ended_at = scheduled_end_at``, so a
+  delayed sweep never extends the class or anyone's attendance;
 - every mutation writes exactly one ``auth_events`` row (subject = the
   teacher for lifecycle events; student join/leave events arrive with the
   classroom in a later slice), with ``actor_user_id`` None: each caller
@@ -273,6 +278,16 @@ def _end_internal(
     it), so a manual End and the automatic end of the same class cannot
     both succeed. Attendance segments are finalized here as well, so no
     open segment can outlive the class.
+
+    ``now`` IS the authoritative end moment this transition records, and
+    the two callers deliberately pass different ones: the teacher's End
+    passes the actual (early) end time, while every automatic end passes
+    the class's ``scheduled_end_at`` (floored by any still-open segment's
+    ``joined_at`` — see :func:`_auto_end_if_due`) — a sweep that runs
+    seconds or minutes late must never stretch the class, and nobody may
+    accrue attendance past the moment the timetable said the class was
+    over (§4 of slice 3E). Segments therefore close at
+    ``actual_ended_at``, not at some later cleanup execution time.
     """
     _require_transition(class_session, OnlineClassStatus.ENDED.value)
     class_session.status = OnlineClassStatus.ENDED.value
@@ -326,6 +341,41 @@ def _end_internal(
     )
 
 
+def _auto_end_if_due(
+    session: Session, class_session: OnlineClassSession, *, now: datetime
+) -> bool:
+    """End ONE already row-locked class whose scheduled window has closed.
+
+    The single place the automatic cutoff is decided (§4 of slice 3E):
+    an overdue ``live`` class ends at its ``scheduled_end_at``, so a
+    sweep — however late it runs — can never stretch the class or anyone's
+    attendance past the timetable. Any other status (or a window that is
+    still open) is a no-op; returns True only when THIS call performed
+    the transition. The class row lock held by the caller is what makes
+    a concurrent manual End or a concurrent sweep leave exactly one
+    winner: the loser re-reads ENDED here and does nothing.
+    """
+    if class_session.status != OnlineClassStatus.LIVE.value:
+        return False
+    cutoff = _as_aware_utc(class_session.scheduled_end_at)
+    if cutoff > now:
+        return False
+    # Integrity floor: the end moment may never precede a segment this
+    # same transition closes (``left_at >= joined_at`` is a schema CHECK).
+    # In normal operation no segment can open after the class's scheduled
+    # end — every join sweeps first — so the floor leaves the cutoff
+    # untouched; it only guards a window rewritten underneath an
+    # already-open segment, keeping the transition valid instead of
+    # letting one stale row break the whole end.
+    latest_join = segment_repo.latest_open_joined_at(session, class_session.id)
+    if latest_join is not None:
+        latest_join = _as_aware_utc(latest_join)
+        if latest_join > cutoff:
+            cutoff = latest_join
+    _end_internal(session, class_session, now=cutoff, reason="auto")
+    return True
+
+
 def ensure_not_overdue(
     session: Session, class_id: uuid.UUID, *, now: datetime | None = None
 ) -> bool:
@@ -342,13 +392,40 @@ def ensure_not_overdue(
     class_session = class_repo.get_by_id_for_update(session, class_id)
     if class_session is None:
         return False
-    if (
-        class_session.status == OnlineClassStatus.LIVE.value
-        and _as_aware_utc(class_session.scheduled_end_at) <= now
-    ):
-        _end_internal(session, class_session, now=now, reason="auto")
-        return True
-    return False
+    return _auto_end_if_due(session, class_session, now=now)
+
+
+def end_due_classes(
+    session: Session, *, now: datetime | None = None, limit: int | None = None
+) -> int:
+    """End a bounded batch of overdue ``live`` classes; return the count.
+
+    The batch primitive behind the background sweeper (§3 of slice 3E):
+    read the due classes (``scheduled_end_at <= now``), then end each one
+    through the very same :func:`_auto_end_if_due` path the request-scoped
+    sweeps use — one implementation of ending rules, one audit event, one
+    ``class.ended`` publication per class, transactional with the
+    transition. Nothing commits here: the sweeper owns the short-lived
+    session this ran in.
+
+    Multi-worker safe without any process-local lock: every worker locks
+    each class row (``SELECT ... FOR UPDATE``) and re-checks the state
+    under that lock, so N concurrent sweeps of the same class produce ONE
+    transition — the losers see ENDED and skip it. ``limit`` bounds the
+    batch so a single pass cannot monopolize the connection pool.
+    """
+    now = now or _now()
+    due = class_repo.list_due_live(session, now)
+    if limit is not None:
+        due = due[: max(0, limit)]
+    ended = 0
+    for candidate in due:
+        locked = class_repo.get_by_id_for_update(session, candidate.id)
+        if locked is None:
+            continue
+        if _auto_end_if_due(session, locked, now=now):
+            ended += 1
+    return ended
 
 
 def _end_due_for_offering(
@@ -360,12 +437,8 @@ def _end_due_for_offering(
         session, now, teaching_offering_id=teaching_offering_id
     ):
         locked = class_repo.get_by_id_for_update(session, due.id)
-        if (
-            locked is not None
-            and locked.status == OnlineClassStatus.LIVE.value
-            and _as_aware_utc(locked.scheduled_end_at) <= now
-        ):
-            _end_internal(session, locked, now=now, reason="auto")
+        if locked is not None:
+            _auto_end_if_due(session, locked, now=now)
 
 
 # --- teacher surface ----------------------------------------------------------------

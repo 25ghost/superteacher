@@ -188,6 +188,24 @@ def close_open_segments_for_class(
     return result.rowcount or 0
 
 
+def latest_open_joined_at(
+    session: Session, class_session_id: uuid.UUID
+) -> datetime | None:
+    """The newest ``joined_at`` among this class's still-open segments.
+
+    The slice 3E automatic-end floor: an end transition may never record
+    an ``actual_ended_at`` that precedes a segment the same transaction
+    closes (the schema's ``left_at >= joined_at`` CHECK states exactly
+    that rule). Read while the class row is locked, so no join can slip
+    in between this read and the bulk close.
+    """
+    stmt = select(func.max(ClassAttendanceSegment.joined_at)).where(
+        ClassAttendanceSegment.class_session_id == class_session_id,
+        ClassAttendanceSegment.left_at.is_(None),
+    )
+    return session.scalar(stmt)
+
+
 def list_for_class(
     session: Session, class_session_id: uuid.UUID
 ) -> list[ClassAttendanceSegment]:

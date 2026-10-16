@@ -165,6 +165,16 @@ class Settings(BaseSettings):
     WS_MESSAGE_RATE_LIMIT: int = 10
     WS_MESSAGE_RATE_WINDOW_SECONDS: int = 10
 
+    # Scheduled class ending (Phase 3, slice 3E). The background sweeper
+    # runs with the application lifecycle (no external scheduler): it sweeps
+    # immediately at startup — recovering LIVE classes whose window closed
+    # while the process was down — and then every CLASS_END_SWEEP_INTERVAL_
+    # SECONDS (re-read each pass, so tests can shrink it live). Each pass
+    # ends at most CLASS_END_SWEEP_BATCH_LIMIT classes in one short-lived
+    # session, then releases it before sleeping.
+    CLASS_END_SWEEP_INTERVAL_SECONDS: float = 5.0
+    CLASS_END_SWEEP_BATCH_LIMIT: int = 50
+
     @property
     def jwt_secret(self) -> str:
         """The JWT signing secret, validated against the environment.

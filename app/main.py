@@ -27,8 +27,10 @@ slowapi to prevent brute-force and account-spam attacks. The limits are
 configurable via RATE_LIMIT_LOGIN, RATE_LIMIT_REGISTER and
 RATE_LIMIT_REFRESH environment variables.
 """
+import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +47,7 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
 from app.services.auth_service import AuthError
+from app.services.class_end_sweeper import class_end_sweeper
 from app.services.registration_service import RegistrationError
 from app.services.student_service import ProfileError
 
@@ -63,7 +66,30 @@ settings.validate_startup()
 
 _is_production = settings.ENVIRONMENT.lower() == "production"
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Application lifecycle: the scheduled-class sweeper (Phase 3, slice 3E).
+
+    Starting the sweeper here (rather than on the first request) is what
+    makes class ending genuinely automatic: its first pass runs inside the
+    thread, so a ``live`` class whose window closed while this process was
+    down is ended at startup — no teacher End press, no client request.
+    Shutdown stops and joins the thread, so no background task or database
+    session outlives the application. Nothing else in the lifecycle is
+    touched (the realtime listener stays lazy, started by the first
+    WebSocket registration).
+    """
+    class_end_sweeper.start()
+    try:
+        yield
+    finally:
+        # Joining must not block the event loop on the way out.
+        await asyncio.to_thread(class_end_sweeper.stop)
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="SuperTeacher API",
     description=(
         "SuperTeacher backend API for the Student Registration Portal — "
