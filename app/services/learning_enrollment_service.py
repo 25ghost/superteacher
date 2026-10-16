@@ -36,9 +36,10 @@ from app.repositories import learning_enrollment_repository as enrollment_repo
 from app.repositories import teaching_offering_repository as offering_repo
 from app.realtime.event_bus import get_event_bus
 from app.schemas.learning import LearningEnrollmentRead
-from app.services import learning_context_service
+from app.services import learning_context_service, teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
+    LearningForbiddenError,
     LearningNotFoundError,
 )
 
@@ -71,9 +72,12 @@ def enroll(
     """Enroll the caller into one active offering (then audit it).
 
     Order of operations: offering exists (404) → offering active (409) →
-    no active enrollment in that context yet (409) → insert → audit. The
-    duplicate pre-check mirrors the partial unique index so the 409 reads
-    like a domain rule; the index stays the final protection.
+    teacher still eligible and the context still in their approved scope
+    (403 — a suspended teacher or a narrowed scope stops new enrollments
+    immediately) → no active enrollment in that context yet (409) →
+    insert → audit. The duplicate pre-check mirrors the partial unique
+    index so the 409 reads like a domain rule; the index stays the final
+    protection.
     """
     offering = offering_repo.get_by_id(session, offering_id)
     if offering is None:
@@ -82,6 +86,10 @@ def enroll(
         raise LearningConflictError(
             f"teaching offering is {offering.status!r} and is not "
             "accepting enrollments"
+        )
+    if not teaching_authorization.offering_is_teachable(session, offering):
+        raise LearningForbiddenError(
+            "this offering is not currently available for enrollment"
         )
 
     context_id = offering.learning_context_id

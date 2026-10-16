@@ -74,6 +74,7 @@ from app.schemas.student_content import (
     StudentMaterialRead,
     StudentTopicRead,
 )
+from app.services import teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -148,6 +149,10 @@ def _active_enrollment(
     if offering is None:
         raise LearningNotFoundError(
             f"no active learning enrollment with id {enrollment_id}"
+        )
+    if not teaching_authorization.offering_is_teachable(session, offering):
+        raise LearningForbiddenError(
+            "this offering is not currently available"
         )
     return EnrollmentRef(enrollment=enrollment, offering=offering)
 

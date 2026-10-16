@@ -198,12 +198,26 @@ def _window(offset_hours: float = 0.0, duration_hours: float = 1.0) -> tuple[dat
 @pytest.fixture()
 def classroom(clean_db, api_client: TestClient):
     """Seeded catalog + logged-in teacher/student + one owned offering."""
+    from app.models.user import User
+    from app.schemas.learning import TeachingOfferingCreate
+    from tests.conftest import approve_teacher_for_payloads
+
     engine = clean_db
     catalog = _seed_catalog(engine)
     teacher = _seed_account(engine, role="teacher")
     student = _seed_account(engine, role="student")
     teacher_header = _header(_login(api_client, teacher))
     student_header = _header(_login(api_client, student))
+
+    session = _session(engine)
+    try:
+        teacher_user = session.get(User, uuid.UUID(teacher["user_id"]))
+        approve_teacher_for_payloads(
+            session, teacher_user, [TeachingOfferingCreate(**catalog)]
+        )
+        session.commit()
+    finally:
+        session.close()
 
     offering = api_client.post(
         "/api/v1/me/teacher/offerings", json=catalog, headers=teacher_header
@@ -546,8 +560,24 @@ def test_teacher_ticket_requires_live_owned_class(
 
     # A foreign teacher (approved, but not the offering's) gets the SAME
     # 404 template for our offering as for an unknown one — no existence
-    # leak either way (L6).
+    # leak either way (L6). Eligibility is granted (no scope) so the
+    # ownership lookup — not the verification gate — produces the 404.
     foreign = _seed_account(engine, role="teacher")
+    session = _session(engine)
+    try:
+        from app.models.teacher import Teacher
+        from app.models.user import User
+        from tests.conftest import grant_teaching_approval
+
+        foreign_profile = session.scalar(
+            select(Teacher).where(
+                Teacher.user_id == session.get(User, uuid.UUID(foreign["user_id"])).id
+            )
+        )
+        grant_teaching_approval(session, foreign_profile, learning_context_ids=[])
+        session.commit()
+    finally:
+        session.close()
     foreign_header = _header(_login(api_client, foreign))
     response = _teacher_ticket_request(api_client, classroom, live, header=foreign_header)
     assert response.status_code == 404
@@ -606,6 +636,19 @@ def test_a_student_of_another_offering_gets_the_same_404(
     engine = classroom["engine"]
     other_teacher = _seed_account(engine, role="teacher")
     other_header = _header(_login(api_client, other_teacher))
+    session = _session(engine)
+    try:
+        from app.models.user import User
+        from app.schemas.learning import TeachingOfferingCreate
+        from tests.conftest import approve_teacher_for_payloads
+
+        other_user = session.get(User, uuid.UUID(other_teacher["user_id"]))
+        approve_teacher_for_payloads(
+            session, other_user, [TeachingOfferingCreate(**classroom["catalog"])]
+        )
+        session.commit()
+    finally:
+        session.close()
     published = api_client.post(
         "/api/v1/me/teacher/offerings",
         json=classroom["catalog"],

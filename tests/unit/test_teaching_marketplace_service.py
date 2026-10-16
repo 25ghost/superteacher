@@ -153,9 +153,24 @@ def _teacher_user(
     return user
 
 
+def _approve_for(session: Session, user: User, *payloads: TeachingOfferingCreate) -> None:
+    """Full policy approval (category + application + scope) for these payloads."""
+    from tests.conftest import approve_teacher_for_payloads
+
+    approve_teacher_for_payloads(session, user, payloads)
+    session.commit()
+
+
 @pytest.fixture()
-def approved_teacher(session: Session) -> User:
-    return _teacher_user(session, verification=TeacherVerificationStatus.APPROVED.value)
+def approved_teacher(session: Session, catalog: dict) -> User:
+    user = _teacher_user(
+        session, verification=TeacherVerificationStatus.APPROVED.value
+    )
+    # Grant scope for the maths context (the coherent payload below; chem
+    # is deliberately NOT part of COMB â€” tests assert the incoherent tuple
+    # is refused before any scope check runs).
+    _approve_for(session, user, _payload(catalog, subject_key="maths"))
+    return user
 
 
 @pytest.fixture()
@@ -255,6 +270,7 @@ def test_duplicate_active_offering_for_same_context_is_refused(
 
     # ...but a different teacher may offer the same context.
     other = _teacher_user(session, verification=TeacherVerificationStatus.APPROVED.value)
+    _approve_for(session, other, _payload(catalog))
     read = teaching_offering_service.create_offering(session, other, _payload(catalog))
     assert read.learning_context_id is not None
     session.commit()
@@ -478,6 +494,7 @@ def test_enroll_leave_and_switch_within_one_context(
     # A second teacher publishes the same context: the student cannot hold
     # two active memberships of that context.
     other = _teacher_user(session, verification=TeacherVerificationStatus.APPROVED.value)
+    _approve_for(session, other, _payload(catalog))
     second = teaching_offering_service.create_offering(session, other, _payload(catalog))
     session.commit()
 

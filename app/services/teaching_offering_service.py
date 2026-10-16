@@ -42,7 +42,7 @@ from app.schemas.learning import (
     TeachingOfferingRead,
     TeachingOfferingUpdate,
 )
-from app.services import learning_context_service
+from app.services import learning_context_service, teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -83,6 +83,28 @@ def _require_approved(profile: Teacher) -> None:
         )
 
 
+def _require_publishable(
+    session: Session, profile: Teacher, learning_context_id: uuid.UUID
+) -> None:
+    """Eligibility (approved category + completed application) + scope.
+
+    The unified policy check: ``teachers.verification_status == approved``
+    is no longer enough on its own â€” the teacher must also hold an
+    approved verification category backed by a completed application, and
+    the exact canonical context must sit in their approved scope
+    (``teacher_approved_contexts``).
+    """
+    teaching_authorization.require_eligible_teacher(
+        session, profile, action="publish teaching offerings"
+    )
+    teaching_authorization.require_context_in_scope(
+        session,
+        profile.id,
+        learning_context_id,
+        action="publish teaching offerings",
+    )
+
+
 def _read(offering: TeachingOffering) -> TeachingOfferingRead:
     """Build the offering summary from its eager-loaded relations."""
     return TeachingOfferingRead(
@@ -102,9 +124,17 @@ def create_offering(
 ) -> TeachingOfferingRead:
     """Publish one offering (context resolved/created first), then audit it."""
     profile = _load_profile(session, user)
-    _require_approved(profile)
+    teaching_authorization.require_eligible_teacher(
+        session, profile, action="publish teaching offerings"
+    )
 
     context = learning_context_service.resolve_context(session, payload)
+    teaching_authorization.require_context_in_scope(
+        session,
+        profile.id,
+        context.id,
+        action="publish teaching offerings",
+    )
 
     existing = offering_repo.find_active_for_teacher_context(
         session, profile.id, context.id

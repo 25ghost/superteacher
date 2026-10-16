@@ -11,10 +11,16 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models.enums import TeacherVerificationStatus, TeachingOfferingStatus
+from app.models.enums import (
+    TeacherApplicationStatus,
+    TeacherVerificationStatus,
+    TeachingOfferingStatus,
+)
 from app.models.learning_context import LearningContext
 from app.models.program_version import ProgramVersion
 from app.models.teacher import Teacher
+from app.models.teacher_application import TeacherApplication
+from app.models.teacher_approved_context import TeacherApprovedContext
 from app.models.teaching_offering import TeachingOffering
 
 #: Everything a teaching-offering summary reads, as loader options: the
@@ -139,17 +145,33 @@ def list_active_for_marketplace(
     limit: int = 20,
     offset: int = 0,
 ) -> list[TeachingOffering]:
-    """Discoverable offerings: active, taught by an *approved* teacher.
+    """Discoverable offerings: active, in the teacher's approved scope.
 
     The verification join is the marketplace's enforcement of the vetting
-    decision — suspending a teacher hides their offerings immediately,
-    without touching the rows. Ordering is deterministic (created_at
-    descending with the unique id as tiebreaker) so offset paging is
-    stable while a whole batch shares one timestamp.
+    *policy*, not just the legacy status column: the teacher must be
+    ``approved`` with a verification category, hold a completed approved
+    application, and the offering's exact canonical context must sit in
+    ``teacher_approved_contexts`` — so suspending a teacher or narrowing
+    their scope hides the affected offerings immediately, without touching
+    the rows. Ordering is deterministic (created_at descending with the
+    unique id as tiebreaker) so offset paging is stable while a whole
+    batch shares one timestamp.
     """
     stmt = (
         select(TeachingOffering)
         .join(Teacher, Teacher.id == TeachingOffering.teacher_id)
+        .join(
+            TeacherApprovedContext,
+            (TeacherApprovedContext.teacher_id == Teacher.id)
+            & (
+                TeacherApprovedContext.learning_context_id
+                == TeachingOffering.learning_context_id
+            ),
+        )
+        .join(
+            TeacherApplication,
+            TeacherApplication.id == TeacherApprovedContext.application_id,
+        )
         .join(
             LearningContext,
             TeachingOffering.learning_context_id == LearningContext.id,
@@ -158,6 +180,8 @@ def list_active_for_marketplace(
         .where(
             TeachingOffering.status == TeachingOfferingStatus.ACTIVE.value,
             Teacher.verification_status == TeacherVerificationStatus.APPROVED.value,
+            Teacher.verification_category.is_not(None),
+            TeacherApplication.status == TeacherApplicationStatus.APPROVED.value,
             *_marketplace_filters(
                 academic_year_id=academic_year_id,
                 pathway_id=pathway_id,

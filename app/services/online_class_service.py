@@ -63,6 +63,7 @@ from app.schemas.online_class import (
     OnlineClassSessionRead,
     OnlineClassSessionUpdate,
 )
+from app.services import teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -111,13 +112,19 @@ def _load_profile(session: Session, user: User) -> Teacher:
     return profile
 
 
-def _require_approved(profile: Teacher) -> None:
-    """Veto every class-creating attempt by a teacher who is not approved."""
-    if profile.verification_status != TeacherVerificationStatus.APPROVED.value:
-        raise LearningForbiddenError(
-            f"teacher verification is {profile.verification_status!r}; "
-            "only an approved teacher may schedule online classes"
-        )
+def _require_approved(
+    session: Session, profile: Teacher, *, action: str = "schedule online classes"
+) -> None:
+    """Veto every class-writing attempt by a teacher who is not eligible.
+
+    Eligibility is the unified policy check: approved status AND an
+    approved verification category backed by a completed application â€”
+    not the status column alone. It is re-read from the profile row on
+    every call (the JWT claim is never consulted), so a vetting decision
+    taken after the token was issued still applies to the very next
+    write. ``action`` names the refused verb in the 403 message.
+    """
+    teaching_authorization.require_eligible_teacher(session, profile, action=action)
 
 
 def _read(class_session: OnlineClassSession) -> OnlineClassSessionRead:
@@ -147,6 +154,12 @@ def _owned_offering(session: Session, profile: Teacher, offering_id: uuid.UUID):
     offering = offering_repo.get_by_id_for_update(session, offering_id)
     if offering is None or offering.teacher_id != profile.id:
         raise LearningNotFoundError(f"no teaching offering with id {offering_id}")
+    teaching_authorization.require_context_in_scope(
+        session,
+        profile.id,
+        offering.learning_context_id,
+        action="schedule online classes",
+    )
     return offering
 
 
@@ -373,7 +386,7 @@ def create_my_class(
     check hold under concurrent creates.
     """
     profile = _load_profile(session, user)
-    _require_approved(profile)
+    _require_approved(session, profile)
     offering = _owned_offering(session, profile, offering_id)
     _require_usable_offering(offering)
 

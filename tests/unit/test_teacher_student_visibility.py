@@ -124,6 +124,8 @@ def catalog(session: Session) -> dict:
 def _teacher(
     session: Session, *, full_name: str, verification: str
 ) -> User:
+    from tests.conftest import grant_teaching_approval
+
     user = User(
         email=f"{full_name.lower()}-{uuid.uuid4().hex[:6]}@example.com",
         role=UserRole.TEACHER.value,
@@ -132,13 +134,15 @@ def _teacher(
     )
     session.add(user)
     session.flush()
-    session.add(
-        Teacher(
-            user_id=user.id,
-            full_name=full_name,
-            verification_status=verification,
-        )
+    profile = Teacher(
+        user_id=user.id,
+        full_name=full_name,
+        verification_status=verification,
     )
+    session.add(profile)
+    session.flush()
+    if verification == TeacherVerificationStatus.APPROVED.value:
+        grant_teaching_approval(session, profile, learning_context_ids=[])
     session.commit()
     return user
 
@@ -174,17 +178,17 @@ def _other_actor(session: Session, role: UserRole) -> User:
 
 
 def _offering(session: Session, catalog: dict, teacher: User) -> uuid.UUID:
-    read = teaching_offering_service.create_offering(
-        session,
-        teacher,
-        TeachingOfferingCreate(
-            academic_year_id=catalog["year"].id,
-            pathway_id=catalog["pathway"].id,
-            education_level_id=catalog["level"].id,
-            program_version_id=catalog["program_version"].id,
-            subject_id=catalog["maths"].id,
-        ),
+    from tests.conftest import approve_teacher_for_payloads
+
+    payload = TeachingOfferingCreate(
+        academic_year_id=catalog["year"].id,
+        pathway_id=catalog["pathway"].id,
+        education_level_id=catalog["level"].id,
+        program_version_id=catalog["program_version"].id,
+        subject_id=catalog["maths"].id,
     )
+    approve_teacher_for_payloads(session, teacher, [payload])
+    read = teaching_offering_service.create_offering(session, teacher, payload)
     session.commit()
     return read.offering_id
 

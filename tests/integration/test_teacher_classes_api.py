@@ -176,12 +176,26 @@ def _payload(start: datetime, end: datetime) -> dict:
 @pytest.fixture()
 def classroom(clean_db, api_client: TestClient):
     """Seeded catalog + logged-in teacher/student + one owned offering."""
+    from app.models.user import User
+    from app.schemas.learning import TeachingOfferingCreate
+    from tests.conftest import approve_teacher_for_payloads
+
     engine = clean_db
     catalog = _seed_catalog(engine)
     teacher = _seed_account(engine, role="teacher")
     student = _seed_account(engine, role="student")
     teacher_header = _header(_login(api_client, teacher))
     student_header = _header(_login(api_client, student))
+
+    session = _session(engine)
+    try:
+        teacher_user = session.get(User, uuid.UUID(teacher["user_id"]))
+        approve_teacher_for_payloads(
+            session, teacher_user, [TeachingOfferingCreate(**catalog)]
+        )
+        session.commit()
+    finally:
+        session.close()
 
     offering = api_client.post(
         "/api/v1/me/teacher/offerings", json=catalog, headers=teacher_header
@@ -449,9 +463,23 @@ def test_a_foreign_offering_is_the_same_404_as_an_unknown_one(
 ) -> None:
     other = _seed_account(classroom["engine"], role="teacher")
     other_header = _header(_login(api_client, other))
+    other_catalog = _seed_catalog(classroom["engine"])
+    session = _session(classroom["engine"])
+    try:
+        from app.models.user import User
+        from app.schemas.learning import TeachingOfferingCreate
+        from tests.conftest import approve_teacher_for_payloads
+
+        other_user = session.get(User, uuid.UUID(other["user_id"]))
+        approve_teacher_for_payloads(
+            session, other_user, [TeachingOfferingCreate(**other_catalog)]
+        )
+        session.commit()
+    finally:
+        session.close()
     other_offering = api_client.post(
         "/api/v1/me/teacher/offerings",
-        json=_seed_catalog(classroom["engine"]),
+        json=other_catalog,
         headers=other_header,
     )
     assert other_offering.status_code == 201, other_offering.text

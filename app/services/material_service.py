@@ -74,7 +74,7 @@ from app.schemas.material import (
     MaterialRejectRequest,
     MaterialUpdate,
 )
-from app.services import file_validation
+from app.services import file_validation, teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -126,15 +126,28 @@ def _require_approved(profile: Teacher) -> None:
 def _load_approved_profile(session: Session, user: User) -> Teacher:
     """Profile of an authoring caller: teacher role + Admin approval."""
     profile = _load_profile(session, user)
-    _require_approved(profile)
+    teaching_authorization.require_eligible_teacher(
+        session, profile, action="create or change teaching content"
+    )
     return profile
 
 
 def _owned_offering(session: Session, profile: Teacher, offering_id: uuid.UUID):
-    """One of the caller's offerings — a foreign id 404s like an unknown one."""
+    """One of the caller's offerings — a foreign id 404s like an unknown one.
+
+    The offering's canonical context must also sit in the teacher's
+    approved scope: authoring content for a context the teacher is not
+    approved to teach is refused (403) even when they own the offering.
+    """
     offering = offering_repo.get_by_id_for_update(session, offering_id)
     if offering is None or offering.teacher_id != profile.id:
         raise LearningNotFoundError(f"no teaching offering with id {offering_id}")
+    teaching_authorization.require_context_in_scope(
+        session,
+        profile.id,
+        offering.learning_context_id,
+        action="create or change teaching content",
+    )
     return offering
 
 

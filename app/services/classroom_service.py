@@ -160,7 +160,7 @@ from app.schemas.online_class import (
     ClassWsTicketRead,
     MessageSenderRead,
 )
-from app.services import auth_service, online_class_service
+from app.services import auth_service, online_class_service, teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -662,7 +662,7 @@ def issue_ws_ticket_for_teacher(
     profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
     if profile is None:
         raise LearningNotFoundError("no teacher profile for this account")
-    if profile.verification_status != TeacherVerificationStatus.APPROVED.value:
+    if not teaching_authorization.is_eligible_teacher(session, profile):
         raise LearningForbiddenError(
             f"teacher verification is {profile.verification_status!r}; "
             "only an approved teacher may enter the classroom"
@@ -674,6 +674,14 @@ def issue_ws_ticket_for_teacher(
     class_session = class_repo.get_by_id(session, class_id)
     if class_session is None:  # pragma: no cover — get_my_class validated it
         raise LearningNotFoundError(f"no online class with id {class_id}")
+    offering = offering_repo.get_by_id(session, class_session.teaching_offering_id)
+    if offering is None or not teaching_authorization.has_approved_context(
+        session, profile.id, offering.learning_context_id
+    ):
+        raise LearningForbiddenError(
+            "this learning context is not in your approved teaching scope; "
+            "only approved contexts may be used to enter the classroom"
+        )
     _require_live(class_session, "ticket issuance")
     return _mint_ws_ticket(session, class_id=read.class_id, user_id=user.id)
 
@@ -780,15 +788,20 @@ def authorize_ws_connection(
 
     if user.role == UserRole.TEACHER.value:
         profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
-        if (
-            profile is None
-            or profile.verification_status != TeacherVerificationStatus.APPROVED.value
+        if profile is None or not teaching_authorization.is_eligible_teacher(
+            session, profile
         ):
             raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
         offering = offering_repo.get_by_id(
             session, class_session.teaching_offering_id
         )
-        if offering is None or offering.teacher_id != profile.id:
+        if (
+            offering is None
+            or offering.teacher_id != profile.id
+            or not teaching_authorization.has_approved_context(
+                session, profile.id, offering.learning_context_id
+            )
+        ):
             raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
         if class_session.status != OnlineClassStatus.LIVE.value:
             raise ClassroomConnectionRefused(REASON_CLASS_NOT_LIVE)
@@ -1208,15 +1221,20 @@ def _authorize_message_send(
 
     if user.role == UserRole.TEACHER.value:
         profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
-        if (
-            profile is None
-            or profile.verification_status != TeacherVerificationStatus.APPROVED.value
+        if profile is None or not teaching_authorization.is_eligible_teacher(
+            session, profile
         ):
             raise MessageRejected(ERROR_NOT_AUTHORIZED)
         offering = offering_repo.get_by_id(
             session, class_session.teaching_offering_id
         )
-        if offering is None or offering.teacher_id != profile.id:
+        if (
+            offering is None
+            or offering.teacher_id != profile.id
+            or not teaching_authorization.has_approved_context(
+                session, profile.id, offering.learning_context_id
+            )
+        ):
             raise MessageRejected(ERROR_NOT_AUTHORIZED)
         return "teacher", profile.full_name
 

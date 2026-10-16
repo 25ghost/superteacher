@@ -52,6 +52,7 @@ from app.schemas.curriculum import (
     TopicRead,
     TopicUpdate,
 )
+from app.services import teaching_authorization
 from app.services.learning_context_service import (
     LearningConflictError,
     LearningForbiddenError,
@@ -89,7 +90,9 @@ def _require_approved(profile: Teacher) -> None:
 def _load_approved_profile(session: Session, user: User) -> Teacher:
     """Profile of an authoring caller: teacher role + Admin approval."""
     profile = _load_profile(session, user)
-    _require_approved(profile)
+    teaching_authorization.require_eligible_teacher(
+        session, profile, action="create or change teaching content"
+    )
     return profile
 
 
@@ -99,11 +102,18 @@ def _owned_offering(
     """One of the caller's offerings — a foreign id 404s like an unknown one.
 
     UUIDs are identifiers, not authorization: answering 403 for someone
-    else's id would confirm that it exists.
+    else's id would confirm that it exists. The offering's canonical
+    context must additionally sit in the teacher's approved scope.
     """
     offering = offering_repo.get_by_id_for_update(session, offering_id)
     if offering is None or offering.teacher_id != profile.id:
         raise LearningNotFoundError(f"no teaching offering with id {offering_id}")
+    teaching_authorization.require_context_in_scope(
+        session,
+        profile.id,
+        offering.learning_context_id,
+        action="create or change teaching content",
+    )
     return offering
 
 
