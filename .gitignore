@@ -14,3 +14,6 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# Runtime storage (LocalStorageBackend root: file-asset bytes)
+var/
