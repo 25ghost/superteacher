@@ -215,7 +215,7 @@ def update_my_material(
     user: User = Depends(require_teacher),
 ) -> MaterialRead:
     try:
-        return material_service.update_material(
+        updated = material_service.update_material(
             session, user, offering_id, material_id, payload
         )
     except LearningError as exc:
@@ -225,6 +225,7 @@ def update_my_material(
         session.rollback()
         raise
     session.commit()
+    return updated
 
 
 @router.post(
@@ -254,7 +255,7 @@ def submit_my_material(
     user: User = Depends(require_teacher),
 ) -> MaterialRead:
     try:
-        return material_service.submit_material(
+        submitted = material_service.submit_material(
             session, user, offering_id, material_id
         )
     except LearningError as exc:
@@ -264,6 +265,7 @@ def submit_my_material(
         session.rollback()
         raise
     session.commit()
+    return submitted
 
 
 @router.post(
@@ -292,7 +294,7 @@ def revise_my_material(
     user: User = Depends(require_teacher),
 ) -> MaterialRead:
     try:
-        return material_service.revise_material(
+        revised = material_service.revise_material(
             session, user, offering_id, material_id
         )
     except LearningError as exc:
@@ -302,6 +304,7 @@ def revise_my_material(
         session.rollback()
         raise
     session.commit()
+    return revised
 
 
 @router.post(
@@ -330,7 +333,7 @@ def archive_my_material(
     user: User = Depends(require_teacher),
 ) -> MaterialRead:
     try:
-        return material_service.archive_material(
+        archived = material_service.archive_material(
             session, user, offering_id, material_id
         )
     except LearningError as exc:
@@ -340,6 +343,7 @@ def archive_my_material(
         session.rollback()
         raise
     session.commit()
+    return archived
 
 
 @router.delete(

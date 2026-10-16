@@ -93,7 +93,9 @@ def create_my_topic(
     user: User = Depends(require_teacher),
 ) -> TopicRead:
     try:
-        return curriculum_service.create_topic(session, user, offering_id, payload)
+        created = curriculum_service.create_topic(
+            session, user, offering_id, payload
+        )
     except LearningError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -101,6 +103,7 @@ def create_my_topic(
         session.rollback()
         raise
     session.commit()
+    return created
 
 
 @router.get(
@@ -279,7 +282,7 @@ def create_my_lesson(
     user: User = Depends(require_teacher),
 ) -> LessonRead:
     try:
-        return curriculum_service.create_lesson(
+        created = curriculum_service.create_lesson(
             session, user, offering_id, topic_id, payload
         )
     except LearningError as exc:
@@ -289,6 +292,7 @@ def create_my_lesson(
         session.rollback()
         raise
     session.commit()
+    return created
 
 
 @router.get(

@@ -142,7 +142,9 @@ def admin_approve_material(
     admin: User = Depends(require_admin),
 ) -> MaterialRead:
     try:
-        return material_service.admin_approve_material(session, admin, material_id)
+        approved = material_service.admin_approve_material(
+            session, admin, material_id
+        )
     except LearningError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -150,6 +152,7 @@ def admin_approve_material(
         session.rollback()
         raise
     session.commit()
+    return approved
 
 
 @router.post(
@@ -181,7 +184,7 @@ def admin_reject_material(
     admin: User = Depends(require_admin),
 ) -> MaterialRead:
     try:
-        return material_service.admin_reject_material(
+        rejected = material_service.admin_reject_material(
             session, admin, material_id, payload
         )
     except LearningError as exc:
@@ -191,6 +194,7 @@ def admin_reject_material(
         session.rollback()
         raise
     session.commit()
+    return rejected
 
 
 @router.post(
@@ -218,7 +222,9 @@ def admin_archive_material(
     admin: User = Depends(require_admin),
 ) -> MaterialRead:
     try:
-        return material_service.admin_archive_material(session, admin, material_id)
+        archived = material_service.admin_archive_material(
+            session, admin, material_id
+        )
     except LearningError as exc:
         session.rollback()
         raise _http_error(exc) from exc
@@ -226,3 +232,4 @@ def admin_archive_material(
         session.rollback()
         raise
     session.commit()
+    return archived
