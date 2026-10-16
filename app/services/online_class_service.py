@@ -565,8 +565,18 @@ def start_my_class(
     Atomic under the class row lock: two concurrent starts leave exactly
     one winner (the loser is a 409). Only the owning teacher can start,
     and a window that has already closed can never go live.
+
+    Order mirrors :func:`create_my_class`: approved teacher (403) ->
+    owned offering, ROW-LOCKED (404) -> owned class (404) -> legal
+    transition (409) -> window still open (409) -> transition + audit.
+    Eligibility is re-read from the profile row here, at the moment of
+    the START: the class may have been scheduled while the teacher was
+    approved and vetting may have revoked that since (a suspended teacher
+    never flips a class live, never writes ``online_class_started``, and
+    leaves the scheduled row untouched).
     """
     profile = _load_profile(session, user)
+    _require_approved(session, profile, action="start online classes")
     _owned_offering(session, profile, offering_id)
     class_session = _owned_class(session, offering_id, class_id)
 

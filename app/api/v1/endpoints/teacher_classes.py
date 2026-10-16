@@ -54,7 +54,10 @@ and guarded by ``require_teacher``, scoped by the offering in the path:
 
 Creating one requires an **approved** teacher verification (403
 otherwise) and an *usable* (active) offering (409 otherwise): vetting
-keeps meaning after the invitation is accepted. Every class read also
+keeps meaning after the invitation is accepted. Starting one re-reads
+that same verification from the profile row, so a teacher suspended
+after scheduling can no longer flip the class live (403, the scheduled
+row untouched). Every class read also
 mechanically ends an overdue ``live`` class (``reason: "auto"``) and
 commits that transition — the system must not stay LIVE because the
 teacher forgot to press End.
@@ -273,13 +276,16 @@ def update_my_class(
         "exactly one winner, the loser is a 409 (never a second "
         "transition). A window whose scheduled end has already passed can "
         "never go live (409). Only SCHEDULED → LIVE is allowed — a live, "
-        "ended or cancelled class is a 409. Exactly one audit event: "
+        "ended or cancelled class is a 409. Requires an APPROVED teacher "
+        "verification, re-read from the profile row at the moment of the "
+        "start (403 otherwise — a class scheduled before a suspension "
+        "never goes live). Exactly one audit event: "
         "online_class_started. Unknown or foreign id → 404."
     ),
     responses={
         200: {"description": "Class is now live"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown class id, or not inside one of your offerings"},
         409: {"description": "Wrong current status, or the window has already ended"},
         429: {"description": "Rate limit exceeded"},

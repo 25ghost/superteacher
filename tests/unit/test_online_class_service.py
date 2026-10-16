@@ -6,6 +6,10 @@ In-memory SQLite, no HTTP — the service layer's own contract:
   a foreign offering/class id answers the same 404 as an unknown one (L6
   existence leak), never a 403 that would confirm the row exists;
 - scheduling requires an APPROVED teacher and an active offering;
+- starting is gated by the SAME approval, re-read at the moment of the
+  write: a teacher suspended after scheduling gets a 403, the class
+  stays ``scheduled`` with no ``online_class_started`` audit row, and
+  ownership/scope refusals keep their existing 404/403 answers;
 - overlapping scheduled/live windows of the SAME offering are refused,
   while adjacent windows (end == next start) and cancelled/ended classes
   free their window again;
@@ -435,6 +439,141 @@ def test_inverted_window_is_refused_before_the_service_is_reached() -> None:
     with pytest.raises(ValidationError) as excinfo:
         OnlineClassSessionCreate(scheduled_start_at=END, scheduled_end_at=START)
     assert "scheduled_end_at must be after scheduled_start_at" in str(excinfo.value)
+
+
+# --- start authorization ------------------------------------------------------------------------
+
+
+def test_an_eligible_teacher_starts_their_scheduled_class(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID
+) -> None:
+    """Positive control: the ordinary START still works, audited once."""
+    created = _create(session, approved_teacher, offering_id)
+    session.commit()
+
+    live = online_class_service.start_my_class(
+        session, approved_teacher, offering_id, created.class_id
+    )
+    session.commit()
+
+    assert live.status == "live"
+    assert live.actual_started_at is not None
+    assert [e.event_type for e in _events(session, approved_teacher)] == [
+        "online_class_created",
+        "online_class_started",
+    ]
+
+
+def test_a_suspended_teacher_cannot_start_a_scheduled_class(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID
+) -> None:
+    """The class was scheduled while approved; vetting revoked it since."""
+    created = _create(session, approved_teacher, offering_id)
+    session.commit()
+
+    profile = session.scalar(
+        select(Teacher).where(Teacher.user_id == approved_teacher.id)
+    )
+    profile.verification_status = TeacherVerificationStatus.SUSPENDED.value
+    session.commit()
+
+    with pytest.raises(LearningForbiddenError) as excinfo:
+        online_class_service.start_my_class(
+            session, approved_teacher, offering_id, created.class_id
+        )
+    session.rollback()
+    message = str(excinfo.value)
+    assert "approved teacher" in message
+    # A refusal never confirms which class or offering was probed (L6).
+    assert str(offering_id) not in message
+    assert str(created.class_id) not in message
+
+    # Nothing happened: no transition, no timestamp, no audit row.
+    stored = session.get(OnlineClassSession, created.class_id)
+    assert stored.status == "scheduled"
+    assert stored.actual_started_at is None
+    assert [e.event_type for e in _events(session, approved_teacher)] == [
+        "online_class_created",
+    ]
+
+    # The check reads the ROW, not the token: restoring the verification
+    # lets the very same start through.
+    profile.verification_status = TeacherVerificationStatus.APPROVED.value
+    session.commit()
+    live = online_class_service.start_my_class(
+        session, approved_teacher, offering_id, created.class_id
+    )
+    session.commit()
+    assert live.status == "live"
+    assert [e.event_type for e in _events(session, approved_teacher)] == [
+        "online_class_created",
+        "online_class_started",
+    ]
+
+
+def test_a_teacher_who_does_not_own_the_class_cannot_start_it(
+    session: Session,
+    approved_teacher: User,
+    offering_id: uuid.UUID,
+    other_teacher: User,
+    other_offering_id: uuid.UUID,
+) -> None:
+    created = _create(session, approved_teacher, offering_id)
+    session.commit()
+
+    # Eligible and approved, but not the owner: the SAME 404 an unknown
+    # offering id gets - ownership is the entitlement, never a 403 that
+    # would confirm the row exists.
+    with pytest.raises(LearningNotFoundError) as excinfo:
+        online_class_service.start_my_class(
+            session, other_teacher, offering_id, created.class_id
+        )
+    session.rollback()
+    assert str(excinfo.value) == f"no teaching offering with id {offering_id}"
+
+    stored = session.get(OnlineClassSession, created.class_id)
+    assert stored.status == "scheduled"
+    assert stored.actual_started_at is None
+    assert _events(session, other_teacher) == []
+    assert [e.event_type for e in _events(session, approved_teacher)] == [
+        "online_class_created",
+    ]
+
+
+def test_a_teacher_without_the_approved_context_cannot_start_it(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID
+) -> None:
+    """Ownership alone is not enough: the context scope is re-read too."""
+    from sqlalchemy import delete as sa_delete
+
+    from app.models.teacher_approved_context import TeacherApprovedContext
+
+    created = _create(session, approved_teacher, offering_id)
+    session.commit()
+
+    profile = session.scalar(
+        select(Teacher).where(Teacher.user_id == approved_teacher.id)
+    )
+    session.execute(
+        sa_delete(TeacherApprovedContext).where(
+            TeacherApprovedContext.teacher_id == profile.id
+        )
+    )
+    session.commit()
+
+    with pytest.raises(LearningForbiddenError) as excinfo:
+        online_class_service.start_my_class(
+            session, approved_teacher, offering_id, created.class_id
+        )
+    session.rollback()
+    assert "approved teaching scope" in str(excinfo.value)
+
+    stored = session.get(OnlineClassSession, created.class_id)
+    assert stored.status == "scheduled"
+    assert stored.actual_started_at is None
+    assert [e.event_type for e in _events(session, approved_teacher)] == [
+        "online_class_created",
+    ]
 
 
 # --- the state machine -----------------------------------------------------------------

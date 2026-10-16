@@ -5,6 +5,10 @@ End-to-end contract for Phase 3 slice 3A against ``super_teacher_db_test``:
 - a teacher schedules a class inside their own offering (201), reads the
   timetable, starts it, ends it — and exactly one ``auth_events`` row per
   transition is on record;
+- starting re-reads the teacher's verification from the database: a
+  teacher suspended AFTER scheduling gets 403, the class stays
+  ``scheduled`` with no ``online_class_started`` audit row, and the very
+  same start works again once the verification is restored;
 - overlapping windows of the same offering are refused (409) while
   back-to-back windows are accepted;
 - a student who enrolled can list and read the class (200); a student who
@@ -19,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 pytestmark = pytest.mark.integration
 
@@ -307,6 +311,83 @@ def test_teacher_schedules_starts_and_ends_a_class(
     assert class_events.count("online_class_created") == 2
     assert class_events.count("online_class_started") == 1
     assert class_events.count("online_class_ended") == 1
+
+
+def test_a_suspended_teacher_cannot_start_a_scheduled_class(
+    api_client: TestClient, classroom: dict
+) -> None:
+    """Start re-reads vetting: a suspension after scheduling never goes live.
+
+    The refusal must be total — no transition, no ``actual_started_at``,
+    no ``online_class_started`` audit row — and it must be driven by the
+    database row, so the identical start succeeds again once the
+    verification is restored.
+    """
+    engine = classroom["engine"]
+    start, end = _window(8)
+    created = api_client.post(
+        f"/api/v1/me/teacher/offerings/{classroom['offering_id']}/classes",
+        json=_payload(start, end),
+        headers=classroom["teacher_header"],
+    )
+    assert created.status_code == 201, created.text
+    class_id = created.json()["class_id"]
+    url = (
+        f"/api/v1/me/teacher/offerings/{classroom['offering_id']}"
+        f"/classes/{class_id}"
+    )
+
+    # Suspended AFTER the class was scheduled — the access token is still
+    # valid and the account is still active, only the vetting moved.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE teachers SET verification_status = 'suspended' "
+                "WHERE user_id = :id"
+            ),
+            {"id": uuid.UUID(classroom["teacher"]["user_id"])},
+        )
+
+    refused = api_client.post(f"{url}/start", headers=classroom["teacher_header"])
+    assert refused.status_code == 403, refused.text
+    assert "approved teacher" in refused.json()["detail"]
+
+    # Nothing partially changed: still scheduled, no timestamp...
+    detail = api_client.get(url, headers=classroom["teacher_header"])
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "scheduled"
+    assert detail.json()["actual_started_at"] is None
+
+    # ...and no misleading audit event for a transition that never happened.
+    session = _session(engine)
+    try:
+        from app.models.auth_event import AuthEvent
+
+        started_rows = session.scalars(
+            select(AuthEvent).where(
+                AuthEvent.user_id == uuid.UUID(classroom["teacher"]["user_id"]),
+                AuthEvent.event_type == "online_class_started",
+            )
+        ).all()
+        assert started_rows == []
+    finally:
+        session.close()
+
+    # Restoring the row (not the token) lets the very same start through:
+    # an eligible, authorized teacher still flips the class LIVE.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE teachers SET verification_status = 'approved' "
+                "WHERE user_id = :id"
+            ),
+            {"id": uuid.UUID(classroom["teacher"]["user_id"])},
+        )
+
+    started = api_client.post(f"{url}/start", headers=classroom["teacher_header"])
+    assert started.status_code == 200, started.text
+    assert started.json()["status"] == "live"
+    assert started.json()["actual_started_at"] is not None
 
 
 def test_cancel_drops_a_scheduled_class_and_frees_the_window(
