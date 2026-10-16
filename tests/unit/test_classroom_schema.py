@@ -218,7 +218,7 @@ def test_participation_indexes_have_no_model_migration_drift() -> None:
 
 
 def test_verification_script_expects_head_0016() -> None:
-    assert verify_database.EXPECTED_REVISION == "0016"
+    assert verify_database.EXPECTED_REVISION == "0017"
     assert verify_database.EXPECTED_REVISION == _migration_head()
 
 

@@ -35,10 +35,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import security
-from app.models.enums import UserStatus, UserRole
+from app.models.enums import TeacherVerificationStatus, UserStatus, UserRole
 from app.models.invite_token import InviteToken
 from app.models.school import School
 from app.models.teacher import Teacher
+from app.models.teacher_application import TeacherApplication
+from app.models.teacher_approved_context import TeacherApprovedContext
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
 from app.repositories import auth_session_repository as auth_session_repo
@@ -343,6 +345,47 @@ def set_teacher_school(
 # --- teacher verification (Phase 1) ---------------------------------------------------
 
 
+def _require_completed_application(session: Session, profile: Teacher) -> None:
+    """Refuse the direct-approval bypass (teacher verification policy).
+
+    ``PATCH /admin/teachers/{id}/verification`` may set ``approved`` ONLY
+    to reinstate a teacher who already completed the application workflow
+    through ``POST /admin/teacher-applications/{id}/decide``: a completed
+    ``approved`` application carrying a category AND at least one
+    ``teacher_approved_contexts`` row. A teacher who never went through
+    the queue cannot be approved here — the 409 points the administrator
+    at the application queue instead. This check reads the same durable
+    database state the enforcement layer trusts; it never consults the
+    request payload.
+    """
+    application = session.scalar(
+        select(TeacherApplication).where(
+            TeacherApplication.teacher_id == profile.id,
+            TeacherApplication.status == "approved",
+        )
+        .order_by(TeacherApplication.created_at.desc(), TeacherApplication.id)
+        .limit(1)
+    )
+    if application is None or not application.category:
+        raise AuthConflictError(
+            "this teacher has no completed approved application; approve "
+            "them through the application workflow "
+            "(POST /admin/teacher-applications/{id}/decide) instead of "
+            "the direct verification endpoint"
+        )
+    scope = session.scalar(
+        select(TeacherApprovedContext.id).where(
+            TeacherApprovedContext.teacher_id == profile.id
+        ).limit(1)
+    )
+    if scope is None:
+        raise AuthConflictError(
+            "this teacher has an approved application but no approved "
+            "teaching scope; re-decide the application with at least one "
+            "approved context"
+        )
+
+
 def set_teacher_verification(
     session: Session,
     user_id: uuid.UUID,
@@ -352,13 +395,26 @@ def set_teacher_verification(
 ) -> TeacherRead:
     """Record an administrator's vetting decision on a teacher profile.
 
-    ``pending``/``approved``/``rejected``/``suspended`` all move freely —
-    an administrator may reopen or reverse a decision — but a repeat of the
-    current value is a 409 (no silent no-op), exactly like the account
-    activate/deactivate routes. The account status is deliberately left
-    alone: vetting and the ability to log in are independent axes, so
-    suspending a *teacher* hides their offerings without locking the person
-    out of their account (and vice versa).
+    ``pending``/``rejected``/``suspended`` move freely — an administrator
+    may reopen or reverse a decision — but a repeat of the current value
+    is a 409 (no silent no-op), exactly like the account
+    activate/deactivate routes.
+
+    ``approved`` is deliberately NOT a free move: the teacher-verification
+    policy closes the direct-approval bypass. This route may only
+    *reinstate* a teacher who already completed the application workflow
+    (a completed ``approved`` application carrying a category, plus at
+    least one approved context — i.e. someone previously approved through
+    ``POST /admin/teacher-applications/{id}/decide`` who was later
+    suspended or manually reset). Setting ``approved`` on a teacher who
+    never completed the workflow is refused with 409 pointing at the
+    application queue. Reinstatement keeps the existing category and
+    scope rows — those are only ever written by the decision workflow.
+
+    The account status is deliberately left alone: vetting and the
+    ability to log in are independent axes, so suspending a *teacher*
+    hides their offerings without locking the person out of their account
+    (and vice versa).
 
     Profile and school come from one joined statement; every accepted
     change writes exactly one ``auth_events`` row naming both the subject
@@ -376,6 +432,9 @@ def set_teacher_verification(
         raise AuthConflictError(
             f"teacher verification is already {new_status!r}"
         )
+
+    if new_status == TeacherVerificationStatus.APPROVED.value:
+        _require_completed_application(session, profile)
 
     profile.verification_status = new_status
     auth_event_repo.log_event(

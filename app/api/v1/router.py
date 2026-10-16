@@ -49,6 +49,7 @@ from app.api.v1.endpoints import (
     teacher_curriculum,
     teacher_materials,
     teacher_offerings,
+    teacher_verification,
 )
 
 api_router = APIRouter()
@@ -61,6 +62,8 @@ api_router.include_router(teacher_offerings.router)
 api_router.include_router(teacher_curriculum.router)
 api_router.include_router(teacher_materials.router)
 api_router.include_router(teacher_classes.router)
+api_router.include_router(teacher_verification.teacher_router)
+api_router.include_router(teacher_verification.admin_router)
 api_router.include_router(learning_enrollments.router)
 api_router.include_router(student_content.router)
 api_router.include_router(student_classes.router)

@@ -25,10 +25,12 @@ super_teacher_db_test;``) — the suite never creates or destroys databases.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+import uuid as uuid_module
+from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -59,6 +61,16 @@ APPLICATION_TABLES: tuple[str, ...] = (
     "topics",
     "learning_enrollments",
     "teaching_offerings",
+    # Verification policy (0017): checks/assessments/evidence before their
+    # applications; approved contexts and application contexts before the
+    # applications; all before learning_contexts/teachers they reference.
+    "teacher_verification_checks",
+    "teacher_assessments",
+    "teacher_evidence_contexts",
+    "teacher_evidence",
+    "teacher_approved_contexts",
+    "teacher_application_contexts",
+    "teacher_applications",
     "learning_contexts",
     "student_subjects",
     "student_enrollments",
@@ -89,6 +101,121 @@ APPLICATION_TABLES: tuple[str, ...] = (
 
 class UnsafeTestDatabase(RuntimeError):
     """Raised when integration tests target a database that is not clearly a test database."""
+
+
+def grant_teaching_approval(
+    session: Session,
+    teacher,
+    *,
+    learning_context_ids: Iterable[uuid_module.UUID],
+    category: str = "formal_teacher",
+):
+    """Give one teacher the durable approval state the policy enforcement reads.
+
+    ``teachers.verification_status = 'approved'`` alone is no longer enough:
+    :func:`app.services.teaching_authorization` additionally requires an
+    approved verification category and a completed ``approved`` application,
+    and every teaching surface (publishing, materials, curriculum, classes,
+    classroom, marketplace, enrollment) requires the offering's canonical
+    context to sit in ``teacher_approved_contexts``.
+
+    Test setups that create a teacher and an offering directly (bypassing
+    the application HTTP flow) must call this helper so the created state
+    is one the policy would actually grant. Creates the
+    ``TeacherApplication`` (approved, decided), one approved
+    ``TeacherApplicationContext`` per context, one
+    ``TeacherApprovedContext`` row per context, and sets the profile's
+    ``verification_status``/``verification_category``. Works on both the
+    unit-test in-memory SQLite sessions and the integration PostgreSQL
+    sessions. Returns the created application row.
+    """
+    from app.models.enums import (
+        ApplicationContextStatus,
+        TeacherApplicationStatus,
+        TeacherVerificationStatus,
+    )
+    from app.models.teacher_application import TeacherApplication
+    from app.models.teacher_application_context import TeacherApplicationContext
+    from app.models.teacher_approved_context import TeacherApprovedContext
+
+    context_ids = list(learning_context_ids)
+    now = datetime.now(timezone.utc)
+    application = session.scalar(
+        select(TeacherApplication).where(
+            TeacherApplication.teacher_id == teacher.id,
+            TeacherApplication.status == TeacherApplicationStatus.APPROVED.value,
+        )
+    )
+    if application is None:
+        application = TeacherApplication(
+            teacher_id=teacher.id,
+            status=TeacherApplicationStatus.APPROVED.value,
+            category=category,
+            submitted_at=now,
+            decided_at=now,
+            created_by=teacher.user_id,
+        )
+        session.add(application)
+        session.flush()
+    existing = {
+        row[0]
+        for row in session.execute(
+            select(TeacherApprovedContext.learning_context_id).where(
+                TeacherApprovedContext.teacher_id == teacher.id
+            )
+        )
+    }
+    for context_id in context_ids:
+        if context_id in existing:
+            continue
+        session.add(
+            TeacherApplicationContext(
+                application_id=application.id,
+                learning_context_id=context_id,
+                status=ApplicationContextStatus.APPROVED.value,
+                decided_at=now,
+            )
+        )
+        session.add(
+            TeacherApprovedContext(
+                teacher_id=teacher.id,
+                learning_context_id=context_id,
+                application_id=application.id,
+                approved_at=now,
+            )
+        )
+    teacher.verification_status = TeacherVerificationStatus.APPROVED.value
+    teacher.verification_category = category
+    session.flush()
+    return application
+
+
+def approve_teacher_for_payloads(
+    session: Session,
+    user,
+    payloads: Iterable,
+) -> None:
+    """Full policy approval for a teacher who will offer these payloads.
+
+    Resolves each ``TeachingOfferingCreate``-shaped payload to its
+    canonical ``learning_contexts`` row (creating it the first time, the
+    same way ``create_offering`` would), then applies
+    :func:`grant_teaching_approval` for every resolved context. Call this
+    in a test setup AFTER the teacher profile exists and BEFORE invoking
+    ``create_offering`` (or the HTTP publish endpoint).
+    """
+    from app.models.teacher import Teacher
+    from app.services import learning_context_service
+
+    profile = session.scalar(select(Teacher).where(Teacher.user_id == user.id))
+    if profile is None:
+        raise RuntimeError("no teacher profile for this user")
+    context_ids: list[uuid_module.UUID] = []
+    for payload in payloads:
+        context = learning_context_service.resolve_context(session, payload)
+        if context.id not in context_ids:
+            context_ids.append(context.id)
+    grant_teaching_approval(session, profile, learning_context_ids=context_ids)
 
 
 def _guarded_test_url() -> str:

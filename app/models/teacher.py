@@ -22,7 +22,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.time_mixin import TimestampMixin
-from app.models.enums import TeacherVerificationStatus, sql_in_list
+from app.models.enums import (
+    TeacherVerificationCategory,
+    TeacherVerificationStatus,
+    sql_in_list,
+)
 
 
 class Teacher(TimestampMixin, Base):
@@ -48,11 +52,23 @@ class Teacher(TimestampMixin, Base):
         nullable=False,
         default=TeacherVerificationStatus.PENDING.value,
     )
+    # Verification policy: the APPROVED category, set only when an
+    # application completes the review workflow. NULL (the default and the
+    # state of every legacy teacher) fails closed — an 'approved' status
+    # without a recorded category grants no teaching authority.
+    verification_category: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint(
             f"verification_status IN ({sql_in_list(TeacherVerificationStatus)})",
             name="teachers_verification_status_check",
+        ),
+        CheckConstraint(
+            f"verification_category IS NULL OR verification_category IN "
+            f"({sql_in_list(TeacherVerificationCategory)})",
+            name="teachers_verification_category_check",
         ),
     )
 

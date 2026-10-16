@@ -35,6 +35,13 @@ from app.models.student_profile_history import StudentProfileHistory
 from app.models.student_subject import StudentSubject
 from app.models.subject import Subject
 from app.models.teacher import Teacher
+from app.models.teacher_application import TeacherApplication
+from app.models.teacher_application_context import TeacherApplicationContext
+from app.models.teacher_approved_context import TeacherApprovedContext
+from app.models.teacher_assessment import TeacherAssessment
+from app.models.teacher_evidence import TeacherEvidence
+from app.models.teacher_evidence_context import TeacherEvidenceContext
+from app.models.teacher_verification_check import TeacherVerificationCheck
 from app.models.teaching_offering import TeachingOffering
 from app.models.topic import Topic
 from app.models.tvet_program import TVETProgram
@@ -73,6 +80,13 @@ __all__ = [
     "StudentSubject",
     "Subject",
     "Teacher",
+    "TeacherApplication",
+    "TeacherApplicationContext",
+    "TeacherApprovedContext",
+    "TeacherAssessment",
+    "TeacherEvidence",
+    "TeacherEvidenceContext",
+    "TeacherVerificationCheck",
     "TeachingOffering",
     "Topic",
     "TVETProgram",

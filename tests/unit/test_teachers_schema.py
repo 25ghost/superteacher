@@ -46,6 +46,7 @@ def test_teachers_table_registered_with_expected_columns() -> None:
         "school_id",
         "subject",
         "verification_status",
+        "verification_category",
         "created_at",
         "updated_at",
     }

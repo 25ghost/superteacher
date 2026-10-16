@@ -3,7 +3,7 @@
 Three levels:
 
 1. STRUCTURAL (always runs, no database needed):
-   - all 35 expected application tables exist in the ORM metadata, with the
+   - all 42 expected application tables exist in the ORM metadata, with the
      plural ``students`` name and no singular ``student`` table;
    - every table that has ``created_at`` also has ``updated_at``;
    - the ``users_role_check`` vocabulary equals ``UserRole``, and the
@@ -19,7 +19,7 @@ Three levels:
 2. LIVE (read-only, ``--live``):
    - connects to PostgreSQL using the configured DB_* settings;
    - checks the live ``alembic_version`` equals the expected revision;
-   - checks every one of the 35 tables exists (and singular ``student`` does
+   - checks every one of the 42 tables exists (and singular ``student`` does
      not);
    - compares the LIVE schema against the ORM metadata with the same
      column/constraint/index comparison used for drift detection, so live
@@ -31,7 +31,7 @@ Three levels:
    - refuses to run when any application table contains rows (this is what
      keeps it from destroying data);
    - then ``alembic downgrade base`` -> verify empty -> ``alembic upgrade
-     head`` -> verify all 35 tables and the expected revision again.
+     head`` -> verify all 42 tables and the expected revision again.
    Use it only on a disposable development database.
 
 Usage (from ``backend/``):
@@ -91,9 +91,18 @@ EXPECTED_TABLES = {
     "class_messages",
     "class_attendance_segments",
     "class_ws_tickets",
+    # created by 0017 (teacher verification policy: application workflow,
+    # evidence, checks, assessments, approved teaching scope)
+    "teacher_applications",
+    "teacher_application_contexts",
+    "teacher_evidence",
+    "teacher_evidence_contexts",
+    "teacher_verification_checks",
+    "teacher_assessments",
+    "teacher_approved_contexts",
 }
 
-EXPECTED_REVISION = "0016"
+EXPECTED_REVISION = "0017"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -779,6 +788,14 @@ LATER_MIGRATION_TABLES = {
     "class_messages",
     "class_attendance_segments",
     "class_ws_tickets",
+    # created by 0017 (teacher verification policy)
+    "teacher_applications",
+    "teacher_application_contexts",
+    "teacher_evidence",
+    "teacher_evidence_contexts",
+    "teacher_verification_checks",
+    "teacher_assessments",
+    "teacher_approved_contexts",
 }
 
 

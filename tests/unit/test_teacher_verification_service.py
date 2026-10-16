@@ -216,7 +216,17 @@ def test_register_teacher_role_is_forced_server_side(session: Session) -> None:
 def test_admin_moves_pending_to_approved_and_audit_names_the_actor(
     session: Session, admin: User
 ) -> None:
+    from tests.conftest import grant_teaching_approval
+
     teacher = _teacher(session, verification=TeacherVerificationStatus.PENDING.value)
+    profile = _profile(session, teacher)
+    # The policy gate requires a completed approved application + scope
+    # before the direct endpoint may set approved; seed that durable state
+    # then reset the profile to pending so the move under test is the one
+    # that exercises the gate's success path.
+    grant_teaching_approval(session, profile, learning_context_ids=[uuid.uuid4()])
+    profile.verification_status = TeacherVerificationStatus.PENDING.value
+    session.flush()
 
     read = admin_user_service.set_teacher_verification(
         session,
@@ -247,8 +257,19 @@ def test_every_status_value_is_reachable_including_reopen_to_pending(
     session: Session, admin: User
 ) -> None:
     """One linear walk proves each value is a legal *move* from the last:
-    approved → rejected → suspended → pending (reopen) → approved."""
+    approved → rejected → suspended → pending (reopen) → approved.
+
+    Both approved moves pass the policy gate because the teacher already
+    has a completed approved application plus one approved scope row; the
+    first move starts from pending (status reset after seeding).
+    """
+    from tests.conftest import grant_teaching_approval
+
     teacher = _teacher(session, verification=TeacherVerificationStatus.PENDING.value)
+    profile = _profile(session, teacher)
+    grant_teaching_approval(session, profile, learning_context_ids=[uuid.uuid4()])
+    profile.verification_status = TeacherVerificationStatus.PENDING.value
+    session.flush()
 
     for status in (
         TeacherVerificationStatus.APPROVED,

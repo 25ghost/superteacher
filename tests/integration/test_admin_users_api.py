@@ -295,6 +295,11 @@ def _routes(target_user_id: str, teacher_email: str) -> list[tuple[str, str, dic
         ("POST", f"/api/v1/admin/teachers/{target_user_id}/activate", {}),
         ("POST", f"/api/v1/admin/teachers/{target_user_id}/deactivate", {}),
         ("PATCH", f"/api/v1/admin/teachers/{target_user_id}/school", {"school_id": None}),
+        (
+            "PATCH",
+            f"/api/v1/admin/teachers/{target_user_id}/verification",
+            {"status": "approved"},
+        ),
         ("GET", "/api/v1/admin/users", None),
         ("GET", f"/api/v1/admin/users/{target_user_id}", None),
         ("POST", f"/api/v1/admin/users/{target_user_id}/deactivate", None),

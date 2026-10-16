@@ -132,6 +132,12 @@ class Settings(BaseSettings):
     # Hard ceiling on one uploaded file (bytes). Content-type allowlist and
     # magic-byte checks live in app.services.file_validation.
     MATERIAL_MAX_FILE_BYTES: int = 20 * 1024 * 1024  # 20 MiB
+    # Hard ceiling on one uploaded verification-evidence file (bytes):
+    # teacher-verification evidence is scanned identity/qualification
+    # documents, deliberately stricter than study materials. Content-type
+    # allowlist and magic-byte checks live in
+    # app.services.evidence_validation.
+    EVIDENCE_MAX_FILE_BYTES: int = 10 * 1024 * 1024  # 10 MiB
     # Root directory for the local StorageBackend. Relative paths resolve
     # against the process working directory (backend/ in development).
     STORAGE_LOCAL_ROOT: str = "var/storage"

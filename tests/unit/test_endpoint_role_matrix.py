@@ -131,6 +131,16 @@ TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/ws-ticket", None),
     # Phase 3 slice 3D — live message recovery cursor (teacher-only).
     ("GET", "/api/v1/me/teacher/offerings/{offering_id}/classes/{class_id}/messages", None),
+    # Teacher verification application (teacher-only self-service).
+    ("GET", "/api/v1/me/teacher/application", None),
+    ("POST", "/api/v1/me/teacher/application", {}),
+    ("PATCH", "/api/v1/me/teacher/application/{application_id}", {}),
+    ("PUT", "/api/v1/me/teacher/application/{application_id}/contexts", {}),
+    ("POST", "/api/v1/me/teacher/application/{application_id}/evidence", {}),
+    ("DELETE", "/api/v1/me/teacher/application/{application_id}/evidence/{evidence_id}", None),
+    ("POST", "/api/v1/me/teacher/application/{application_id}/submit", None),
+    ("POST", "/api/v1/me/teacher/application/{application_id}/withdraw", None),
+    ("GET", "/api/v1/me/teacher/verification/scope", None),
 ]
 
 ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -164,6 +174,14 @@ ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/admin/materials/{material_id}/approve", None),
     ("POST", "/api/v1/admin/materials/{material_id}/reject", {"reason": "not allowed"}),
     ("POST", "/api/v1/admin/materials/{material_id}/archive", None),
+    # Teacher verification application review (admin-only).
+    ("GET", "/api/v1/admin/teacher-applications", None),
+    ("GET", "/api/v1/admin/teacher-applications/{application_id}", None),
+    ("GET", "/api/v1/admin/teacher-applications/{application_id}/evidence/{evidence_id}/file", None),
+    ("POST", "/api/v1/admin/teacher-applications/{application_id}/checks", {}),
+    ("POST", "/api/v1/admin/teacher-applications/{application_id}/assessments", {}),
+    ("POST", "/api/v1/admin/teacher-applications/{application_id}/request-information", {}),
+    ("POST", "/api/v1/admin/teacher-applications/{application_id}/decide", {}),
 ]
 
 ANY_ROLE_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -283,6 +301,8 @@ def _path(template: str) -> str:
         lesson_id=uuid.uuid4(),
         material_id=uuid.uuid4(),
         class_id=uuid.uuid4(),
+        application_id=uuid.uuid4(),
+        evidence_id=uuid.uuid4(),
         school_code="MISSING",
     )
 
@@ -342,7 +362,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 115, f"route count changed: {len(actual)} != 115"
+    assert len(actual) == 131, f"route count changed: {len(actual)} != 131"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------

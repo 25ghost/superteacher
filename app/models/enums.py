@@ -115,6 +115,125 @@ class TeacherVerificationStatus(str, enum.Enum):
     SUSPENDED = "suspended"
 
 
+class TeacherVerificationCategory(str, enum.Enum):
+    """The approved verification category of a teacher account.
+
+    Exactly two categories exist and they are NOT interchangeable labels:
+
+    - ``formal_teacher`` — the applicant claimed formal teacher status and
+      the claim was verified through the application workflow;
+    - ``independent_tutor`` — the applicant qualified through subject
+      expertise without claiming formal teaching qualifications.
+
+    Stored on ``teachers.verification_category`` (nullable: a teacher who
+    has never completed the application workflow has NO category and fails
+    closed) and claimed on ``teacher_applications.category``.
+    """
+
+    FORMAL_TEACHER = "formal_teacher"
+    INDEPENDENT_TUTOR = "independent_tutor"
+
+
+class TeacherApplicationStatus(str, enum.Enum):
+    """Lifecycle of one teacher verification application (review cycle).
+
+    ``draft → submitted → (needs_information → submitted)* →
+    (approved | rejected)``, with ``withdrawn`` reachable from any
+    non-terminal state. Re-application after a terminal state is a NEW
+    application row (``previous_application_id`` preserves the chain);
+    these are application states, not a replacement for the account-level
+    ``teachers.verification_status``. Enforced by
+    ``teacher_applications_status_check`` plus the service transition map.
+    """
+
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    NEEDS_INFORMATION = "needs_information"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+
+
+class ApplicationContextStatus(str, enum.Enum):
+    """Decision state of ONE requested learning context on an application.
+
+    Approval applies only to explicitly reviewed contexts: every requested
+    context must reach ``approved`` or ``rejected`` (with a reason) before
+    the application itself may be approved.
+    """
+
+    REQUESTED = "requested"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class TeacherEvidenceType(str, enum.Enum):
+    """Kind of credential/identity evidence attached to an application.
+
+    Identity evidence and qualification evidence are sensitive private
+    documents — never student learning material. The experience route for
+    an independent tutor requires ``professional_experience`` evidence AND
+    a recorded passing subject assessment; a CV/bio/self-declaration alone
+    is never evidence of this type.
+    """
+
+    IDENTITY_DOCUMENT = "identity_document"
+    ACADEMIC_QUALIFICATION = "academic_qualification"
+    TEACHER_TRAINING = "teacher_training"
+    PROFESSIONAL_REGISTRATION = "professional_registration"
+    EMPLOYMENT_CONFIRMATION = "employment_confirmation"
+    SUBJECT_QUALIFICATION = "subject_qualification"
+    VOCATIONAL_QUALIFICATION = "vocational_qualification"
+    PROFESSIONAL_EXPERIENCE = "professional_experience"
+
+
+class TeacherEvidenceStatus(str, enum.Enum):
+    """Evidence row lifecycle: ``removed`` is a soft delete that keeps the
+    submitted history auditable."""
+
+    SUBMITTED = "submitted"
+    REMOVED = "removed"
+
+
+class VerificationCheckOutcome(str, enum.Enum):
+    """Outcome of one reviewer verification check on one evidence row.
+
+    An inconclusive or failed required check blocks approval until it is
+    resolved by a later, recorded check. The latest check outcome per
+    evidence is what approval accounting uses.
+    """
+
+    VERIFIED = "verified"
+    FAILED = "failed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class VerificationMethod(str, enum.Enum):
+    """How a reviewer checked a credential — recorded, never inferred.
+
+    ``registry_lookup`` and ``issuer_confirmation`` are the independent
+    routes; ``manual_contact`` is the documented manual method for
+    credentials without an accessible register; ``other`` requires notes.
+    """
+
+    REGISTRY_LOOKUP = "registry_lookup"
+    ISSUER_CONFIRMATION = "issuer_confirmation"
+    MANUAL_CONTACT = "manual_contact"
+    OTHER = "other"
+
+
+class AssessmentOutcome(str, enum.Enum):
+    """Outcome of a recorded subject-specific assessment (experience route).
+
+    Only ``passed`` satisfies the independent-tutor experience route. The
+    platform never scores assessments — an authorized reviewer records the
+    outcome of an assessment performed under the reviewer's own standards.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+
+
 class TeachingOfferingStatus(str, enum.Enum):
     """Lifecycle of one teacher's offering of a learning context.
 
