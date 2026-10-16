@@ -118,7 +118,7 @@ def _require_approved(
     """Veto every class-writing attempt by a teacher who is not eligible.
 
     Eligibility is the unified policy check: approved status AND an
-    approved verification category backed by a completed application â€”
+    approved verification category backed by a completed application —
     not the status column alone. It is re-read from the profile row on
     every call (the JWT claim is never consulted), so a vetting decision
     taken after the token was issued still applies to the very next

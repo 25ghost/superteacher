@@ -167,7 +167,7 @@ def approved_teacher(session: Session, catalog: dict) -> User:
         session, verification=TeacherVerificationStatus.APPROVED.value
     )
     # Grant scope for the maths context (the coherent payload below; chem
-    # is deliberately NOT part of COMB â€” tests assert the incoherent tuple
+    # is deliberately NOT part of COMB — tests assert the incoherent tuple
     # is refused before any scope check runs).
     _approve_for(session, user, _payload(catalog, subject_key="maths"))
     return user

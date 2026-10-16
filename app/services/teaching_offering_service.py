@@ -89,7 +89,7 @@ def _require_publishable(
     """Eligibility (approved category + completed application) + scope.
 
     The unified policy check: ``teachers.verification_status == approved``
-    is no longer enough on its own â€” the teacher must also hold an
+    is no longer enough on its own — the teacher must also hold an
     approved verification category backed by a completed application, and
     the exact canonical context must sit in their approved scope
     (``teacher_approved_contexts``).
