@@ -284,8 +284,18 @@ def update_my_offering(
     different, reachable value; ``description`` alone may clear the text.
     Exactly one audit event is written: ``teaching_offering_status_changed``
     when the status drives the call, otherwise ``teaching_offering_updated``.
+
+    Order mirrors :func:`create_offering`: eligible teacher (403) ->
+    owned offering (404) -> legal transition (409). Eligibility is re-read
+    from the profile row here, at the moment of the write: the offering
+    may have been published while the teacher was approved and vetting may
+    have revoked that since (a suspended teacher never edits, pauses,
+    resumes or archives an offering, and no audit event is written).
     """
     profile = _load_profile(session, user)
+    teaching_authorization.require_eligible_teacher(
+        session, profile, action="amend teaching offerings"
+    )
     offering = _owned_offering(session, profile, offering_id)
 
     sets_status = "status" in payload.model_fields_set

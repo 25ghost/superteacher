@@ -17,9 +17,12 @@ guarded by ``require_teacher``:
 - ``PATCH /me/teacher/offerings/{offering_id}`` — amend the description
   and/or move active → paused → archived.
 
-Publishing additionally requires an **approved** verification: an account
-that may log in is not enough, so the vetting decision stays meaningful
-after the invitation is accepted (403 otherwise).
+Publishing and amending additionally require an **approved**
+verification: an account that may log in is not enough, so the vetting
+decision stays meaningful after the invitation is accepted (403
+otherwise) — the profile row is re-read on every write, so a teacher
+suspended after publishing can no longer edit, pause, resume or archive
+their offerings.
 
 Endpoint bodies stay thin: validate schema → delegate to the service →
 map the Phase 1 error family onto HTTP → commit on success.
@@ -202,14 +205,18 @@ def list_my_offering_students(
         "archived); archived is terminal and any other pair is 409. A "
         "supplied status must differ from the current one (same status → "
         "409, never a silent 200). Supplying only description changes the "
-        "text (explicit null clears it). Exactly one audit event is written: "
+        "text (explicit null clears it). Requires the same APPROVED "
+        "verification as publishing, re-read from the profile row at the "
+        "moment of the write (403 otherwise — a teacher suspended after "
+        "publishing cannot amend, pause, resume or archive an offering). "
+        "Exactly one audit event is written: "
         "teaching_offering_status_changed when status is supplied, otherwise "
         "teaching_offering_updated. Unknown or foreign id → 404."
     ),
     responses={
         200: {"description": "Offering updated"},
         401: {"description": "Missing/invalid credentials"},
-        403: {"description": "Authenticated but not a teacher account"},
+        403: {"description": "Not a teacher account, or verification is not approved"},
         404: {"description": "Unknown offering id, or not one of yours"},
         409: {"description": "Same status, or the transition is not allowed"},
         422: {"description": "Invalid request (no fields, null status, unknown keys)"},

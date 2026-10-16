@@ -46,6 +46,7 @@ from app.models.program_version import ProgramVersion
 from app.models.student import Student
 from app.models.subject import Subject
 from app.models.teacher import Teacher
+from app.models.teaching_offering import TeachingOffering
 from app.models.user import User
 from app.schemas.learning import (
     TeachingOfferingCreate,
@@ -401,6 +402,239 @@ def test_foreign_offering_id_404s_like_an_unknown_id(
         message = str(excinfo.value)
         assert message.startswith("no teaching offering with id ")
         assert not any(word in message for word in ("teacher", "not yours", "other"))
+
+
+# --- amendment authorization (P2) -------------------------------------------------------
+
+
+def test_an_eligible_teacher_amends_pauses_resumes_and_archives(
+    session: Session, catalog: dict, approved_teacher: User
+) -> None:
+    """Positive control: every supported mutation still works when eligible."""
+    created = teaching_offering_service.create_offering(
+        session, approved_teacher, _payload(catalog)
+    )
+    session.commit()
+    offering_id = created.offering_id
+
+    edited = teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(description="Now with proofs"),
+    )
+    assert edited.description == "Now with proofs"
+    assert edited.status == "active"
+
+    paused = teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.PAUSED),
+    )
+    assert paused.status == "paused"
+
+    resumed = teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ACTIVE),
+    )
+    assert resumed.status == "active"
+
+    archived = teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ARCHIVED),
+    )
+    assert archived.status == "archived"
+    session.commit()
+
+    event_types = [
+        e.event_type
+        for e in session.scalars(
+            select(AuthEvent).where(AuthEvent.user_id == approved_teacher.id)
+        )
+    ]
+    assert event_types == [
+        "teaching_offering_created",
+        "teaching_offering_updated",
+        "teaching_offering_status_changed",
+        "teaching_offering_status_changed",
+        "teaching_offering_status_changed",
+    ]
+
+
+def test_a_suspended_teacher_cannot_amend_pause_resume_or_archive(
+    session: Session, catalog: dict, approved_teacher: User
+) -> None:
+    """The offering was published while approved; vetting revoked it since."""
+    created = teaching_offering_service.create_offering(
+        session, approved_teacher, _payload(catalog)
+    )
+    session.commit()
+    offering_id = created.offering_id
+
+    # Pause while still eligible, so resume/reactivate can be probed below.
+    teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.PAUSED),
+    )
+    session.commit()
+
+    profile = _teacher_profile(session, approved_teacher)
+    profile.verification_status = TeacherVerificationStatus.SUSPENDED.value
+    session.commit()
+
+    for mutation in (
+        TeachingOfferingUpdate(description="tampered"),
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ACTIVE),
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ARCHIVED),
+    ):
+        with pytest.raises(LearningForbiddenError) as excinfo:
+            teaching_offering_service.update_my_offering(
+                session, approved_teacher, offering_id, mutation
+            )
+        session.rollback()
+        message = str(excinfo.value)
+        assert excinfo.value.status_code == 403
+        assert "approved teacher" in message
+        # A refusal never confirms which offering was probed (L6).
+        assert str(offering_id) not in message
+
+    # Nothing partially changed: a FRESH session sees the committed row
+    # exactly as it was, and no audit event was written for a mutation
+    # that never happened.
+    fresh = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )()
+    try:
+        stored = fresh.get(TeachingOffering, offering_id)
+        assert stored.status == "paused"
+        assert stored.description == "Algebra and geometry"
+        event_types = [
+            e.event_type
+            for e in fresh.scalars(
+                select(AuthEvent).where(AuthEvent.user_id == approved_teacher.id)
+            )
+        ]
+    finally:
+        fresh.close()
+    assert event_types == [
+        "teaching_offering_created",
+        "teaching_offering_status_changed",
+    ]
+
+    # The check reads the ROW, not the token: restoring the verification
+    # lets the very same resume through.
+    profile = _teacher_profile(session, approved_teacher)
+    profile.verification_status = TeacherVerificationStatus.APPROVED.value
+    session.commit()
+    resumed = teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ACTIVE),
+    )
+    session.commit()
+    assert resumed.status == "active"
+
+
+def test_a_suspended_teacher_gets_the_same_403_for_any_offering_id(
+    session: Session, catalog: dict, approved_teacher: User
+) -> None:
+    """Eligibility is decided before ownership, so ids stay indistinguishable."""
+    created = teaching_offering_service.create_offering(
+        session, approved_teacher, _payload(catalog)
+    )
+    other = _teacher_user(
+        session, verification=TeacherVerificationStatus.APPROVED.value
+    )
+    _approve_for(session, other, _payload(catalog))
+    other_offering = teaching_offering_service.create_offering(
+        session, other, _payload(catalog)
+    )
+    session.commit()
+
+    profile = _teacher_profile(session, approved_teacher)
+    profile.verification_status = TeacherVerificationStatus.SUSPENDED.value
+    session.commit()
+
+    messages = []
+    for target in (uuid.uuid4(), other_offering.offering_id):
+        with pytest.raises(LearningForbiddenError) as excinfo:
+            teaching_offering_service.update_my_offering(
+                session,
+                approved_teacher,
+                target,
+                TeachingOfferingUpdate(description="probe"),
+            )
+        session.rollback()
+        assert excinfo.value.status_code == 403
+        messages.append(str(excinfo.value))
+    assert messages[0] == messages[1]
+
+    # ...and an ELIGIBLE teacher probing those same ids still gets the
+    # ownership 404, same message shape for unknown and foreign (L6).
+    profile.verification_status = TeacherVerificationStatus.APPROVED.value
+    session.commit()
+    with pytest.raises(LearningNotFoundError) as unknown:
+        teaching_offering_service.update_my_offering(
+            session,
+            approved_teacher,
+            uuid.uuid4(),
+            TeachingOfferingUpdate(description="probe"),
+        )
+    with pytest.raises(LearningNotFoundError) as foreign:
+        teaching_offering_service.update_my_offering(
+            session,
+            approved_teacher,
+            other_offering.offering_id,
+            TeachingOfferingUpdate(description="probe"),
+        )
+    session.rollback()
+    for excinfo in (unknown, foreign):
+        assert excinfo.value.status_code == 404
+        assert str(excinfo.value).startswith("no teaching offering with id ")
+
+
+def test_the_transition_matrix_survives_the_eligibility_guard(
+    session: Session, catalog: dict, approved_teacher: User
+) -> None:
+    """Refusing a suspended teacher never softens the 409 rules for an eligible one."""
+    created = teaching_offering_service.create_offering(
+        session, approved_teacher, _payload(catalog)
+    )
+    session.commit()
+
+    with pytest.raises(LearningConflictError) as same:
+        teaching_offering_service.update_my_offering(
+            session,
+            approved_teacher,
+            created.offering_id,
+            TeachingOfferingUpdate(status=TeachingOfferingStatus.ACTIVE),
+        )
+    assert "already" in str(same.value)
+
+    teaching_offering_service.update_my_offering(
+        session,
+        approved_teacher,
+        created.offering_id,
+        TeachingOfferingUpdate(status=TeachingOfferingStatus.ARCHIVED),
+    )
+    session.commit()
+
+    with pytest.raises(LearningConflictError) as terminal:
+        teaching_offering_service.update_my_offering(
+            session,
+            approved_teacher,
+            created.offering_id,
+            TeachingOfferingUpdate(status=TeachingOfferingStatus.ACTIVE),
+        )
+    assert "cannot move" in str(terminal.value)
 
 
 # --- marketplace ------------------------------------------------------------------------
