@@ -26,6 +26,7 @@ Role-split layout (no endpoint serves two roles):
 - ``admin_students.router`` — administration (`/admin/students`),
 - ``admin_users.router`` — administration (`/admin/teachers`, `/admin/users`),
 - ``admin_materials.router`` — administration (`/admin/materials`, Phase 2 2B),
+- ``admin_books.router`` — administration (`/admin/books`, book intake P1),
 - ``registrations.router`` / ``registrations.me_router`` — public readiness
   + student self-service (`/me/registrations`),
 - ``registrations.admin_router`` — administration (`/admin/registrations`),
@@ -34,6 +35,7 @@ Role-split layout (no endpoint serves two roles):
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    admin_books,
     admin_materials,
     admin_students,
     admin_users,
@@ -72,6 +74,7 @@ api_router.include_router(catalog.router)
 api_router.include_router(admin_students.router)
 api_router.include_router(admin_users.router)
 api_router.include_router(admin_materials.router)
+api_router.include_router(admin_books.router)
 api_router.include_router(registrations.router)
 api_router.include_router(registrations.me_router)
 api_router.include_router(registrations.admin_router)

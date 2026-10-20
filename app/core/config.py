@@ -132,6 +132,11 @@ class Settings(BaseSettings):
     # Hard ceiling on one uploaded file (bytes). Content-type allowlist and
     # magic-byte checks live in app.services.file_validation.
     MATERIAL_MAX_FILE_BYTES: int = 20 * 1024 * 1024  # 20 MiB
+    # Hard ceiling on one uploaded administrator book PDF (bytes), kept
+    # separate from MATERIAL_MAX_FILE_BYTES so the teacher-material limit
+    # never changes when book policy evolves. Books are PDF-only; the
+    # structural pypdf intake lives in app.services.book_validation.
+    BOOK_MAX_FILE_BYTES: int = 20 * 1024 * 1024  # 20 MiB
     # Hard ceiling on one uploaded verification-evidence file (bytes):
     # teacher-verification evidence is scanned identity/qualification
     # documents, deliberately stricter than study materials. Content-type

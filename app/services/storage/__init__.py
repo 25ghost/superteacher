@@ -8,6 +8,7 @@ root — the models, services and API stay unchanged.
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Protocol
 
@@ -23,6 +24,18 @@ class StorageBackend(Protocol):
 
     def save(self, storage_key: str, data: bytes, *, content_type: str) -> None:
         """Persist ``data`` under ``storage_key`` (creating parents as needed)."""
+
+    def save_file(
+        self, storage_key: str, source_path: str | Path, *, content_type: str
+    ) -> None:
+        """Persist the file at ``source_path`` under ``storage_key``.
+
+        Additive sibling of :meth:`save` for uploads staged on disk
+        (administrator books): the bytes are copied from the source file
+        so the application never has to hold a whole book in memory just
+        to hand it to the backend. ``source_path`` is a local filesystem
+        path the backend reads — never a client-supplied storage key.
+        """
 
     def read(self, storage_key: str) -> bytes:
         """Return the bytes stored under ``storage_key``."""
@@ -58,6 +71,13 @@ class LocalStorageBackend:
         path = self._resolve(storage_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+
+    def save_file(
+        self, storage_key: str, source_path: str | Path, *, content_type: str
+    ) -> None:
+        path = self._resolve(storage_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, path)
 
     def read(self, storage_key: str) -> bytes:
         path = self._resolve(storage_key)

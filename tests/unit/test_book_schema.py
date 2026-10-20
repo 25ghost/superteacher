@@ -280,6 +280,34 @@ def test_book_revision_status_vocabulary_is_the_six_intake_states() -> None:
     assert BookRevisionStatus.UPLOADED.value == "uploaded"
 
 
+def test_the_p1_endpoint_names_bypass_the_banned_segment_tripwire() -> None:
+    """``/admin/books`` carries none of the forbidden path substrings."""
+    from fastapi.routing import APIRoute
+
+    from app.api.v1.router import api_router
+
+    banned = (
+        "message", "conversation", "chat", "thread", "payment", "price",
+        "purchase", "checkout", "rating", "review", "assignment", "homework",
+        "quiz", "feedback", "search", "directory",
+    )
+    book_routes = [
+        (method, route.path)
+        for route in api_router.routes
+        if isinstance(route, APIRoute) and "book" in route.path
+        for method in route.methods
+        if method not in ("HEAD", "OPTIONS")
+    ]
+    assert book_routes, "the book routes must be registered"
+    violations = [
+        (method, path, segment)
+        for method, path in book_routes
+        for segment in banned
+        if segment in path
+    ]
+    assert violations == [], violations
+
+
 def test_the_book_status_enum_never_drifts_from_the_asset_vocabulary() -> None:
     """Intake reuses the shared file-asset states it already depends on."""
     assert "stored" in {s.value for s in FileAssetStatus}
