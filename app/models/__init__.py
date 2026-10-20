@@ -8,6 +8,9 @@ from app.core.database import Base
 from app.models.academic_year import AcademicYear
 from app.models.auth_event import AuthEvent
 from app.models.auth_session import AuthSession
+from app.models.book import Book
+from app.models.book_revision import BookRevision
+from app.models.book_revision_context import BookRevisionContext
 from app.models.class_attendance_segment import ClassAttendanceSegment
 from app.models.class_message import ClassMessage
 from app.models.class_ws_ticket import ClassWsTicket
@@ -53,6 +56,9 @@ __all__ = [
     "AcademicYear",
     "AuthEvent",
     "AuthSession",
+    "Book",
+    "BookRevision",
+    "BookRevisionContext",
     "ClassAttendanceSegment",
     "ClassMessage",
     "ClassWsTicket",

@@ -43,6 +43,11 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 # The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
+    # Administrator book intake (0018) - context links before revisions
+    # before books; all before the file_assets/users they reference.
+    "book_revision_contexts",
+    "book_revisions",
+    "books",
     # Phase 3 slice 3A - classroom children before the class sessions they
     # hang off (messages/segments/tickets cascade from online_class_sessions).
     "class_messages",
@@ -101,6 +106,69 @@ APPLICATION_TABLES: tuple[str, ...] = (
 
 class UnsafeTestDatabase(RuntimeError):
     """Raised when integration tests target a database that is not clearly a test database."""
+
+
+def build_minimal_pdf(text: str | None = "Hello Book Content", *, pages: int = 1) -> bytes:
+    """Byte-exact minimal PDF that ``pypdf`` really parses.
+
+    The legacy ``b"%PDF-1.4 fake pdf content"`` fixtures satisfy the
+    teacher-material prefix check but cannot survive the administrator
+    book intake probe (a real ``pypdf`` parse plus an extractable-text
+    requirement), so book tests build structurally valid documents here
+    instead. The xref offsets are computed for real — a hand-waved xref
+    would be rejected as corrupt, which is precisely what some tests
+    want (they corrupt the result deliberately).
+
+    ``text=None`` produces an image-only style page: a content stream
+    with no text-showing operator, so extraction yields no text.
+    """
+    content_ops: list[bytes] = []
+    for _ in range(pages):
+        if text is None:
+            content_ops.append(b"")  # a page with a stream but no text
+        else:
+            escaped = text.encode("latin-1").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+            content_ops.append(b"BT /F1 12 Tf 72 720 Td (" + escaped + b") Tj ET\n")
+    # Object layout: 1 catalog, 2 pages node, then one page object and one
+    # content-stream object per page, then the font.
+    page_ids = list(range(3, 3 + pages))
+    content_ids = list(range(3 + pages, 3 + 2 * pages))
+    font_id = 3 + 2 * pages
+
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        (
+            b"<< /Type /Pages /Kids ["
+            + b" ".join(f"{i} 0 R".encode() for i in page_ids)
+            + f"] /Count {pages} >>".encode()
+        ),
+    ]
+    for page_id, content_id in zip(page_ids, content_ids):
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Contents {content_id} 0 R /Resources << /Font << /F1 {font_id} 0 R >> >> >>".encode()
+        )
+    for body in content_ops:
+        objects.append(
+            b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"endstream"
+        )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
 
 
 def grant_teaching_approval(

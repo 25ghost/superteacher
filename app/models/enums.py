@@ -299,6 +299,35 @@ class MaterialStatus(str, enum.Enum):
     ARCHIVED = "archived"
 
 
+class BookRevisionStatus(str, enum.Enum):
+    """Intake-to-publication lifecycle of one uploaded book edition.
+
+    P1 (administrator intake) writes only ``uploaded``: the book library
+    is not yet student-visible and no extraction or review workflow runs.
+    The remaining values exist so the approved later phases extend this
+    same vocabulary instead of redefining the column:
+
+    - ``extracting`` / ``extraction_failed`` — asynchronous content
+      extraction in progress, or failed and awaiting an administrator
+      retry (ADR-004/ADR-005);
+    - ``pending_review`` — extracted structure awaiting administrative
+      approval; never student-visible;
+    - ``published`` / ``rejected`` — terminal review outcomes; published
+      revisions are immutable and corrections create a NEW revision
+      (ADR-005).
+
+    Enforced by ``book_revisions_status_check``. Published revisions are
+    the only future student-visible state; P1 exposes no student surface.
+    """
+
+    UPLOADED = "uploaded"
+    EXTRACTING = "extracting"
+    EXTRACTION_FAILED = "extraction_failed"
+    PENDING_REVIEW = "pending_review"
+    PUBLISHED = "published"
+    REJECTED = "rejected"
+
+
 class FileAssetStatus(str, enum.Enum):
     """Upload/validation pipeline state for one stored file asset.
 

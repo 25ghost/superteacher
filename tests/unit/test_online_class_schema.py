@@ -244,7 +244,8 @@ def test_ws_tickets_stay_single_use_through_a_unique_digest() -> None:
 
 
 def test_verification_script_covers_the_new_tables_and_head() -> None:
-    assert verify_database.EXPECTED_REVISION == "0017"
+    # Head may advance beyond this slice (0018 book intake); never behind.
+    assert verify_database.EXPECTED_REVISION >= "0017"
     assert verify_database.EXPECTED_REVISION == _migration_head()
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES

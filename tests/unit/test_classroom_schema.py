@@ -218,7 +218,9 @@ def test_participation_indexes_have_no_model_migration_drift() -> None:
 
 
 def test_verification_script_expects_head_0016() -> None:
-    assert verify_database.EXPECTED_REVISION == "0017"
+    # The head may advance beyond this slice's own migration (0017 teacher
+    # verification, 0018 book intake); it must never fall behind it.
+    assert verify_database.EXPECTED_REVISION >= "0017"
     assert verify_database.EXPECTED_REVISION == _migration_head()
 
 

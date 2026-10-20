@@ -100,9 +100,14 @@ EXPECTED_TABLES = {
     "teacher_verification_checks",
     "teacher_assessments",
     "teacher_approved_contexts",
+    # created by 0018 (administrator book intake: library + editions +
+    # canonical context associations)
+    "books",
+    "book_revisions",
+    "book_revision_contexts",
 }
 
-EXPECTED_REVISION = "0017"
+EXPECTED_REVISION = "0018"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -154,6 +159,18 @@ EXPECTED_FK_INDEXES = {
     # Phase 2 slice 2C: personal material progress FKs.
     "material_progress_student_id_idx": ("material_progress", ("student_id",)),
     "material_progress_material_id_idx": ("material_progress", ("material_id",)),
+    # Administrator book intake (0018): book library FKs.
+    "books_created_by_user_id_idx": ("books", ("created_by_user_id",)),
+    "book_revisions_book_id_idx": ("book_revisions", ("book_id",)),
+    "book_revisions_file_asset_id_idx": ("book_revisions", ("file_asset_id",)),
+    "book_revisions_uploaded_by_user_id_idx": (
+        "book_revisions",
+        ("uploaded_by_user_id",),
+    ),
+    "book_revision_contexts_context_id_idx": (
+        "book_revision_contexts",
+        ("learning_context_id",),
+    ),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------
@@ -796,6 +813,11 @@ LATER_MIGRATION_TABLES = {
     "teacher_verification_checks",
     "teacher_assessments",
     "teacher_approved_contexts",
+    # created by 0018 (administrator book intake: library + editions +
+    # canonical context associations)
+    "books",
+    "book_revisions",
+    "book_revision_contexts",
 }
 
 
@@ -1274,7 +1296,7 @@ def rebuild_schema(db_url: str) -> bool:
             print(f"REFUSED: {rows} application row(s) exist — refusing to drop data.")
             engine.dispose()
             return False
-        print("target database contains no application data (0 rows in all 22 tables)")
+        print("target database contains no application data (0 rows in all 25 tables)")
 
     alembic_cfg = Config(str(BACKEND_DIR / "alembic.ini"))
     alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
@@ -1288,7 +1310,7 @@ def rebuild_schema(db_url: str) -> bool:
     command.upgrade(alembic_cfg, "head")
     recreated = set(inspect(engine).get_table_names())
     recreated_ok = (EXPECTED_TABLES & recreated) == EXPECTED_TABLES
-    print(f"  all 22 tables recreated: {recreated_ok}")
+    print(f"  all 25 tables recreated: {recreated_ok}")
 
     engine.dispose()
     ok = not remaining and recreated_ok
