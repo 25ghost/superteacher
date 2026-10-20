@@ -1022,6 +1022,21 @@ def test_registry_finds_connections_for_an_offering_revocation() -> None:
     assert {connection.connection_id for connection in found} == {"c1", "c2"}
 
 
+def test_presence_claim_is_exactly_once_until_the_participant_leaves() -> None:
+    """One socket shows one participant once: claim, drop, release, re-claim."""
+    connection = _fake_connection(uuid.uuid4(), uuid.uuid4())
+
+    assert connection.claim_participant(connection.participant_ref) is True
+    assert connection.claim_participant(connection.participant_ref) is False
+
+    connection.release_participant(connection.participant_ref)
+    assert connection.claim_participant(connection.participant_ref) is True
+
+    # Releasing a ref this socket never showed is a harmless no-op.
+    connection.release_participant(uuid.uuid4().hex[:32])
+    assert connection.claim_participant(uuid.uuid4().hex[:32]) is True
+
+
 def test_bus_publish_validates_and_stays_a_local_noop_on_sqlite() -> None:
     engine = create_engine(
         "sqlite+pysqlite://", connect_args={"check_same_thread": False},

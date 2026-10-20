@@ -19,6 +19,15 @@ used inside presence events: SHA-256 of ``"{class_id}:{user_id}"``, first
 worker's student rows) but reveals nothing about the user id — presence
 events never carry raw ids.
 
+Presence claims (§20 exactly-once)
+    A socket builds its snapshot from a registry read that RACES the join
+    broadcast of whoever is joining at that instant, so one participant
+    can reach the same socket twice — through the snapshot and through
+    the broadcast. ``claim_participant`` is the guard: the first claim
+    wins and every later claim of the same ref is refused, and
+    ``release_participant`` (on ``presence.left``) makes a later rejoin
+    news again. The set belongs to ONE connection and dies with it.
+
 Behavior hooks (``handle_event``, ``cleanup``) are plain attributes the
 WS endpoint installs on registration: the event bus only ever schedules
 ``handle_event(payload)`` on the connection's loop, and cleanup stays in
@@ -73,8 +82,33 @@ class LiveConnection:
     #: only the teardown frame, sent with ``force=True``, may still go
     #: out on the way to the close.
     revoked: bool = False
+    #: Participant refs this socket has already put on the wire (§20).
+    _shown_participants: set[str] = field(default_factory=set, repr=False)
+    _claim_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def claim_participant(self, participant_ref: str | None) -> bool:
+        """Show this participant on this socket; False when already shown.
+
+        The first claim always wins, so a ref this socket never carried
+        (or one it released) is news again. A missing ref cannot be
+        deduplicated and is therefore always claimable.
+        """
+        if not participant_ref:
+            return True
+        with self._claim_lock:
+            if participant_ref in self._shown_participants:
+                return False
+            self._shown_participants.add(participant_ref)
+            return True
+
+    def release_participant(self, participant_ref: str | None) -> None:
+        """Forget a participant this socket showed — their next join shows again."""
+        if not participant_ref:
+            return
+        with self._claim_lock:
+            self._shown_participants.discard(participant_ref)
 
     async def send_json(self, payload: dict, *, force: bool = False) -> bool:
         """Send one frame; False when the socket is gone or revoked.

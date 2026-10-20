@@ -1172,6 +1172,77 @@ def test_presence_snapshot_broadcast_and_left(
             assert second_ws.receive_json()["participant"]["participant_ref"] == first_ref
 
 
+def test_a_join_broadcast_never_duplicates_a_snapshot_entry(
+    api_client: TestClient, classroom: dict, monkeypatch
+) -> None:
+    """§20 exactly-once: a snapshot entry "joining" again mid-handshake.
+
+    A participant already inside may publish their join while a newcomer
+    registers — the broadcast lands between the newcomer's registry read
+    and its snapshot send. Whichever path reaches the socket first wins:
+    that participant appears exactly once on the wire, never twice.
+    """
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    second = _seed_second_student(api_client, classroom)
+    third = _seed_second_student(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+
+    first_ref = _ref(class_id, classroom["student"]["user_id"])
+    second_ref = _ref(class_id, second["user_id"])
+    third_ref = _ref(class_id, third["user_id"])
+
+    first_ticket = _mint_student(api_client, classroom, class_id)["ticket"]
+    second_ticket = _mint_student(
+        api_client, classroom, class_id, header=second["header"]
+    )["ticket"]
+
+    with api_client.websocket_connect(_ws_url(class_id, first_ticket)) as first_ws:
+        assert first_ws.receive_json()["participant"]["participant_ref"] == first_ref
+
+        from app.api.v1.endpoints import classroom_ws
+        from app.realtime.connections import registry as live_registry
+
+        original_remote_students = classroom_ws._remote_students
+
+        def _republish_first(cid, identity, local_student_ids):
+            # The first student is already in the newcomer's registry
+            # snapshot (the read precedes this hook): republishing their
+            # join here IS the mid-handshake broadcast race.
+            cid_text = str(cid)
+            connection = next(
+                other
+                for other in live_registry.connections_for_class(uuid.UUID(cid_text))
+                if other.participant_ref == first_ref
+            )
+            classroom_ws._publish(
+                {
+                    "type": "presence.joined",
+                    "class_id": cid_text,
+                    "participant": classroom_ws._presence_of(connection),
+                    "except_ref": connection.participant_ref,
+                }
+            )
+            return original_remote_students(cid, identity, local_student_ids)
+
+        monkeypatch.setattr(classroom_ws, "_remote_students", _republish_first)
+
+        with api_client.websocket_connect(_ws_url(class_id, second_ticket)) as second_ws:
+            # Snapshot or broadcast, in either arrival order — once each.
+            assert second_ws.receive_json()["participant"]["participant_ref"] == first_ref
+            assert second_ws.receive_json()["participant"]["participant_ref"] == second_ref
+
+            # The next real join proves no duplicate is queued behind them.
+            third_ticket = _mint_student(
+                api_client, classroom, class_id, header=third["header"]
+            )["ticket"]
+            with api_client.websocket_connect(_ws_url(class_id, third_ticket)):
+                assert (
+                    second_ws.receive_json()["participant"]["participant_ref"]
+                    == third_ref
+                )
+
+
 def test_presence_events_never_cross_classes(
     api_client: TestClient, classroom: dict
 ) -> None:

@@ -36,7 +36,11 @@ joined a class that was still live)
        before any snapshot or presence broadcast;
     6. snapshot (``presence.joined`` for every other participant, others
        first then self — §20), broadcast your join to everyone else
-       (never to yourself);
+       (never to yourself). The registry read that feeds the snapshot
+       races a join broadcast already on its way, so every entry is
+       claimed first: each participant reaches a socket exactly once,
+       whichever path delivers it, and ``presence.left`` releases the
+       claim so a rejoin shows again;
     7. live loop: control frames + heartbeat watchdog.
 
 Close codes (stable, documented in ``app.realtime.close_codes``)
@@ -53,7 +57,9 @@ Events (client-visible vocabulary, nothing else ever crosses the wire)
       snapshot BEFORE their own join is broadcast to the others.
       ``presence.left`` is published only while the class is still live
       (§36): a class end bulk-closes everyone and sends ``class.ended``
-      instead.
+      instead. Exactly-once per socket (§20): a join broadcast that
+      races the snapshot of the same participant is dropped, and their
+      ``presence.left`` releases the claim so the next join is news.
     * ``class.started`` / ``class.ended`` — ``{"type", "class_id"}``,
       relayed from the bus exactly when the database transition commits
       (manual End, overdue auto-end, and the teacher's Start alike —
@@ -609,6 +615,14 @@ def _install_hooks(connection: LiveConnection) -> None:
             if event_type in (cc.EVENT_PRESENCE_JOINED, cc.EVENT_PRESENCE_LEFT):
                 participant = event.get("participant")
                 if isinstance(participant, dict):
+                    ref = participant.get("participant_ref")
+                    if event_type == cc.EVENT_PRESENCE_LEFT:
+                        # Their next join must be news again (§20 exactly-once).
+                        connection.release_participant(ref)
+                    elif not connection.claim_participant(ref):
+                        # Already on this socket's wire: the snapshot and
+                        # this broadcast raced — never show them twice.
+                        return
                     # §19 shape exactly — routing keys never reach a client.
                     await connection.send_json(
                         {"type": event_type, "participant": participant}
@@ -816,6 +830,10 @@ async def classroom_websocket(websocket: WebSocket, class_id: uuid.UUID) -> None
             logger.exception("realtime listener failed to start")
 
         # §11 steps 8-11: snapshot (others → self) then broadcast the join.
+        # Each entry is CLAIMED first: the registry read above races the
+        # join broadcast of someone joining right now, and §20 allows a
+        # participant on this socket exactly once — whichever of the two
+        # paths reaches the wire first.
         local_connections = registry.connections_for_class(class_id)
         local_others = [
             other
@@ -829,12 +847,16 @@ async def classroom_websocket(websocket: WebSocket, class_id: uuid.UUID) -> None
             _remote_students, class_id, identity, local_student_ids
         )
         for entry in [_presence_of(other) for other in local_others] + remote_students:
+            if not connection.claim_participant(entry.get("participant_ref")):
+                continue
             await connection.send_json(
                 {"type": cc.EVENT_PRESENCE_JOINED, "participant": entry}
             )
-        await connection.send_json(
-            {"type": cc.EVENT_PRESENCE_JOINED, "participant": _presence_of(connection)}
-        )
+        self_presence = _presence_of(connection)
+        if connection.claim_participant(self_presence["participant_ref"]):
+            await connection.send_json(
+                {"type": cc.EVENT_PRESENCE_JOINED, "participant": self_presence}
+            )
         await asyncio.to_thread(
             _publish,
             {
