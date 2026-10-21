@@ -180,6 +180,19 @@ class Settings(BaseSettings):
     CLASS_END_SWEEP_INTERVAL_SECONDS: float = 5.0
     CLASS_END_SWEEP_BATCH_LIMIT: int = 50
 
+    # Book content extraction (Phase 4, slice 4C). The background sweeper
+    # runs with the application lifecycle (no external scheduler, same
+    # shape as class ending above): it sweeps immediately at startup —
+    # extracting revisions left ``uploaded`` by a crash or redeploy — and
+    # then every BOOK_EXTRACT_SWEEP_INTERVAL_SECONDS (re-read each pass,
+    # so tests can shrink it live). Each pass extracts at most
+    # BOOK_EXTRACT_SWEEP_BATCH_LIMIT revisions, one short-lived
+    # transaction each, then releases the session before sleeping. The
+    # interval floor (``_MIN_INTERVAL_SECONDS``) is enforced in
+    # app.services.book_extraction_sweeper, not here.
+    BOOK_EXTRACT_SWEEP_INTERVAL_SECONDS: float = 5.0
+    BOOK_EXTRACT_SWEEP_BATCH_LIMIT: int = 10
+
     @property
     def jwt_secret(self) -> str:
         """The JWT signing secret, validated against the environment.

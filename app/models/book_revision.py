@@ -13,7 +13,7 @@ never be silently deleted by a cascade.
 """
 import uuid
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -40,6 +40,14 @@ class BookRevision(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=BookRevisionStatus.UPLOADED.value
     )
+    #: P2 extraction bookkeeping: a JSON summary of what was extracted
+    #: (page/unit counts, per-kind tallies, revision warnings) once the
+    #: revision reaches ``pending_review``.
+    extraction_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: The stable failure code/message when extraction refused the
+    #: document (``extraction_failed``); NULL otherwise. Source-derived
+    #: only — never bytes, paths or storage keys.
+    extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -71,4 +79,8 @@ class BookRevision(TimestampMixin, Base):
         "BookRevisionContext",
         back_populates="revision",
         order_by="BookRevisionContext.created_at.asc()",
+    )
+    units = relationship(
+        "BookUnit",
+        back_populates="revision",
     )

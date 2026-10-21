@@ -20,7 +20,16 @@ from app.schemas.material import FileAssetRead
 
 
 class BookRevisionRead(BaseModel):
-    """One uploaded edition of a book (never a path/URL)."""
+    """One uploaded edition of a book (never a path/URL).
+
+    P2 adds the extraction outcome as plain metadata: ``status`` already
+    tells the administrator where the revision is in the pipeline, and
+    these two fields tell them what happened — ``extraction_summary`` is
+    the parsed extraction report (document title, page/unit counts, fixed
+    warnings) once the sweeper finished, ``extraction_error`` the fixed
+    ``code: message`` why it failed. NULL until extraction runs; never
+    file bytes, never a storage path, never extracted document text.
+    """
 
     revision_id: UUID
     book_id: UUID
@@ -28,6 +37,8 @@ class BookRevisionRead(BaseModel):
     status: BookRevisionStatus
     uploaded_by_user_id: UUID
     file_asset: FileAssetRead
+    extraction_summary: dict | None = None
+    extraction_error: str | None = None
     created_at: datetime
     updated_at: datetime
 

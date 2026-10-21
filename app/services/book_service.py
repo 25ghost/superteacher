@@ -417,9 +417,29 @@ def _read_book(book) -> BookRead:
             status=BookRevisionStatus(revision.status),
             uploaded_by_user_id=revision.uploaded_by_user_id,
             file_asset=_file_asset_read(revision.file_asset),
+            extraction_summary=_extraction_summary_dict(
+                revision.extraction_summary
+            ),
+            extraction_error=revision.extraction_error,
             created_at=revision.created_at,
             updated_at=revision.updated_at,
         ),
         created_at=book.created_at,
         updated_at=book.updated_at,
     )
+
+
+def _extraction_summary_dict(raw: str | None) -> dict | None:
+    """The stored extraction summary as a dict; NULL/legacy-bad → None.
+
+    P2 writes it as sorted JSON via ``ExtractionResult.summary_json()``;
+    a value that cannot parse is simply not summarized rather than
+    breaking the book read (the ``status`` still tells the truth).
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

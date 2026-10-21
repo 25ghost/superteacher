@@ -1,9 +1,11 @@
-"""Unit tests: the administrator book intake tables, migration 0018.
+"""Unit tests: the administrator book tables, migrations 0018/0019.
 
 Book intake adds ``books``, ``book_revisions`` and
-``book_revision_contexts``. Model, migration and the offline
-verification script must agree — the drift tests below run
-``scripts/verify_database.py``'s own schema descriptors, and the
+``book_revision_contexts`` (0018); content extraction adds the
+``book_units`` tree plus two ``book_revisions`` bookkeeping columns
+(``extraction_summary``/``extraction_error``, 0019). Model, migration
+and the offline verification script must agree — the drift tests below
+run ``scripts/verify_database.py``'s own schema descriptors, and the
 truncation-order test proves the children are cleared before their
 parents.
 """
@@ -19,7 +21,13 @@ from sqlalchemy.schema import CheckConstraint, ForeignKeyConstraint, Index
 
 from app.core.database import Base
 import app.models  # noqa: F401
-from app.models.enums import BookRevisionStatus, FileAssetStatus, sql_in_list
+from app.models.enums import (
+    AssessmentRequirement,
+    BookRevisionStatus,
+    BookUnitKind,
+    FileAssetStatus,
+    sql_in_list,
+)
 from app.schemas.book import BookRead, BookRevisionRead
 from app.schemas.material import FileAssetRead
 
@@ -34,7 +42,7 @@ verify_database = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("verify_database", verify_database)
 _spec.loader.exec_module(verify_database)
 
-_NEW_TABLES = ("books", "book_revisions", "book_revision_contexts")
+_NEW_TABLES = ("books", "book_revisions", "book_revision_contexts", "book_units")
 
 
 def _table(name: str):
@@ -65,6 +73,8 @@ def test_book_tables_are_registered_with_expected_columns() -> None:
         "file_asset_id",
         "uploaded_by_user_id",
         "status",
+        "extraction_summary",
+        "extraction_error",
         "created_at",
         "updated_at",
     }
@@ -75,6 +85,9 @@ def test_book_tables_are_registered_with_expected_columns() -> None:
     assert revisions.columns["uploaded_by_user_id"].nullable is False
     assert revisions.columns["status"].nullable is False
     assert revisions.columns["status"].type.length == 32
+    # P2 bookkeeping: source-derived metadata only, NULL until extraction.
+    assert revisions.columns["extraction_summary"].nullable is True
+    assert revisions.columns["extraction_error"].nullable is True
 
     assert set(_table("book_revision_contexts").columns.keys()) == {
         "id",
@@ -105,6 +118,12 @@ def test_book_foreign_keys_follow_the_naming_convention() -> None:
         "book_revision_contexts": {
             "book_revision_contexts_book_revision_id_fkey": "book_revisions.id",
             "book_revision_contexts_learning_context_id_fkey": "learning_contexts.id",
+        },
+        "book_units": {
+            "book_units_book_revision_id_fkey": "book_revisions.id",
+            # Composite self-FK: a child can only ever reference a parent
+            # of the SAME revision (both columns, enforced by the database).
+            "book_units_parent_unit_id_fkey": "book_units.id",
         },
     }
     for table_name, expected in expectations.items():
@@ -148,6 +167,25 @@ def test_book_check_constraints_match_the_enum_vocabulary() -> None:
         checks["book_revisions_revision_number_check"].sqltext
     )
 
+    units = _table("book_units")
+    unit_checks = {
+        c.name: c
+        for c in units.constraints
+        if isinstance(c, CheckConstraint)
+    }
+    assert "book_units_kind_check" in unit_checks
+    assert _literals(unit_checks["book_units_kind_check"]) == sorted(
+        kind.value for kind in BookUnitKind
+    )
+    assert "book_units_assessment_requirement_check" in unit_checks
+    assert _literals(unit_checks["book_units_assessment_requirement_check"]) == sorted(
+        requirement.value for requirement in AssessmentRequirement
+    )
+    assert "book_units_title_check" in unit_checks
+    assert "book_units_display_order_check" in unit_checks
+    assert "book_units_page_start_check" in unit_checks
+    assert "book_units_page_range_check" in unit_checks
+
 
 def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
     expectations = {
@@ -162,6 +200,13 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
         "book_revision_contexts": {
             "uq_book_revision_contexts_revision_context_key",
             "book_revision_contexts_context_id_idx",
+        },
+        "book_units": {
+            "book_units_book_revision_id_idx",
+            "book_units_parent_unit_id_idx",
+            # Sibling order is collision-free for children AND roots.
+            "uq_book_units_revision_parent_order_key",
+            "uq_book_units_revision_root_order_key",
         },
     }
     for table_name, expected in expectations.items():
@@ -190,6 +235,36 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
         "learning_context_id",
     ]
 
+    # The composite self-FK target: a table-level UNIQUE on (id, revision).
+    from sqlalchemy import UniqueConstraint
+
+    unit_uniques = {
+        c.name: c
+        for c in _table("book_units").constraints
+        if isinstance(c, UniqueConstraint)
+    }
+    assert "book_units_id_revision_key" in unit_uniques
+    assert sorted(col.name for col in unit_uniques["book_units_id_revision_key"].columns) == [
+        "book_revision_id",
+        "id",
+    ]
+    # Both sibling-order indexes are PARTIAL: roots (NULL parent) are
+    # protected too, which a plain UNIQUE constraint could never do.
+    partial_names = {
+        i.name
+        for i in _table("book_units").indexes
+        if i.name
+        in {
+            "uq_book_units_revision_parent_order_key",
+            "uq_book_units_revision_root_order_key",
+        }
+        and (i.dialect_options.get("postgresql", {}).get("where") is not None)
+    }
+    assert partial_names == {
+        "uq_book_units_revision_parent_order_key",
+        "uq_book_units_revision_root_order_key",
+    }
+
 
 def test_book_tables_have_no_model_migration_drift() -> None:
     metadata_schema = verify_database.schema_from_metadata()
@@ -216,7 +291,7 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES
         assert table in verify_database.LATER_MIGRATION_TABLES
-    assert verify_database.EXPECTED_REVISION == "0018"
+    assert verify_database.EXPECTED_REVISION == "0019"
     assert verify_database.EXPECTED_REVISION in {
         p.stem.split("_")[0]
         for p in (verify_database.MIGRATION_DIR).glob("0*.py")
@@ -228,6 +303,8 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
         "book_revisions_file_asset_id_idx",
         "book_revisions_uploaded_by_user_id_idx",
         "book_revision_contexts_context_id_idx",
+        "book_units_book_revision_id_idx",
+        "book_units_parent_unit_id_idx",
     ):
         assert index_name in verify_database.EXPECTED_FK_INDEXES
 
@@ -238,7 +315,9 @@ def test_book_tables_appear_in_application_truncation_order() -> None:
     for table in _NEW_TABLES:
         assert table in tests_conftest.APPLICATION_TABLES
     order = tests_conftest.APPLICATION_TABLES
-    # Children before parents: context links → revisions → books → assets/users.
+    # Children before parents: units → context links → revisions → books →
+    # assets/users.
+    assert order.index("book_units") < order.index("book_revisions")
     assert order.index("book_revision_contexts") < order.index("book_revisions")
     assert order.index("book_revisions") < order.index("books")
     assert order.index("books") < order.index("file_assets")
@@ -261,6 +340,12 @@ def test_book_read_schemas_require_their_fields_and_expose_no_paths() -> None:
     # The uploader comes from the token, never from a request body.
     assert "uploaded_by_user_id" in BookRevisionRead.model_fields
     assert "learning_context_ids" in BookRead.model_fields
+    # P2 extraction outcome: counts/warnings and a fixed failure code —
+    # never extracted document text or storage details.
+    assert "extraction_summary" in BookRevisionRead.model_fields
+    assert "extraction_error" in BookRevisionRead.model_fields
+    assert "content" not in BookRevisionRead.model_fields
+    assert "units" not in BookRevisionRead.model_fields
 
 
 def test_book_revision_status_vocabulary_is_the_six_intake_states() -> None:

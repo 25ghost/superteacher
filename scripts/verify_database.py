@@ -3,7 +3,7 @@
 Three levels:
 
 1. STRUCTURAL (always runs, no database needed):
-   - all 42 expected application tables exist in the ORM metadata, with the
+    - all 46 expected application tables exist in the ORM metadata, with the
      plural ``students`` name and no singular ``student`` table;
    - every table that has ``created_at`` also has ``updated_at``;
    - the ``users_role_check`` vocabulary equals ``UserRole``, and the
@@ -19,7 +19,7 @@ Three levels:
 2. LIVE (read-only, ``--live``):
    - connects to PostgreSQL using the configured DB_* settings;
    - checks the live ``alembic_version`` equals the expected revision;
-   - checks every one of the 42 tables exists (and singular ``student`` does
+    - checks every one of the 46 tables exists (and singular ``student`` does
      not);
    - compares the LIVE schema against the ORM metadata with the same
      column/constraint/index comparison used for drift detection, so live
@@ -31,7 +31,7 @@ Three levels:
    - refuses to run when any application table contains rows (this is what
      keeps it from destroying data);
    - then ``alembic downgrade base`` -> verify empty -> ``alembic upgrade
-     head`` -> verify all 42 tables and the expected revision again.
+      head`` -> verify all 46 tables and the expected revision again.
    Use it only on a disposable development database.
 
 Usage (from ``backend/``):
@@ -105,9 +105,11 @@ EXPECTED_TABLES = {
     "books",
     "book_revisions",
     "book_revision_contexts",
+    # created by 0019 (book content extraction: per-revision unit tree)
+    "book_units",
 }
 
-EXPECTED_REVISION = "0018"
+EXPECTED_REVISION = "0019"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -171,6 +173,9 @@ EXPECTED_FK_INDEXES = {
         "book_revision_contexts",
         ("learning_context_id",),
     ),
+    # Book content extraction (0019): book_units FK columns.
+    "book_units_book_revision_id_idx": ("book_units", ("book_revision_id",)),
+    "book_units_parent_unit_id_idx": ("book_units", ("parent_unit_id",)),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------
@@ -257,9 +262,13 @@ def schema_from_metadata() -> dict[str, dict]:
         for constraint in table.constraints:
             if isinstance(constraint, ForeignKeyConstraint):
                 columns = tuple(element.parent.name for element in constraint.elements)
-                referred = tuple(
+                # Deduplicated: a multi-column FK to one table (0019's
+                # composite book_units self-FK) reports the same referred
+                # table once per element here but exactly once from the
+                # live inspector.
+                referred = tuple(dict.fromkeys(
                     element.target_fullname.split(".")[0] for element in constraint.elements
-                )
+                ))
                 fks[constraint.name] = (columns, referred)
             elif isinstance(constraint, UniqueConstraint):
                 uqs[constraint.name] = tuple(column.name for column in constraint.columns)
@@ -369,7 +378,11 @@ def schema_from_migration(path: Path) -> dict[str, dict]:
             elif kind == "ForeignKeyConstraint":
                 fks[name_kw] = (
                     tuple(item.value for item in arg.args[0].elts),
-                    tuple(item.value.split(".")[0] for item in arg.args[1].elts),
+                    # Deduplicated for the same reason as schema_from_metadata:
+                    # the live inspector reports one entry per constraint.
+                    tuple(dict.fromkeys(
+                        item.value.split(".")[0] for item in arg.args[1].elts
+                    )),
                 )
             elif kind == "UniqueConstraint":
                 uqs[name_kw] = tuple(item.value for item in arg.args)
@@ -818,6 +831,8 @@ LATER_MIGRATION_TABLES = {
     "books",
     "book_revisions",
     "book_revision_contexts",
+    # created by 0019 (book content extraction: per-revision unit tree)
+    "book_units",
 }
 
 

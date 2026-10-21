@@ -24,12 +24,14 @@ super_teacher_db_test;``) — the suite never creates or destroys databases.
 """
 from __future__ import annotations
 
+import io
 import os
 import uuid as uuid_module
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
 import pytest
+from pypdf import PdfReader, PdfWriter
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -43,8 +45,10 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 # The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
-    # Administrator book intake (0018) - context links before revisions
-    # before books; all before the file_assets/users they reference.
+    # Administrator book intake (0018/0019) - extracted units before
+    # context links before revisions before books; all before the
+    # file_assets/users they reference.
+    "book_units",
     "book_revision_contexts",
     "book_revisions",
     "books",
@@ -108,27 +112,24 @@ class UnsafeTestDatabase(RuntimeError):
     """Raised when integration tests target a database that is not clearly a test database."""
 
 
-def build_minimal_pdf(text: str | None = "Hello Book Content", *, pages: int = 1) -> bytes:
-    """Byte-exact minimal PDF that ``pypdf`` really parses.
+def _escape_pdf_text(text: str) -> bytes:
+    """Literal-string body escaping (ASCII/latin-1 fixtures only)."""
+    return (
+        text.encode("latin-1")
+        .replace(b"\\", b"\\\\")
+        .replace(b"(", b"\\(")
+        .replace(b")", b"\\)")
+    )
 
-    The legacy ``b"%PDF-1.4 fake pdf content"`` fixtures satisfy the
-    teacher-material prefix check but cannot survive the administrator
-    book intake probe (a real ``pypdf`` parse plus an extractable-text
-    requirement), so book tests build structurally valid documents here
-    instead. The xref offsets are computed for real — a hand-waved xref
-    would be rejected as corrupt, which is precisely what some tests
-    want (they corrupt the result deliberately).
 
-    ``text=None`` produces an image-only style page: a content stream
-    with no text-showing operator, so extraction yields no text.
+def _assemble_pdf(page_bodies: list[bytes]) -> bytes:
+    """Byte-exact minimal PDF around one content-stream body per page.
+
+    The object layout and xref offsets are computed for real — a
+    hand-waved xref would be rejected as corrupt, which is precisely
+    what some tests want (they corrupt the result deliberately).
     """
-    content_ops: list[bytes] = []
-    for _ in range(pages):
-        if text is None:
-            content_ops.append(b"")  # a page with a stream but no text
-        else:
-            escaped = text.encode("latin-1").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-            content_ops.append(b"BT /F1 12 Tf 72 720 Td (" + escaped + b") Tj ET\n")
+    pages = len(page_bodies)
     # Object layout: 1 catalog, 2 pages node, then one page object and one
     # content-stream object per page, then the font.
     page_ids = list(range(3, 3 + pages))
@@ -148,7 +149,7 @@ def build_minimal_pdf(text: str | None = "Hello Book Content", *, pages: int = 1
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             f"/Contents {content_id} 0 R /Resources << /Font << /F1 {font_id} 0 R >> >> >>".encode()
         )
-    for body in content_ops:
+    for body in page_bodies:
         objects.append(
             b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"endstream"
         )
@@ -169,6 +170,79 @@ def build_minimal_pdf(text: str | None = "Hello Book Content", *, pages: int = 1
         f"startxref\n{xref}\n%%EOF\n"
     ).encode()
     return bytes(out)
+
+
+def build_minimal_pdf(text: str | None = "Hello Book Content", *, pages: int = 1) -> bytes:
+    """Byte-exact minimal PDF that ``pypdf`` really parses.
+
+    The legacy ``b"%PDF-1.4 fake pdf content"`` fixtures satisfy the
+    teacher-material prefix check but cannot survive the administrator
+    book intake probe (a real ``pypdf`` parse plus an extractable-text
+    requirement), so book tests build structurally valid documents here
+    instead.
+
+    ``text=None`` produces an image-only style page: a content stream
+    with no text-showing operator, so extraction yields no text.
+    """
+    content_ops: list[bytes] = []
+    for _ in range(pages):
+        if text is None:
+            content_ops.append(b"")  # a page with a stream but no text
+        else:
+            escaped = _escape_pdf_text(text)
+            content_ops.append(b"BT /F1 12 Tf 72 720 Td (" + escaped + b") Tj ET\n")
+    return _assemble_pdf(content_ops)
+
+
+def build_multiline_pdf(pages: list[list[str]]) -> bytes:
+    """One PDF page per inner list; each string is its own printed line.
+
+    Extraction fixtures need real multi-line layout (``pypdf`` emits one
+    line per separate ``Td``/``Tj`` write, which is what lets a parser
+    see chapter headings, body text and exercise lines separately), and
+    a single ``build_minimal_pdf`` page can only carry one line. Each
+    ``Td``/``Tj`` operator pair is whitespace-separated exactly as real
+    PDF producers emit them — pypdf's content parser mis-tokenises
+    missing separators (``Tj0``), which is a property of pypdf, not of
+    the document under test. Text is latin-1/ASCII like the minimal
+    builder; an empty inner list yields an empty (but present) content
+    stream.
+    """
+    bodies: list[bytes] = []
+    for lines in pages:
+        ops: list[bytes] = [b"BT /F1 12 Tf 72 720 Td"]
+        for index, line in enumerate(lines):
+            if index:
+                ops.append(b"0 -16 Td")
+            ops.append(b"(" + _escape_pdf_text(line) + b") Tj")
+        ops.append(b"ET")
+        bodies.append((b" ".join(ops) + b"\n") if lines else b"")
+    return _assemble_pdf(bodies)
+
+
+def build_outline_pdf(
+    pages: list[list[str]],
+    outline: list[tuple[str, int, list[tuple[str, int]] | None]],
+) -> bytes:
+    """``build_multiline_pdf`` plus a real ``/Outlines`` bookmark tree.
+
+    ``outline`` entries are ``(title, zero_based_page_index, children)``
+    and become the PDF outline pypdf returns as ``Destination`` objects:
+    the extraction pipeline prefers that authoritative structure over
+    printed headings, so fixtures must be able to provide it. Requires
+    at least one page; child lists may be ``None``.
+    """
+    reader = PdfReader(io.BytesIO(build_multiline_pdf(pages)))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    for title, page_index, children in outline:
+        parent = writer.add_outline_item(title, page_index)
+        for child_title, child_page in children or ():
+            writer.add_outline_item(child_title, child_page, parent=parent)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
 
 
 def grant_teaching_approval(
@@ -422,3 +496,22 @@ def _class_end_sweeper_idle() -> Iterator[None]:
     class_end_sweeper.stop()
     yield
     class_end_sweeper.stop()
+
+
+@pytest.fixture(autouse=True)
+def _book_extraction_sweeper_idle() -> Iterator[None]:
+    """Keep the Phase 4 background book-extraction sweeper out of every test.
+
+    Same isolation as the class-end sweeper above, same reason: the
+    extraction sweep runs on the application lifespan, and a thread that
+    extracts ``uploaded`` revisions in the background would race tests
+    that deliberately place a revision in a specific state and assert one
+    specific transition (or one specific row count). Extraction tests
+    drive :meth:`sweep_once` directly, so every sweep in the suite is
+    deliberate.
+    """
+    from app.services.book_extraction_sweeper import book_extraction_sweeper
+
+    book_extraction_sweeper.stop()
+    yield
+    book_extraction_sweeper.stop()

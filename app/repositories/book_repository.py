@@ -2,18 +2,22 @@
 
 Insert/lookup helpers only — validation, storage writes and lifecycle
 decisions are **service** concerns. All inserts are ``flush``ed, never
-committed (the endpoint owns the transaction, as everywhere else).
+committed (the endpoint owns the transaction, as everywhere else); the
+extraction claim is the one exception documented in place: it locks the
+row and the extraction service commits per revision.
 """
 from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.book import Book
 from app.models.book_revision import BookRevision
 from app.models.book_revision_context import BookRevisionContext
+from app.models.book_unit import BookUnit
+from app.models.enums import BookRevisionStatus
 
 
 def create_book(
@@ -111,3 +115,38 @@ def list_books(
         .offset(offset)
     )
     return list(session.scalars(stmt))
+
+
+def claim_next_uploaded_revision(session: Session) -> BookRevision | None:
+    """The oldest ``uploaded`` revision, ROW-LOCKED for extraction.
+
+    ``SELECT ... FOR UPDATE`` inside the caller's transaction: the lock
+    is the extraction lease. A second worker sweeping the same batch
+    blocks here, re-reads the committed state after the winner commits
+    and simply skips the revision it no longer sees as ``uploaded``. If
+    the winner crashes, its transaction rolls back, the lock releases
+    with it and the revision is claimable again on the next pass — no
+    lease timeout to guess. Plain single-table statement (a locking read
+    must not lock other tables); ``populate_existing`` makes the lock
+    read authoritative for an object the identity map may already hold.
+    """
+    stmt = (
+        select(BookRevision)
+        .where(BookRevision.status == BookRevisionStatus.UPLOADED.value)
+        .order_by(BookRevision.created_at.asc(), BookRevision.id.asc())
+        .limit(1)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    return session.scalar(stmt)
+
+
+def delete_revision_units(session: Session, book_revision_id: uuid.UUID) -> None:
+    """Remove every extracted unit of one revision (flushed, not committed).
+
+    Extraction is idempotent by delete-then-write: re-running a pass
+    (retry, double claim after a crash) can never double the tree.
+    """
+    session.execute(
+        delete(BookUnit).where(BookUnit.book_revision_id == book_revision_id)
+    )

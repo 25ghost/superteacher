@@ -45,7 +45,7 @@ from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.book import BookRead
-from app.services import book_service
+from app.services import book_extraction_service, book_service
 from app.services.learning_context_service import LearningError
 
 _settings = get_settings()
@@ -198,3 +198,49 @@ def admin_read_book(
         return book_service.get_book(session, admin, book_id)
     except LearningError as exc:
         raise _http_error(exc) from exc
+
+
+@router.post(
+    "/books/{book_id}/retry-extraction",
+    response_model=BookRead,
+    summary="Retry a failed book extraction (administrator only)",
+    description=(
+        "Requeues the book's latest revision when — and only when — its "
+        "content extraction previously FAILED: the revision returns to "
+        "``uploaded`` and the background extraction sweep re-parses the "
+        "already-stored PDF, so the response shows the requeued state "
+        "while the sweeper moves it to ``pending_review`` (or back to "
+        "``extraction_failed`` with the fixed error code) asynchronously. "
+        "The retry never re-uploads bytes. Any other revision status → "
+        "409 (nothing to retry), unknown id → 404. Administrators only."
+    ),
+    responses={
+        200: {"description": "Extraction requeued; latest revision shown"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book id"},
+        409: {"description": "Latest extraction is not in a failed state"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_retry_book_extraction(
+    request: Request,
+    book_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookRead:
+    # Write path: service flushes, the endpoint owns the commit.
+    try:
+        result = book_extraction_service.retry_book_extraction(
+            session, admin, book_id=book_id
+        )
+    except LearningError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return result

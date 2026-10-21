@@ -11,6 +11,7 @@ from app.models.auth_session import AuthSession
 from app.models.book import Book
 from app.models.book_revision import BookRevision
 from app.models.book_revision_context import BookRevisionContext
+from app.models.book_unit import BookUnit
 from app.models.class_attendance_segment import ClassAttendanceSegment
 from app.models.class_message import ClassMessage
 from app.models.class_ws_ticket import ClassWsTicket
@@ -59,6 +60,7 @@ __all__ = [
     "Book",
     "BookRevision",
     "BookRevisionContext",
+    "BookUnit",
     "ClassAttendanceSegment",
     "ClassMessage",
     "ClassWsTicket",

@@ -328,6 +328,39 @@ class BookRevisionStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class BookUnitKind(str, enum.Enum):
+    """Structural role of one extracted ``book_units`` row (P2, ADR-004).
+
+    The parser assigns exactly one of these; there is no free-form kind
+    anywhere in the schema. ``chapter`` and ``topic`` come from the PDF
+    outline (or, without one, from conservative printed headings);
+    ``explanation``, ``example`` and ``exercise_set`` are the leaf kinds
+    recognized inside them. Enforced by ``book_units_kind_check``.
+    """
+
+    CHAPTER = "chapter"
+    TOPIC = "topic"
+    EXPLANATION = "explanation"
+    EXAMPLE = "example"
+    EXERCISE_SET = "exercise_set"
+
+
+class AssessmentRequirement(str, enum.Enum):
+    """Whether an extracted unit still needs automated assessment content.
+
+    P2 writes ``unresolved`` for every unit: deciding the requirement is
+    the job of the (deliberately disabled) classifier extension point in
+    ``app.services.book_extraction``, never an external call. ``required``
+    and ``not_required`` exist so that later phase extends this vocabulary
+    instead of redefining the column (ADR-004). Enforced by
+    ``book_units_assessment_requirement_check``.
+    """
+
+    UNRESOLVED = "unresolved"
+    REQUIRED = "required"
+    NOT_REQUIRED = "not_required"
+
+
 class FileAssetStatus(str, enum.Enum):
     """Upload/validation pipeline state for one stored file asset.
 
