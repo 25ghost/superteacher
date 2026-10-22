@@ -17,6 +17,22 @@ with 403 before any logic runs, and anonymous callers get 401.
 - ``GET  /admin/books/{book_id}`` — one book with its latest revision
   and canonical contexts; unknown id → 404.
 
+Book review & publication (P3) — every route here is administrator-only
+and operates on ONE revision of ONE book:
+
+- ``GET    .../revisions/{revision_id}`` — full inspection: the ordered
+  unit tree with review state, extraction warnings and designation.
+- ``PATCH  .../revisions/{revision_id}/units/{unit_id}`` — correct one
+  unit while the revision is ``pending_review``.
+- ``POST   .../revisions/{revision_id}/units/{unit_id}/approve`` —
+  approve a single unit.
+- ``POST   .../revisions/{revision_id}/approve`` — approve the fully
+  reviewed revision: it becomes the current publication.
+- ``POST   .../revisions/{revision_id}/reject`` — reject with a recorded
+  reason.
+- ``POST   .../revisions/{revision_id}/correct`` — clone a rejected or
+  published revision into the next edition for correction.
+
 The response carries metadata only: never a ``storage_key``, filesystem
 path or file bytes, and no student or teacher surface exists for books in
 this phase. Error contract: invalid upload/inputs → 422 (shared
@@ -44,8 +60,14 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
-from app.schemas.book import BookRead
-from app.services import book_extraction_service, book_service
+from app.schemas.book import (
+    BookRead,
+    BookRevisionDetailRead,
+    BookRevisionRejectRequest,
+    BookUnitCorrectRequest,
+    BookUnitRead,
+)
+from app.services import book_extraction_service, book_review_service, book_service
 from app.services.learning_context_service import LearningError
 
 _settings = get_settings()
@@ -244,3 +266,283 @@ def admin_retry_book_extraction(
         session.rollback()
         raise
     return result
+
+
+# --- book review & publication (P3) -------------------------------------------------
+
+
+def _review_write(service_call, session: Session):
+    """Run one review decision, then commit it as one transaction.
+
+    A domain refusal (404/409/422) rolls the WHOLE request back — a
+    failed correction or approval must leave content, review state and
+    audit events untouched — and only a clean service result reaches the
+    commit, which is the single owner of the transaction boundary.
+    """
+    try:
+        result = service_call()
+    except LearningError as exc:
+        session.rollback()
+        raise _http_error(exc) from exc
+    except Exception:
+        session.rollback()
+        raise
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return result
+
+
+@router.get(
+    "/books/{book_id}/revisions/{revision_id}",
+    response_model=BookRevisionDetailRead,
+    summary="Inspect one book revision (administrator only)",
+    description=(
+        "Full review surface for ONE revision: extraction summary and "
+        "outcome, publication/rejection state, and the complete unit tree "
+        "in reading order — kind, title, ordered content, source-page "
+        "range, extraction warnings, assessment designation and durable "
+        "review state (reviewer + timestamp). Never a storage key or "
+        "filesystem path. Unknown id, or a revision of another book, → "
+        "404. Administrators only."
+    ),
+    responses={
+        200: {"description": "Revision with its ordered unit tree"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book or revision id"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def admin_inspect_book_revision(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookRevisionDetailRead:
+    # Read path: translate domain errors only; no commit/rollback.
+    try:
+        return book_review_service.get_revision_detail(
+            session, admin, book_id=book_id, revision_id=revision_id
+        )
+    except LearningError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.patch(
+    "/books/{book_id}/revisions/{revision_id}/units/{unit_id}",
+    response_model=BookUnitRead,
+    summary="Correct one unit of a pending review (administrator only)",
+    description=(
+        "Edits the domain fields of ONE unit while — and only while — the "
+        "revision is ``pending_review``. Only supplied fields are applied "
+        "(``model_fields_set``); ``parent_unit_id`` may be explicit null "
+        "to move a unit to the root, any other explicit null is refused "
+        "(422). Blank titles, impossible page ranges, cross-revision "
+        "parents, cycles, colliding sibling orders and empty bodies are "
+        "all refused (422) BEFORE anything is written, so a refused "
+        "correction changes nothing. Every correction resets the unit to "
+        "``pending``; a structural correction (kind/parent/order) also "
+        "resets the moved subtree. Wrong revision status → 409, unknown "
+        "ids → 404. Administrators only."
+    ),
+    responses={
+        200: {"description": "Corrected unit, reset to pending"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or unit id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Invalid correction"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_correct_book_unit(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    unit_id: uuid.UUID,
+    payload: BookUnitCorrectRequest,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookUnitRead:
+    return _review_write(
+        lambda: book_review_service.correct_unit(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            unit_id=unit_id,
+            payload=payload,
+        ),
+        session,
+    )
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/units/{unit_id}/approve",
+    response_model=BookUnitRead,
+    summary="Approve one unit of a pending review (administrator only)",
+    description=(
+        "Records reviewer identity and timestamp on the unit. A "
+        "chapter/topic unit whose assessment designation is still "
+        "``unresolved`` cannot be approved (422), so a published tree "
+        "never hides an undecided designation behind an approval. Already "
+        "approved → 409, wrong revision status → 409, unknown ids → 404. "
+        "Administrators only."
+    ),
+    responses={
+        200: {"description": "Approved unit"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or unit id"},
+        409: {"description": "Unit already approved or revision not pending"},
+        422: {"description": "Unresolved assessment designation"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_approve_book_unit(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    unit_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookUnitRead:
+    return _review_write(
+        lambda: book_review_service.approve_unit(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            unit_id=unit_id,
+        ),
+        session,
+    )
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/approve",
+    response_model=BookRevisionDetailRead,
+    summary="Approve a reviewed revision as the current publication",
+    description=(
+        "Validates first: every unit approved, no chapter/topic with an "
+        "unresolved assessment designation, no unresolved structural "
+        "warning, a valid unit tree (anything incomplete → 422 with the "
+        "reason). Then, atomically inside one transaction, the book's "
+        "previous current-publication flag is cleared and THIS revision "
+        "becomes ``published`` + current — concurrent publications of the "
+        "same book serialize on the book row lock. Wrong revision status "
+        "(not ``pending_review``) → 409, unknown ids → 404. "
+        "Administrators only."
+    ),
+    responses={
+        200: {"description": "Revision approved and published"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book or revision id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Review is incomplete"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_approve_book_revision(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookRevisionDetailRead:
+    return _review_write(
+        lambda: book_review_service.approve_revision(
+            session, admin, book_id=book_id, revision_id=revision_id
+        ),
+        session,
+    )
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/reject",
+    response_model=BookRevisionDetailRead,
+    summary="Reject a pending revision with a recorded reason",
+    description=(
+        "Marks the ``pending_review`` revision ``rejected`` and stores the "
+        "mandatory non-blank reason (422 if blank) for the next reviewer. "
+        "Rejected and published revisions then refuse every other review "
+        "operation (409). Wrong status → 409, unknown ids → 404. "
+        "Administrators only."
+    ),
+    responses={
+        200: {"description": "Rejected revision"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book or revision id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Blank rejection reason"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_reject_book_revision(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    payload: BookRevisionRejectRequest,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookRevisionDetailRead:
+    return _review_write(
+        lambda: book_review_service.reject_revision(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            payload=payload,
+        ),
+        session,
+    )
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/correct",
+    response_model=BookRevisionDetailRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a correction revision from a rejected/published one",
+    description=(
+        "Clones the source revision into the NEXT edition of the same "
+        "book: new unit IDs with parents remapped inside the copy, every "
+        "unit reset to ``pending``, shared source asset, learning contexts "
+        "and extraction summary — the source revision is never modified, "
+        "so published/rejected history stays intact. Only rejected or "
+        "published sources may be corrected (otherwise 409); unknown ids "
+        "→ 404. The new edition starts ``pending_review``. Administrators "
+        "only."
+    ),
+    responses={
+        201: {"description": "Correction revision created"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book or revision id"},
+        409: {"description": "Source revision is not rejected/published"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_correct_book_revision(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookRevisionDetailRead:
+    return _review_write(
+        lambda: book_review_service.create_correction_revision(
+            session, admin, book_id=book_id, revision_id=revision_id
+        ),
+        session,
+    )

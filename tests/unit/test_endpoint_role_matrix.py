@@ -189,6 +189,28 @@ ADMIN_ROUTES: list[tuple[str, str, dict | None]] = [
     # Book extraction retry (book P2) — no body; only a failed
     # extraction may be requeued, everything else answers 409.
     ("POST", "/api/v1/admin/books/{book_id}/retry-extraction", None),
+    # Book review & publication (book P3) — one revision of one book:
+    # inspect, correct one unit, approve one unit, approve (publish) or
+    # reject the revision, and clone a rejected/published one for
+    # correction. Bodies are minimal: the guards must refuse first.
+    ("GET", "/api/v1/admin/books/{book_id}/revisions/{revision_id}", None),
+    (
+        "PATCH",
+        "/api/v1/admin/books/{book_id}/revisions/{revision_id}/units/{unit_id}",
+        {},
+    ),
+    (
+        "POST",
+        "/api/v1/admin/books/{book_id}/revisions/{revision_id}/units/{unit_id}/approve",
+        None,
+    ),
+    ("POST", "/api/v1/admin/books/{book_id}/revisions/{revision_id}/approve", None),
+    (
+        "POST",
+        "/api/v1/admin/books/{book_id}/revisions/{revision_id}/reject",
+        {"reason": "not allowed"},
+    ),
+    ("POST", "/api/v1/admin/books/{book_id}/revisions/{revision_id}/correct", None),
 ]
 
 ANY_ROLE_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -311,6 +333,8 @@ def _path(template: str) -> str:
         application_id=uuid.uuid4(),
         evidence_id=uuid.uuid4(),
         book_id=uuid.uuid4(),
+        revision_id=uuid.uuid4(),
+        unit_id=uuid.uuid4(),
         school_code="MISSING",
     )
 
@@ -351,7 +375,7 @@ def test_public_routes_never_answer_401_or_403(
 def test_route_inventory_is_exactly_the_matrix() -> None:
     """No v1 endpoint may exist outside the role matrix — and vice versa.
 
-    The count pin (135) makes adding or removing a route a conscious
+    The count pin (141) makes adding or removing a route a conscious
     decision: a new endpoint must be listed in one of the five groups
     above or this test names it as unlisted.
     """
@@ -370,7 +394,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 135, f"route count changed: {len(actual)} != 135"
+    assert len(actual) == 141, f"route count changed: {len(actual)} != 141"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------

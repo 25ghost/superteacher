@@ -109,7 +109,7 @@ EXPECTED_TABLES = {
     "book_units",
 }
 
-EXPECTED_REVISION = "0019"
+EXPECTED_REVISION = "0020"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -176,6 +176,8 @@ EXPECTED_FK_INDEXES = {
     # Book content extraction (0019): book_units FK columns.
     "book_units_book_revision_id_idx": ("book_units", ("book_revision_id",)),
     "book_units_parent_unit_id_idx": ("book_units", ("parent_unit_id",)),
+    # Book review & publication (0020): the reviewer FK column (new).
+    "book_units_reviewed_by_user_id_idx": ("book_units", ("reviewed_by_user_id",)),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------

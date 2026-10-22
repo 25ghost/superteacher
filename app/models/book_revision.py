@@ -13,7 +13,16 @@ never be silently deleted by a cascade.
 """
 import uuid
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -48,6 +57,18 @@ class BookRevision(TimestampMixin, Base):
     #: document (``extraction_failed``); NULL otherwise. Source-derived
     #: only — never bytes, paths or storage keys.
     extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: P3 publication pointer (ADR-005): TRUE for the book's CURRENT
+    #: published revision. Previous published revisions keep
+    #: ``status='published'`` with the flag cleared, so history is never
+    #: rewritten; the PARTIAL unique index below is what makes "at most
+    #: one current per book" a database rule rather than a convention.
+    is_current_publication: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    #: The administrator's recorded reason when ``status='rejected'``.
+    #: NULL for every other status — the named CHECK below proves
+    #: "rejected without a reason" cannot be stored (P3, ADR-005).
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -58,6 +79,10 @@ class BookRevision(TimestampMixin, Base):
             f"status IN ({sql_in_list(BookRevisionStatus)})",
             name="book_revisions_status_check",
         ),
+        CheckConstraint(
+            "status <> 'rejected' OR rejection_reason IS NOT NULL",
+            name="book_revisions_rejected_reason_check",
+        ),
         # One edition number per book: a republication can never collide
         # with (or silently overwrite) an earlier edition.
         Index(
@@ -65,6 +90,18 @@ class BookRevision(TimestampMixin, Base):
             "book_id",
             "revision_number",
             unique=True,
+        ),
+        # At most one CURRENT published revision per book; partial so a
+        # historical published revision (flag false) never collides.
+        # sqlite_where is kept alongside postgresql_where so the scratch-
+        # SQLite metadata checks and PostgreSQL see the same DDL (0016
+        # house pattern).
+        Index(
+            "uq_book_revisions_book_current_key",
+            "book_id",
+            unique=True,
+            postgresql_where=text("is_current_publication"),
+            sqlite_where=text("is_current_publication"),
         ),
         Index("book_revisions_book_id_idx", "book_id"),
         Index("book_revisions_file_asset_id_idx", "file_asset_id"),

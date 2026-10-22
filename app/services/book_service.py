@@ -421,6 +421,7 @@ def _read_book(book) -> BookRead:
                 revision.extraction_summary
             ),
             extraction_error=revision.extraction_error,
+            is_current_publication=revision.is_current_publication,
             created_at=revision.created_at,
             updated_at=revision.updated_at,
         ),

@@ -1,13 +1,16 @@
-"""Unit tests: the administrator book tables, migrations 0018/0019.
+"""Unit tests: the administrator book tables, migrations 0018-0020.
 
 Book intake adds ``books``, ``book_revisions`` and
 ``book_revision_contexts`` (0018); content extraction adds the
 ``book_units`` tree plus two ``book_revisions`` bookkeeping columns
-(``extraction_summary``/``extraction_error``, 0019). Model, migration
-and the offline verification script must agree — the drift tests below
-run ``scripts/verify_database.py``'s own schema descriptors, and the
-truncation-order test proves the children are cleared before their
-parents.
+(``extraction_summary``/``extraction_error``, 0019); review and
+publication add the publication pointer + rejection reason and the
+per-unit review state (``is_current_publication``/``rejection_reason``,
+``review_status``/``reviewed_by_user_id``/``reviewed_at``, 0020). Model,
+migration and the offline verification script must agree — the drift
+tests below run ``scripts/verify_database.py``'s own schema descriptors,
+and the truncation-order test proves the children are cleared before
+their parents.
 """
 from __future__ import annotations
 
@@ -25,10 +28,18 @@ from app.models.enums import (
     AssessmentRequirement,
     BookRevisionStatus,
     BookUnitKind,
+    BookUnitReviewStatus,
     FileAssetStatus,
     sql_in_list,
 )
-from app.schemas.book import BookRead, BookRevisionRead
+from app.schemas.book import (
+    BookRead,
+    BookRevisionDetailRead,
+    BookRevisionRead,
+    BookRevisionRejectRequest,
+    BookUnitCorrectRequest,
+    BookUnitRead,
+)
 from app.schemas.material import FileAssetRead
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -75,6 +86,9 @@ def test_book_tables_are_registered_with_expected_columns() -> None:
         "status",
         "extraction_summary",
         "extraction_error",
+        # P3: the publication pointer and the recorded rejection reason.
+        "is_current_publication",
+        "rejection_reason",
         "created_at",
         "updated_at",
     }
@@ -88,6 +102,37 @@ def test_book_tables_are_registered_with_expected_columns() -> None:
     # P2 bookkeeping: source-derived metadata only, NULL until extraction.
     assert revisions.columns["extraction_summary"].nullable is True
     assert revisions.columns["extraction_error"].nullable is True
+    # P3: the pointer is NOT NULL (default false — no NULL-comparison
+    # semantics for "is this the current edition?"), the reason is NULL
+    # for every status except rejected.
+    assert revisions.columns["is_current_publication"].nullable is False
+    assert revisions.columns["rejection_reason"].nullable is True
+
+    # P3 per-unit review state: every extracted unit carries a durable
+    # verdict plus WHO/WHEN (both nullable — NULL while pending).
+    assert set(_table("book_units").columns.keys()) == {
+        "id",
+        "book_revision_id",
+        "parent_unit_id",
+        "kind",
+        "title",
+        "content",
+        "display_order",
+        "source_page_start",
+        "source_page_end",
+        "extraction_warnings",
+        "assessment_requirement",
+        "review_status",
+        "reviewed_by_user_id",
+        "reviewed_at",
+        "created_at",
+        "updated_at",
+    }
+    units = _table("book_units")
+    assert units.columns["review_status"].nullable is False
+    assert units.columns["review_status"].type.length == 32
+    assert units.columns["reviewed_by_user_id"].nullable is True
+    assert units.columns["reviewed_at"].nullable is True
 
     assert set(_table("book_revision_contexts").columns.keys()) == {
         "id",
@@ -124,6 +169,9 @@ def test_book_foreign_keys_follow_the_naming_convention() -> None:
             # Composite self-FK: a child can only ever reference a parent
             # of the SAME revision (both columns, enforced by the database).
             "book_units_parent_unit_id_fkey": "book_units.id",
+            # P3: WHO approved the unit (NO ACTION — review history is
+            # never cascade-deleted).
+            "book_units_reviewed_by_user_id_fkey": "users.id",
         },
     }
     for table_name, expected in expectations.items():
@@ -166,6 +214,11 @@ def test_book_check_constraints_match_the_enum_vocabulary() -> None:
     assert "revision_number >= 1" in str(
         checks["book_revisions_revision_number_check"].sqltext
     )
+    # P3: a rejected revision without a recorded reason is impossible.
+    assert "book_revisions_rejected_reason_check" in checks
+    assert str(checks["book_revisions_rejected_reason_check"].sqltext) == (
+        "status <> 'rejected' OR rejection_reason IS NOT NULL"
+    )
 
     units = _table("book_units")
     unit_checks = {
@@ -186,6 +239,21 @@ def test_book_check_constraints_match_the_enum_vocabulary() -> None:
     assert "book_units_page_start_check" in unit_checks
     assert "book_units_page_range_check" in unit_checks
 
+    # P3 review-state CHECKs: the vocabulary, and the paired identity
+    # rules (approved REQUIRES reviewer+timestamp, pending REQUIRES none).
+    assert "book_units_review_status_check" in unit_checks
+    assert _literals(unit_checks["book_units_review_status_check"]) == sorted(
+        state.value for state in BookUnitReviewStatus
+    )
+    assert str(unit_checks["book_units_review_approved_check"].sqltext) == (
+        "review_status <> 'approved' OR "
+        "(reviewed_by_user_id IS NOT NULL AND reviewed_at IS NOT NULL)"
+    )
+    assert str(unit_checks["book_units_review_pending_check"].sqltext) == (
+        "review_status <> 'pending' OR "
+        "(reviewed_by_user_id IS NULL AND reviewed_at IS NULL)"
+    )
+
 
 def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
     expectations = {
@@ -196,6 +264,8 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
             "book_revisions_file_asset_id_idx",
             "book_revisions_uploaded_by_user_id_idx",
             "book_revisions_status_idx",
+            # P3: at most ONE current publication per book (partial).
+            "uq_book_revisions_book_current_key",
         },
         "book_revision_contexts": {
             "uq_book_revision_contexts_revision_context_key",
@@ -204,6 +274,8 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
         "book_units": {
             "book_units_book_revision_id_idx",
             "book_units_parent_unit_id_idx",
+            # P3: the reviewer FK column carries its own index.
+            "book_units_reviewed_by_user_id_idx",
             # Sibling order is collision-free for children AND roots.
             "uq_book_units_revision_parent_order_key",
             "uq_book_units_revision_root_order_key",
@@ -234,6 +306,16 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
         "book_revision_id",
         "learning_context_id",
     ]
+
+    # The current-publication pointer is a PARTIAL unique index: historical
+    # published revisions (flag false) never collide with the live one.
+    current_pointer = next(
+        i for i in _table("book_revisions").indexes
+        if i.name == "uq_book_revisions_book_current_key"
+    )
+    assert current_pointer.unique is True
+    assert list(current_pointer.columns.keys()) == ["book_id"]
+    assert current_pointer.dialect_options.get("postgresql", {}).get("where") is not None
 
     # The composite self-FK target: a table-level UNIQUE on (id, revision).
     from sqlalchemy import UniqueConstraint
@@ -291,7 +373,7 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES
         assert table in verify_database.LATER_MIGRATION_TABLES
-    assert verify_database.EXPECTED_REVISION == "0019"
+    assert verify_database.EXPECTED_REVISION == "0020"
     assert verify_database.EXPECTED_REVISION in {
         p.stem.split("_")[0]
         for p in (verify_database.MIGRATION_DIR).glob("0*.py")
@@ -305,6 +387,7 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
         "book_revision_contexts_context_id_idx",
         "book_units_book_revision_id_idx",
         "book_units_parent_unit_id_idx",
+        "book_units_reviewed_by_user_id_idx",
     ):
         assert index_name in verify_database.EXPECTED_FK_INDEXES
 
@@ -346,6 +429,52 @@ def test_book_read_schemas_require_their_fields_and_expose_no_paths() -> None:
     assert "extraction_error" in BookRevisionRead.model_fields
     assert "content" not in BookRevisionRead.model_fields
     assert "units" not in BookRevisionRead.model_fields
+
+    # P3: the publication pointer is part of the plain revision read, but
+    # the unit tree and the rejection reason live ONLY on the detail read
+    # — a book listing never drags every unit of every edition along.
+    assert "is_current_publication" in BookRevisionRead.model_fields
+    assert BookRevisionRead.model_fields["is_current_publication"].default is False
+    assert "rejection_reason" not in BookRevisionRead.model_fields
+    assert "units" in BookRevisionDetailRead.model_fields
+    assert "rejection_reason" in BookRevisionDetailRead.model_fields
+    assert set(BookRevisionDetailRead.model_fields) == (
+        set(BookRevisionRead.model_fields) | {"units", "rejection_reason"}
+    )
+    # Inspection never leaks storage details either.
+    assert "storage_key" not in BookRevisionDetailRead.model_fields
+    assert "storage_key" not in BookUnitRead.model_fields
+
+
+def test_book_review_request_schemas_are_strict_and_forgiving_in_the_right_ways() -> None:
+    """Corrections take ONLY supplied fields; rejection demands a reason."""
+    # Every correction field is optional — an empty body is valid schema
+    # (the SERVICE refuses it as "no correction fields supplied", 422).
+    assert all(
+        not field.is_required() for field in BookUnitCorrectRequest.model_fields.values()
+    )
+    # unknown fields are refused, not silently dropped (extra=forbid).
+    assert BookUnitCorrectRequest.model_config.get("extra") == "forbid"
+    with pytest.raises(ValidationError):
+        BookUnitCorrectRequest.model_validate({"storage_key": "x"})
+    # Explicit null is representable for schema purposes (the service
+    # allows it only for parent_unit_id; other nulls → 422 there).
+    assert BookUnitCorrectRequest.model_validate({"content": None}) is not None
+
+    # The rejection reason is mandatory and bounded like material reject.
+    with pytest.raises(ValidationError):
+        BookRevisionRejectRequest.model_validate({})
+    with pytest.raises(ValidationError):
+        BookRevisionRejectRequest.model_validate({"reason": ""})
+    with pytest.raises(ValidationError):
+        BookRevisionRejectRequest.model_validate({"reason": "x" * 2001})
+    assert BookRevisionRejectRequest.model_config.get("extra") == "forbid"
+    assert BookRevisionRejectRequest.model_validate(
+        {"reason": "spurious pages"}
+    ).reason == "spurious pages"
+
+    # A blank/whitespace reason is refused by the SERVICE (strip first).
+    assert BookRevisionRejectRequest.model_validate({"reason": "   "}).reason == "   "
 
 
 def test_book_revision_status_vocabulary_is_the_six_intake_states() -> None:

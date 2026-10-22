@@ -361,6 +361,23 @@ class AssessmentRequirement(str, enum.Enum):
     NOT_REQUIRED = "not_required"
 
 
+class BookUnitReviewStatus(str, enum.Enum):
+    """Durable per-unit review state (P3, ADR-004).
+
+    Every extracted unit starts ``pending`` and becomes ``approved`` only
+    through an explicit administrator approval; any correction of the unit
+    (or of a structural ancestor) resets it to ``pending`` so reviewed
+    content can never silently become unreviewed content in a published
+    revision. There is no per-unit ``rejected`` state: rejection is a
+    revision-level decision with a recorded reason. Enforced by
+    ``book_units_review_status_check``, and the reviewer identity columns
+    are kept in lockstep by the paired approved/pending CHECKs.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+
+
 class FileAssetStatus(str, enum.Enum):
     """Upload/validation pipeline state for one stored file asset.
 

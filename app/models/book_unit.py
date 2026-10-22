@@ -26,9 +26,11 @@ FKs stay NO ACTION like the rest of the book family: historical
 revisions are never cascade-deleted.
 """
 import uuid
+from datetime import datetime
 
 from sqlalchemy import (
     CheckConstraint,
+    DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -42,7 +44,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.time_mixin import TimestampMixin
-from app.models.enums import AssessmentRequirement, BookUnitKind, sql_in_list
+from app.models.enums import (
+    AssessmentRequirement,
+    BookUnitKind,
+    BookUnitReviewStatus,
+    sql_in_list,
+)
 
 
 class BookUnit(TimestampMixin, Base):
@@ -68,12 +75,33 @@ class BookUnit(TimestampMixin, Base):
     source_page_start: Mapped[int] = mapped_column(Integer, nullable=False)
     source_page_end: Mapped[int] = mapped_column(Integer, nullable=False)
     #: Fixed warning codes (see ``app.services.book_extraction``),
-    #: newline-separated; NULL when the unit parsed cleanly.
+    #: newline-separated; NULL when the unit parsed cleanly. Approval
+    #: never clears these: P3 keeps them visible on approved units too.
     extraction_warnings: Mapped[str | None] = mapped_column(Text, nullable=True)
     assessment_requirement: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default=AssessmentRequirement.UNRESOLVED.value,
+    )
+    #: P3 durable per-unit review state: starts ``pending``, becomes
+    #: ``approved`` only through an explicit administrator approval, and
+    #: any correction (of this unit or a structural ancestor) resets it —
+    #: the paired CHECKs below keep the reviewer identity columns in
+    #: lockstep so a reset can never leave stale identity behind.
+    review_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=BookUnitReviewStatus.PENDING.value,
+    )
+    #: WHO approved this unit (NULL while pending); FK uses NO ACTION
+    #: like the rest of the book family — review history is never
+    #: cascade-deleted.
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    #: WHEN the approval happened (NULL while pending).
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (
@@ -89,6 +117,18 @@ class BookUnit(TimestampMixin, Base):
             "assessment_requirement IN (" + sql_in_list(AssessmentRequirement) + ")",
             name="book_units_assessment_requirement_check",
         ),
+        CheckConstraint(
+            "review_status IN (" + sql_in_list(BookUnitReviewStatus) + ")",
+            name="book_units_review_status_check",
+        ),
+        CheckConstraint(
+            "review_status <> 'approved' OR (reviewed_by_user_id IS NOT NULL AND reviewed_at IS NOT NULL)",
+            name="book_units_review_approved_check",
+        ),
+        CheckConstraint(
+            "review_status <> 'pending' OR (reviewed_by_user_id IS NULL AND reviewed_at IS NULL)",
+            name="book_units_review_pending_check",
+        ),
         # FK target for the composite self-FK below.
         UniqueConstraint("id", "book_revision_id", name="book_units_id_revision_key"),
         ForeignKeyConstraint(
@@ -98,6 +138,9 @@ class BookUnit(TimestampMixin, Base):
         ),
         Index("book_units_book_revision_id_idx", "book_revision_id"),
         Index("book_units_parent_unit_id_idx", "parent_unit_id"),
+        # The reviewer FK column carries its own index (0016/0019 house
+        # rule: PostgreSQL does not index foreign keys automatically).
+        Index("book_units_reviewed_by_user_id_idx", "reviewed_by_user_id"),
         # Sibling order is a durable invariant: children and roots get one
         # PARTIAL unique index each (NULL parent is excluded from a plain
         # UNIQUE), with sqlite_where kept alongside postgresql_where so the
