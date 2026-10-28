@@ -9,6 +9,10 @@ from app.models.academic_year import AcademicYear
 from app.models.auth_event import AuthEvent
 from app.models.auth_session import AuthSession
 from app.models.book import Book
+from app.models.book_attempt import BookAttempt
+from app.models.book_attempt_answer import BookAttemptAnswer
+from app.models.book_question import BookQuestion
+from app.models.book_question_option import BookQuestionOption
 from app.models.book_revision import BookRevision
 from app.models.book_revision_context import BookRevisionContext
 from app.models.book_unit import BookUnit
@@ -58,6 +62,10 @@ __all__ = [
     "AuthEvent",
     "AuthSession",
     "Book",
+    "BookAttempt",
+    "BookAttemptAnswer",
+    "BookQuestion",
+    "BookQuestionOption",
     "BookRevision",
     "BookRevisionContext",
     "BookUnit",

@@ -103,6 +103,14 @@ class BookUnit(TimestampMixin, Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: P4 exercise-set passing threshold (percent, 1-100). NULL means the
+    #: default 70. The named CHECK below proves the column can only ever
+    #: hold a value on an ``exercise_set`` unit — every other kind must
+    #: keep it NULL (a CHECK cannot enforce "only this kind", only "this
+    #: kind or NULL", which is exactly the invariant).
+    passing_threshold_percent: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint("kind IN (" + sql_in_list(BookUnitKind) + ")", name="book_units_kind_check"),
@@ -128,6 +136,13 @@ class BookUnit(TimestampMixin, Base):
         CheckConstraint(
             "review_status <> 'pending' OR (reviewed_by_user_id IS NULL AND reviewed_at IS NULL)",
             name="book_units_review_pending_check",
+        ),
+        # P4: the passing threshold may only live on an exercise set,
+        # and only within 1-100 (NULL = the default 70).
+        CheckConstraint(
+            "passing_threshold_percent IS NULL OR "
+            "(kind = 'exercise_set' AND passing_threshold_percent BETWEEN 1 AND 100)",
+            name="book_units_passing_threshold_check",
         ),
         # FK target for the composite self-FK below.
         UniqueConstraint("id", "book_revision_id", name="book_units_id_revision_key"),

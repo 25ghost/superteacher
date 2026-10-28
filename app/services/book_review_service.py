@@ -58,9 +58,11 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.book import Book
+from app.models.book_question import BookQuestion
+from app.models.book_question_option import BookQuestionOption
 from app.models.book_revision import BookRevision
 from app.models.book_revision_context import BookRevisionContext
 from app.models.book_unit import BookUnit
@@ -374,7 +376,7 @@ def approve_revision(
             "the revision has no extracted units to approve"
         )
     ordered = _ordered_tree(units)
-    problems = _publication_problems(ordered)
+    problems = _publication_problems(ordered, _load_questions(session, revision))
     if problems:
         raise LearningValidationError("; ".join(problems))
 
@@ -487,8 +489,11 @@ def create_correction_revision(
     The copy shares the source's source asset, learning contexts and
     extraction summary (same document), gets brand-new unit IDs with
     parents remapped inside the copy, and every unit starts ``pending``.
-    The source revision and its units are never written — published and
-    rejected history stays byte-identical.
+    P4: questions and options are cloned with fresh IDs remapped to the
+    copied units; answer-key verification and correctness are reset, so
+    the new revision requires explicit verification again. The source
+    revision, its units and its questions are never written — published
+    and rejected history stays byte-identical.
     """
     _require_admin(user)
     book = _load_book(session, book_id, for_update=True)
@@ -504,6 +509,7 @@ def create_correction_revision(
 
     source_units = _load_units(session, source)
     _ordered_tree(source_units)  # refuse a corrupt source instead of copying it
+    source_questions = _load_questions(session, source)
 
     created = BookRevision(
         book_id=book.id,
@@ -528,11 +534,13 @@ def create_correction_revision(
 
     children = _children_by_parent(source_units)
     copied = 0
+    unit_id_map: dict[uuid.UUID, uuid.UUID] = {}
 
     def _copy(unit: BookUnit, parent_new_id: uuid.UUID | None) -> None:
         nonlocal copied
+        new_id = uuid.uuid4()
         row = BookUnit(
-            id=uuid.uuid4(),
+            id=new_id,
             book_revision_id=created.id,
             parent_unit_id=parent_new_id,
             kind=unit.kind,
@@ -543,17 +551,49 @@ def create_correction_revision(
             source_page_end=unit.source_page_end,
             extraction_warnings=unit.extraction_warnings,
             assessment_requirement=unit.assessment_requirement,
+            passing_threshold_percent=unit.passing_threshold_percent,
             review_status=BookUnitReviewStatus.PENDING.value,
             reviewed_by_user_id=None,
             reviewed_at=None,
         )
         session.add(row)
+        unit_id_map[unit.id] = new_id
         copied += 1
         for child in children.get(unit.id, ()):
             _copy(child, row.id)
 
     for root in children.get(None, ()):
         _copy(root, None)
+    session.flush()
+
+    # P4: clone every question and its options with FRESH ids, remapped
+    # to the copied units. Verification state and correctness are reset —
+    # the new revision requires explicit answer-key verification again.
+    copied_questions = 0
+    for question in source_questions:
+        new_question = BookQuestion(
+            id=uuid.uuid4(),
+            book_revision_id=created.id,
+            book_unit_id=unit_id_map[question.book_unit_id],
+            question_type=question.question_type,
+            prompt=question.prompt,
+            explanation=question.explanation,
+            display_order=question.display_order,
+            answer_key_verified_by_user_id=None,
+            answer_key_verified_at=None,
+        )
+        session.add(new_question)
+        for option in question.options:
+            session.add(
+                BookQuestionOption(
+                    id=uuid.uuid4(),
+                    book_question_id=new_question.id,
+                    option_text=option.option_text,
+                    display_order=option.display_order,
+                    is_correct=False,
+                )
+            )
+        copied_questions += 1
     session.flush()
 
     _log(
@@ -567,6 +607,7 @@ def create_correction_revision(
             "book_revision_id": str(created.id),
             "revision_number": created.revision_number,
             "unit_count": copied,
+            "question_count": copied_questions,
         },
     )
     session.flush()
@@ -647,6 +688,20 @@ def _load_units(session: Session, revision: BookRevision) -> list[BookUnit]:
         session.scalars(
             select(BookUnit)
             .where(BookUnit.book_revision_id == revision.id)
+            .execution_options(populate_existing=True)
+        )
+    )
+
+
+def _load_questions(
+    session: Session, revision: BookRevision
+) -> list[BookQuestion]:
+    """Every question of the revision with its options (P4)."""
+    return list(
+        session.scalars(
+            select(BookQuestion)
+            .where(BookQuestion.book_revision_id == revision.id)
+            .options(selectinload(BookQuestion.options))
             .execution_options(populate_existing=True)
         )
     )
@@ -744,7 +799,9 @@ def _validate_parent(
         cursor = next_cursor
 
 
-def _publication_problems(units: list[BookUnit]) -> list[str]:
+def _publication_problems(
+    units: list[BookUnit], questions: list[BookQuestion]
+) -> list[str]:
     """Everything that must be fixed before a revision may be published."""
     problems: list[str] = []
     unapproved = [
@@ -777,6 +834,46 @@ def _publication_problems(units: list[BookUnit]) -> list[str]:
         problems.append(
             f"{len(warning_units)} units carry an unresolved structural "
             "warning; correct their structure first"
+        )
+    problems.extend(_assessment_problems(units, questions))
+    return problems
+
+
+def _assessment_problems(
+    units: list[BookUnit], questions: list[BookQuestion]
+) -> list[str]:
+    """P4: every REQUIRED exercise set needs verified questions.
+
+    A published revision must never contain a required exercise set
+    that lacks questions or whose answer keys are unverified — the
+    exercise set would be ungradeable the moment a student opens it.
+    ``not_required`` / ``unresolved`` exercise sets are exempt (they
+    carry no assessment obligation), but if questions DO exist on any
+    published exercise set, every one of them must be verified.
+    """
+    problems: list[str] = []
+    by_unit: dict[uuid.UUID, list[BookQuestion]] = {}
+    for question in questions:
+        by_unit.setdefault(question.book_unit_id, []).append(question)
+    unverified = [
+        question for question in questions if question.answer_key_verified_at is None
+    ]
+    if unverified:
+        problems.append(
+            f"{len(unverified)} of {len(questions)} questions have an "
+            "unverified answer key; verify every question first"
+        )
+    required_sets = [
+        unit
+        for unit in units
+        if unit.kind == BookUnitKind.EXERCISE_SET.value
+        and unit.assessment_requirement == AssessmentRequirement.REQUIRED.value
+    ]
+    empty = [unit for unit in required_sets if not by_unit.get(unit.id)]
+    if empty:
+        problems.append(
+            f"{len(empty)} required exercise sets have no objective questions; "
+            "author and verify at least one question per required set"
         )
     return problems
 
@@ -855,6 +952,11 @@ def _asset_read(asset: FileAsset) -> FileAssetRead:
     )
 
 
+def read_unit(unit: BookUnit) -> BookUnitRead:
+    """Public unit reader shared with the question/threshold surface (P4)."""
+    return _read_unit(unit)
+
+
 def _read_unit(unit: BookUnit) -> BookUnitRead:
     return BookUnitRead(
         unit_id=unit.id,
@@ -870,6 +972,7 @@ def _read_unit(unit: BookUnit) -> BookUnitRead:
         review_status=BookUnitReviewStatus(unit.review_status),
         reviewed_by_user_id=unit.reviewed_by_user_id,
         reviewed_at=unit.reviewed_at,
+        passing_threshold_percent=unit.passing_threshold_percent,
         created_at=unit.created_at,
         updated_at=unit.updated_at,
     )

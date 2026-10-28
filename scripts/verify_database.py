@@ -107,9 +107,15 @@ EXPECTED_TABLES = {
     "book_revision_contexts",
     # created by 0019 (book content extraction: per-revision unit tree)
     "book_units",
+    # created by 0021 (book objective assessment: questions, options,
+    # attempts, submitted answers)
+    "book_questions",
+    "book_question_options",
+    "book_attempts",
+    "book_attempt_answers",
 }
 
-EXPECTED_REVISION = "0020"
+EXPECTED_REVISION = "0021"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -178,6 +184,39 @@ EXPECTED_FK_INDEXES = {
     "book_units_parent_unit_id_idx": ("book_units", ("parent_unit_id",)),
     # Book review & publication (0020): the reviewer FK column (new).
     "book_units_reviewed_by_user_id_idx": ("book_units", ("reviewed_by_user_id",)),
+    # Book objective assessment (0021): question/attempt FK columns.
+    "book_questions_book_revision_id_idx": (
+        "book_questions",
+        ("book_revision_id",),
+    ),
+    "book_questions_book_unit_id_idx": ("book_questions", ("book_unit_id",)),
+    "book_questions_answer_key_verified_by_user_id_idx": (
+        "book_questions",
+        ("answer_key_verified_by_user_id",),
+    ),
+    "book_question_options_book_question_id_idx": (
+        "book_question_options",
+        ("book_question_id",),
+    ),
+    "book_attempts_student_id_idx": ("book_attempts", ("student_id",)),
+    "book_attempts_book_revision_id_idx": ("book_attempts", ("book_revision_id",)),
+    "book_attempts_book_unit_id_idx": ("book_attempts", ("book_unit_id",)),
+    "book_attempts_student_unit_idx": (
+        "book_attempts",
+        ("student_id", "book_unit_id"),
+    ),
+    "book_attempt_answers_book_attempt_id_idx": (
+        "book_attempt_answers",
+        ("book_attempt_id",),
+    ),
+    "book_attempt_answers_book_question_id_idx": (
+        "book_attempt_answers",
+        ("book_question_id",),
+    ),
+    "book_attempt_answers_selected_option_id_idx": (
+        "book_attempt_answers",
+        ("selected_option_id",),
+    ),
 }
 
 # --- type / CHECK-text normalisation -----------------------------------------
@@ -200,10 +239,13 @@ def _norm_type(type_text: str) -> str:
 
     PostgreSQL's inspector reports timezone-aware columns as ``TIMESTAMP``
     without the ``WITH TIME ZONE`` suffix, so that suffix is dropped on both
-    sides; spacing is otherwise collapsed.
+    sides; ``sa.Float`` is stored as ``float8`` and reported by PostgreSQL
+    as ``double precision`` (0021's ``score_percent`` is the first such
+    column); spacing is otherwise collapsed.
     """
     text = re.sub(r"\s+", " ", str(type_text).strip().upper())
     text = text.replace(" WITH TIME ZONE", "").replace(" WITHOUT TIME ZONE", "")
+    text = text.replace("DOUBLE PRECISION", "FLOAT")
     return text.replace("CHARACTER VARYING", "VARCHAR")
 
 
@@ -214,7 +256,15 @@ def _check_literals(text: str) -> tuple[str, ...]:
 
 def _check_shape(text: str) -> str:
     """A CHECK constraint's structure with literals masked and parens removed."""
-    masked = re.sub(r"'[^']*'", "?", text)
+    # PostgreSQL canonicalises ``a BETWEEN b AND c`` to
+    # ``a >= b AND a <= c`` (0021's passing-threshold CHECK), so both
+    # spellings are folded to the canonical form before masking.
+    masked = re.sub(
+        r"(?i)([a-z_0-9]+)\s+BETWEEN\s+([^\s]+)\s+AND\s+([^\s]+)",
+        r"\1 >= \2 AND \1 <= \3",
+        text,
+    )
+    masked = re.sub(r"'[^']*'", "?", masked)
     masked = re.sub(r"::\s*[a-z_ ]+", "", masked)
     return re.sub(r"[\s()\[\]]", "", masked).upper()
 
@@ -835,6 +885,12 @@ LATER_MIGRATION_TABLES = {
     "book_revision_contexts",
     # created by 0019 (book content extraction: per-revision unit tree)
     "book_units",
+    # created by 0021 (book objective assessment: questions, options,
+    # attempts, submitted answers)
+    "book_questions",
+    "book_question_options",
+    "book_attempts",
+    "book_attempt_answers",
 }
 
 

@@ -33,6 +33,21 @@ and operates on ONE revision of ONE book:
 - ``POST   .../revisions/{revision_id}/correct`` — clone a rejected or
   published revision into the next edition for correction.
 
+Objective assessment authoring (P4) — administrator-only, one revision:
+
+- ``GET    .../revisions/{revision_id}/units/{unit_id}/questions`` —
+  list the questions of one exercise-set unit.
+- ``POST   .../revisions/{revision_id}/units/{unit_id}/questions`` —
+  author one question (options inline, unverified).
+- ``PATCH  .../revisions/{revision_id}/questions/{question_id}`` —
+  correct one question (supplying ``options`` replaces the set).
+- ``DELETE .../revisions/{revision_id}/questions/{question_id}`` —
+  delete one question.
+- ``POST   .../revisions/{revision_id}/questions/{question_id}/verify``
+  — name THE correct option (answer key).
+- ``PATCH  .../revisions/{revision_id}/units/{unit_id}/threshold`` —
+  set one exercise set's passing threshold percent.
+
 The response carries metadata only: never a ``storage_key``, filesystem
 path or file bytes, and no student or teacher surface exists for books in
 this phase. Error contract: invalid upload/inputs → 422 (shared
@@ -67,7 +82,19 @@ from app.schemas.book import (
     BookUnitCorrectRequest,
     BookUnitRead,
 )
-from app.services import book_extraction_service, book_review_service, book_service
+from app.schemas.book_assessment import (
+    BookQuestionCorrectRequest,
+    BookQuestionCreate,
+    BookQuestionRead,
+    BookQuestionVerifyRequest,
+    BookUnitThresholdRequest,
+)
+from app.services import (
+    book_extraction_service,
+    book_question_service,
+    book_review_service,
+    book_service,
+)
 from app.services.learning_context_service import LearningError
 
 _settings = get_settings()
@@ -543,6 +570,275 @@ def admin_correct_book_revision(
     return _review_write(
         lambda: book_review_service.create_correction_revision(
             session, admin, book_id=book_id, revision_id=revision_id
+        ),
+        session,
+    )
+
+
+# --- objective assessment authoring (P4) -----------------------------------------------
+
+
+@router.get(
+    "/books/{book_id}/revisions/{revision_id}/units/{unit_id}/questions",
+    response_model=list[BookQuestionRead],
+    summary="List the questions of one exercise-set unit",
+    description=(
+        "Every question of ONE unit in sibling order, with its options "
+        "and the answer-key verification state (verifier + timestamp). "
+        "Administrators only. Unknown ids → 404."
+    ),
+    responses={
+        200: {"description": "Ordered questions with their options"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or unit id"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_READ)
+def admin_list_book_unit_questions(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    unit_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> list[BookQuestionRead]:
+    try:
+        return book_question_service.list_questions(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            unit_id=unit_id,
+        )
+    except LearningError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/units/{unit_id}/questions",
+    response_model=BookQuestionRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Author one question on one exercise-set unit",
+    description=(
+        "Creates ONE question on ONE ``exercise_set`` unit of a "
+        "``pending_review`` revision. ``question_type`` is "
+        "``multiple_choice`` (2-10 options) or ``true_false`` (exactly 2); "
+        "options are supplied inline with distinct texts and sibling "
+        "orders; ``prompt`` and ``explanation`` must be non-blank. "
+        "Correctness is NOT part of creation — the question stays "
+        "unverified until an explicit ``verify`` action names the correct "
+        "option. Creating resets the unit to ``pending``. Duplicate "
+        "``display_order`` in the same set → 422; wrong revision status "
+        "→ 409; unknown ids → 404; a non-exercise-set unit → 422. "
+        "Administrators only."
+    ),
+    responses={
+        201: {"description": "Question created (unverified)"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or unit id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Invalid question or options"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_create_book_unit_question(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    unit_id: uuid.UUID,
+    payload: BookQuestionCreate,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookQuestionRead:
+    return _review_write(
+        lambda: book_question_service.create_question(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            unit_id=unit_id,
+            payload=payload,
+        ),
+        session,
+    )
+
+
+@router.patch(
+    "/books/{book_id}/revisions/{revision_id}/questions/{question_id}",
+    response_model=BookQuestionRead,
+    summary="Correct one question of a pending review",
+    description=(
+        "Only supplied fields are applied (``model_fields_set``); an "
+        "empty body is a 422. Supplying ``options`` REPLACES the whole "
+        "option set — fresh rows. ANY correction clears the question's "
+        "answer key (verification state and option flags) and resets "
+        "the owning unit to ``pending``; everything is validated "
+        "before any row is written, so a refused correction changes "
+        "nothing. Wrong revision status → 409, unknown ids → 404. "
+        "Administrators only."
+    ),
+    responses={
+        200: {"description": "Corrected question (verification cleared)"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or question id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Invalid correction"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_correct_book_question(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    question_id: uuid.UUID,
+    payload: BookQuestionCorrectRequest,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookQuestionRead:
+    return _review_write(
+        lambda: book_question_service.correct_question(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            question_id=question_id,
+            payload=payload,
+        ),
+        session,
+    )
+
+
+@router.delete(
+    "/books/{book_id}/revisions/{revision_id}/questions/{question_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete one question of a pending review",
+    description=(
+        "Removes ONE question and its options. Published and rejected "
+        "revisions refuse every mutation (409), so a graded question "
+        "and the attempts that reference it are never orphaned by a "
+        "late delete. Wrong revision status → 409, unknown ids → 404. "
+        "Administrators only."
+    ),
+    responses={
+        204: {"description": "Question deleted"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or question id"},
+        409: {"description": "Revision is no longer pending review"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_delete_book_question(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    question_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> None:
+    _review_write(
+        lambda: book_question_service.delete_question(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            question_id=question_id,
+        ),
+        session,
+    )
+
+
+@router.post(
+    "/books/{book_id}/revisions/{revision_id}/questions/{question_id}/verify",
+    response_model=BookQuestionRead,
+    summary="Name THE correct option of one question (answer key)",
+    description=(
+        "Explicitly confirm THE correct option of ONE question. The "
+        "named option must belong to this question (else the SAME 404 "
+        "as an unknown id); every other option of the question is "
+        "cleared, so exactly one correct option exists. Verification is "
+        "recorded with the administrator identity and timestamp — "
+        "correctness is never inferred. Wrong revision status → 409, "
+        "unknown ids → 404. Administrators only."
+    ),
+    responses={
+        200: {"description": "Verified question"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or question id"},
+        409: {"description": "Revision is no longer pending review"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_verify_book_question(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    question_id: uuid.UUID,
+    payload: BookQuestionVerifyRequest,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookQuestionRead:
+    return _review_write(
+        lambda: book_question_service.verify_question(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            question_id=question_id,
+            payload=payload,
+        ),
+        session,
+    )
+
+
+@router.patch(
+    "/books/{book_id}/revisions/{revision_id}/units/{unit_id}/threshold",
+    response_model=BookUnitRead,
+    summary="Set one exercise set's passing threshold percent",
+    description=(
+        "Configure the per-exercise-set passing threshold (1-100, "
+        "integer percent). ``null`` restores the default 70. Any "
+        "effective change resets the unit's review status to "
+        "``pending``; setting the stored value again is an idempotent "
+        "no-op. Only ``pending_review`` revisions and ``exercise_set`` "
+        "units can be configured (409 / 422). Administrators only."
+    ),
+    responses={
+        200: {"description": "Updated exercise-set unit"},
+        401: {"description": "Missing/invalid credentials"},
+        403: {"description": "Authenticated but not an administrator"},
+        404: {"description": "Unknown book, revision or unit id"},
+        409: {"description": "Revision is no longer pending review"},
+        422: {"description": "Invalid threshold or unit kind"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit(_settings.RATE_LIMIT_STUDENT_WRITE)
+def admin_set_book_unit_threshold(
+    request: Request,
+    book_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    unit_id: uuid.UUID,
+    payload: BookUnitThresholdRequest,
+    session: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> BookUnitRead:
+    return _review_write(
+        lambda: book_question_service.set_unit_threshold(
+            session,
+            admin,
+            book_id=book_id,
+            revision_id=revision_id,
+            unit_id=unit_id,
+            payload=payload,
         ),
         session,
     )

@@ -45,9 +45,14 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 # The application tables, children first for TRUNCATE CASCADE simplicity.
 APPLICATION_TABLES: tuple[str, ...] = (
-    # Administrator book intake (0018/0019) - extracted units before
+    # Administrator book intake (0018/0019/0021) - assessment children
+    # (answers → attempts, options → questions) before units, then
     # context links before revisions before books; all before the
     # file_assets/users they reference.
+    "book_attempt_answers",
+    "book_attempts",
+    "book_question_options",
+    "book_questions",
     "book_units",
     "book_revision_contexts",
     "book_revisions",

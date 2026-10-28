@@ -378,6 +378,24 @@ class BookUnitReviewStatus(str, enum.Enum):
     APPROVED = "approved"
 
 
+class BookQuestionType(str, enum.Enum):
+    """Kind of one administrator-authored objective question (P4, ADR-006).
+
+    Exactly two kinds exist and they are NOT interchangeable labels:
+
+    - ``multiple_choice`` — two or more distinct options, exactly one of
+      which is correct once the answer key is verified;
+    - ``true_false`` — exactly two options.
+
+    Enforced by ``book_questions_question_type_check``; the per-kind
+    option-count rules live in the authoring service (a CHECK cannot
+    count child rows).
+    """
+
+    MULTIPLE_CHOICE = "multiple_choice"
+    TRUE_FALSE = "true_false"
+
+
 class FileAssetStatus(str, enum.Enum):
     """Upload/validation pipeline state for one stored file asset.
 

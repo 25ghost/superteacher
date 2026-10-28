@@ -86,6 +86,10 @@ class BookUnitRead(BaseModel):
     review_status: BookUnitReviewStatus
     reviewed_by_user_id: UUID | None = None
     reviewed_at: datetime | None = None
+    #: P4: the exercise set's passing threshold (percent). NULL means
+    #: the default 70; only ever set on ``exercise_set`` units (the
+    #: database CHECK proves it).
+    passing_threshold_percent: int | None = None
     created_at: datetime
     updated_at: datetime
 
