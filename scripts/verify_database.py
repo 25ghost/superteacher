@@ -113,9 +113,11 @@ EXPECTED_TABLES = {
     "book_question_options",
     "book_attempts",
     "book_attempt_answers",
+    # created by 0022 (student guided learning: per-revision progress)
+    "student_book_progress",
 }
 
-EXPECTED_REVISION = "0021"
+EXPECTED_REVISION = "0022"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)
@@ -216,6 +218,19 @@ EXPECTED_FK_INDEXES = {
     "book_attempt_answers_selected_option_id_idx": (
         "book_attempt_answers",
         ("selected_option_id",),
+    ),
+    # Student guided learning (0022): progress FK columns.
+    "student_book_progress_student_id_idx": (
+        "student_book_progress",
+        ("student_id",),
+    ),
+    "student_book_progress_book_revision_id_idx": (
+        "student_book_progress",
+        ("book_revision_id",),
+    ),
+    "student_book_progress_book_unit_id_idx": (
+        "student_book_progress",
+        ("book_unit_id",),
     ),
 }
 
@@ -891,6 +906,8 @@ LATER_MIGRATION_TABLES = {
     "book_question_options",
     "book_attempts",
     "book_attempt_answers",
+    # created by 0022 (student guided learning: per-revision progress)
+    "student_book_progress",
 }
 
 

@@ -19,6 +19,8 @@ Role-split layout (no endpoint serves two roles):
   (`/me/learning-enrollments`, Phase 1),
 - ``student_content.router`` — student self-service content access
   (`/me/learning-content`, Phase 2, slice 2C),
+- ``student_books.router`` — student guided learning over published
+  books (`/me/books`, book P5),
 - ``student_classes.router`` — student self-service online classes
   (`/me/classes`, Phase 3 3A),
 - ``marketplace.router`` — student marketplace
@@ -45,6 +47,7 @@ from app.api.v1.endpoints import (
     learning_enrollments,
     marketplace,
     registrations,
+    student_books,
     student_classes,
     student_content,
     teacher_classes,
@@ -68,6 +71,7 @@ api_router.include_router(teacher_verification.teacher_router)
 api_router.include_router(teacher_verification.admin_router)
 api_router.include_router(learning_enrollments.router)
 api_router.include_router(student_content.router)
+api_router.include_router(student_books.router)
 api_router.include_router(student_classes.router)
 api_router.include_router(marketplace.router)
 api_router.include_router(catalog.router)

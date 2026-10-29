@@ -82,6 +82,13 @@ STUDENT_ROUTES: list[tuple[str, str, dict | None]] = [
     ("POST", "/api/v1/me/classes/{class_id}/ws-ticket", None),
     # Phase 3 slice 3D — live message recovery cursor (student-only).
     ("GET", "/api/v1/me/classes/{class_id}/messages", None),
+    # Book P5 — student guided learning over administrator-published books.
+    ("GET", "/api/v1/me/books", None),
+    ("GET", "/api/v1/me/books/{book_id}", None),
+    ("GET", "/api/v1/me/books/{book_id}/next-unit", None),
+    ("GET", "/api/v1/me/books/{book_id}/units/{unit_id}", None),
+    ("POST", "/api/v1/me/books/{book_id}/units/{unit_id}/complete", None),
+    ("POST", "/api/v1/me/books/{book_id}/units/{unit_id}/attempts", {}),
 ]
 
 TEACHER_ROUTES: list[tuple[str, str, dict | None]] = [
@@ -409,7 +416,7 @@ def test_public_routes_never_answer_401_or_403(
 def test_route_inventory_is_exactly_the_matrix() -> None:
     """No v1 endpoint may exist outside the role matrix — and vice versa.
 
-    The count pin (147) makes adding or removing a route a conscious
+    The count pin (153) makes adding or removing a route a conscious
     decision: a new endpoint must be listed in one of the five groups
     above or this test names it as unlisted.
     """
@@ -428,7 +435,7 @@ def test_route_inventory_is_exactly_the_matrix() -> None:
         f"unlisted routes: {sorted(actual - listed)}; "
         f"stale matrix entries: {sorted(listed - actual)}"
     )
-    assert len(actual) == 147, f"route count changed: {len(actual)} != 147"
+    assert len(actual) == 153, f"route count changed: {len(actual)} != 153"
 
 
 # --- wrong-role callers (guards must answer before the handler) ----------------------

@@ -1,4 +1,4 @@
-"""Unit tests: the administrator book tables, migrations 0018-0021.
+"""Unit tests: the administrator book tables, migrations 0018-0022.
 
 Book intake adds ``books``, ``book_revisions`` and
 ``book_revision_contexts`` (0018); content extraction adds the
@@ -9,7 +9,8 @@ per-unit review state (``is_current_publication``/``rejection_reason``,
 ``review_status``/``reviewed_by_user_id``/``reviewed_at``, 0020);
 objective assessment adds the per-unit passing threshold plus
 ``book_questions``/``book_question_options``/``book_attempts``/
-``book_attempt_answers`` (0021). Model, migration and the offline
+``book_attempt_answers`` (0021); student guided learning adds
+``student_book_progress`` (0022). Model, migration and the offline
 verification script must agree — the drift tests below run
 ``scripts/verify_database.py``'s own schema descriptors, and the
 truncation-order test proves the children are cleared before their
@@ -76,6 +77,8 @@ _NEW_TABLES = (
     "book_question_options",
     "book_attempts",
     "book_attempt_answers",
+    # P5 (0022)
+    "student_book_progress",
 )
 
 
@@ -253,6 +256,23 @@ def test_book_tables_are_registered_with_expected_columns() -> None:
     assert answers.columns["selected_option_id"].nullable is False
     assert answers.columns["is_correct"].nullable is False
 
+    # P5 progress: one completion record per (student, revision, unit);
+    # a row IS a completion (the timestamp is never absent or rewritten).
+    assert set(_table("student_book_progress").columns.keys()) == {
+        "id",
+        "student_id",
+        "book_revision_id",
+        "book_unit_id",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    }
+    progress = _table("student_book_progress")
+    assert progress.columns["student_id"].nullable is False
+    assert progress.columns["book_revision_id"].nullable is False
+    assert progress.columns["book_unit_id"].nullable is False
+    assert progress.columns["completed_at"].nullable is False
+
 
 def test_book_foreign_keys_follow_the_naming_convention() -> None:
     expectations = {
@@ -307,6 +327,17 @@ def test_book_foreign_keys_follow_the_naming_convention() -> None:
             "book_attempt_answers_selected_option_id_fkey": (
                 "book_question_options.id",
                 "book_question_options.book_question_id",
+            ),
+        },
+        # P5: progress binds to BOTH the unit and its revision in one
+        # composite constraint (same pattern as the attempt rows), so a
+        # completion can never be grafted onto another edition.
+        "student_book_progress": {
+            "student_book_progress_student_id_fkey": ("students.id",),
+            "student_book_progress_book_revision_id_fkey": ("book_revisions.id",),
+            "student_book_progress_book_unit_id_fkey": (
+                "book_units.id",
+                "book_units.book_revision_id",
             ),
         },
     }
@@ -501,6 +532,14 @@ def test_book_indexes_are_declared_including_the_unique_edition_keys() -> None:
             "book_attempt_answers_book_question_id_idx",
             "book_attempt_answers_selected_option_id_idx",
         },
+        # P5: one completion per (student, revision, unit), and the FK
+        # columns carry their own indexes.
+        "student_book_progress": {
+            "uq_student_book_progress_key",
+            "student_book_progress_student_id_idx",
+            "student_book_progress_book_revision_id_idx",
+            "student_book_progress_book_unit_id_idx",
+        },
     }
     for table_name, expected in expectations.items():
         indexes = {
@@ -643,7 +682,7 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES
         assert table in verify_database.LATER_MIGRATION_TABLES
-    assert verify_database.EXPECTED_REVISION == "0021"
+    assert verify_database.EXPECTED_REVISION == "0022"
     assert verify_database.EXPECTED_REVISION in {
         p.stem.split("_")[0]
         for p in (verify_database.MIGRATION_DIR).glob("0*.py")
@@ -687,6 +726,9 @@ def test_book_tables_appear_in_application_truncation_order() -> None:
     assert order.index("book_question_options") < order.index("book_questions")
     assert order.index("book_questions") < order.index("book_units")
     assert order.index("book_attempts") < order.index("book_units")
+    assert order.index("student_book_progress") < order.index("book_units")
+    assert order.index("student_book_progress") < order.index("book_revisions")
+    assert order.index("student_book_progress") < order.index("students")
     assert order.index("book_units") < order.index("book_revisions")
     assert order.index("book_revision_contexts") < order.index("book_revisions")
     assert order.index("book_revisions") < order.index("books")

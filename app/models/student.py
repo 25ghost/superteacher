@@ -66,3 +66,9 @@ class Student(TimestampMixin, Base):
         back_populates="student",
         cascade="all, delete-orphan",
     )
+    # Personal guided-learning progress rows (P5) -- owned by this student.
+    book_progress_rows = relationship(
+        "StudentBookProgress",
+        back_populates="student",
+        cascade="all, delete-orphan",
+    )

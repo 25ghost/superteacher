@@ -53,6 +53,9 @@ APPLICATION_TABLES: tuple[str, ...] = (
     "book_attempts",
     "book_question_options",
     "book_questions",
+    # Student guided-learning progress (0022) - children of units,
+    # revisions and students.
+    "student_book_progress",
     "book_units",
     "book_revision_contexts",
     "book_revisions",

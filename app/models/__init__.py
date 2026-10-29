@@ -39,6 +39,7 @@ from app.models.program_version import ProgramVersion
 from app.models.school import School
 from app.models.school_program import SchoolProgram
 from app.models.student import Student
+from app.models.student_book_progress import StudentBookProgress
 from app.models.student_profile_history import StudentProfileHistory
 from app.models.student_subject import StudentSubject
 from app.models.subject import Subject
@@ -92,6 +93,7 @@ __all__ = [
     "School",
     "SchoolProgram",
     "Student",
+    "StudentBookProgress",
     "StudentProfileHistory",
     "StudentSubject",
     "Subject",
