@@ -33,6 +33,7 @@ def create(
     *,
     class_session_id: uuid.UUID,
     user_id: uuid.UUID,
+    auth_session_id: uuid.UUID,
     token_hash: str,
     expires_at: datetime,
 ) -> ClassWsTicket:
@@ -40,6 +41,7 @@ def create(
     ticket = ClassWsTicket(
         class_session_id=class_session_id,
         user_id=user_id,
+        auth_session_id=auth_session_id,
         token_hash=token_hash,
         expires_at=expires_at,
     )

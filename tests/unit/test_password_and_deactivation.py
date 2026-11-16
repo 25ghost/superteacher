@@ -75,37 +75,50 @@ def _create_student(session: Session, email: str = "kid@example.com") -> User:
 
 def test_change_password_success(session: Session) -> None:
     user = _create_student(session)
+    current = AuthSession(user_id=user.id, token_hash="current-session", expires_at=datetime.now(timezone.utc) + timedelta(days=1))
+    other = AuthSession(user_id=user.id, token_hash="other-session", expires_at=datetime.now(timezone.utc) + timedelta(days=1))
+    session.add_all([current, other])
+    session.flush()
     payload = ChangePasswordRequest(
         current_password="TestPass123",
         new_password="NewPass456!",
     )
-    auth_service.change_password(session, user, payload)
+    auth_service.change_password(session, user, payload, current_session_id=current.id)
     session.flush()
 
     # Verify the new password works
     refreshed = session.get(User, user.id)
     assert security.verify_password("NewPass456!", refreshed.password_hash)
     assert not security.verify_password("TestPass123", refreshed.password_hash)
+    assert session.get(AuthSession, current.id).revoked_at is None
+    session.refresh(other)
+    assert session.get(AuthSession, other.id).revoked_at is not None
 
 
 def test_change_password_wrong_current(session: Session) -> None:
     user = _create_student(session)
+    current = AuthSession(user_id=user.id, token_hash="wrong-current", expires_at=datetime.now(timezone.utc) + timedelta(days=1))
+    session.add(current)
+    session.flush()
     payload = ChangePasswordRequest(
         current_password="WrongPass!",
         new_password="NewPass456!",
     )
     with pytest.raises(AuthCredentialsError):
-        auth_service.change_password(session, user, payload)
+        auth_service.change_password(session, user, payload, current_session_id=current.id)
 
 
 def test_change_password_same_password(session: Session) -> None:
     user = _create_student(session)
+    current = AuthSession(user_id=user.id, token_hash="same-current", expires_at=datetime.now(timezone.utc) + timedelta(days=1))
+    session.add(current)
+    session.flush()
     payload = ChangePasswordRequest(
         current_password="TestPass123",
         new_password="TestPass123",
     )
     with pytest.raises(AuthValidationError, match="must differ"):
-        auth_service.change_password(session, user, payload)
+        auth_service.change_password(session, user, payload, current_session_id=current.id)
 
 
 def test_change_password_policy_violation(session: Session) -> None:
@@ -130,7 +143,7 @@ def test_change_password_no_password_set(session: Session) -> None:
         new_password="NewPass456!",
     )
     with pytest.raises(AuthValidationError, match="no password set"):
-        auth_service.change_password(session, user, payload)
+        auth_service.change_password(session, user, payload, current_session_id=uuid.uuid4())
 
 
 # --- password reset token tests ----------------------------------------------
@@ -202,6 +215,7 @@ def test_reset_password_revokes_all_sessions(session: Session) -> None:
     )
     session.add(auth_session)
     session.flush()
+    access_token = security.create_access_token(user.id, user.role, auth_session.id)
 
     raw_token = security.create_reset_token(user.id)
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
@@ -220,6 +234,19 @@ def test_reset_password_revokes_all_sessions(session: Session) -> None:
     session.expire_all()
     refreshed = session.get(AuthSession, auth_session.id)
     assert refreshed.revoked_at is not None
+    from fastapi import HTTPException
+    from fastapi.security import HTTPAuthorizationCredentials
+    from starlette.requests import Request
+    from app.core.auth_dependencies import get_current_user
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    with pytest.raises(HTTPException) as error:
+        get_current_user(
+            request,
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=access_token),
+            session,
+        )
+    assert error.value.status_code == 401
 
 
 def test_reset_password_used_token_rejected(session: Session) -> None:

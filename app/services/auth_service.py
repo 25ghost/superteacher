@@ -215,7 +215,7 @@ def _issue_session(
     auth_session_repo.enforce_session_limit(
         session, user.id, settings.MAX_SESSIONS_PER_USER, now
     )
-    access_token = security.create_access_token(user.id, user.role)
+    access_token = security.create_access_token(user.id, user.role, auth_session.id)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_jwt,
@@ -640,6 +640,7 @@ def change_password(
     user: User,
     payload: ChangePasswordRequest,
     *,
+    current_session_id: uuid.UUID,
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> None:
@@ -648,8 +649,15 @@ def change_password(
     Verifies the current password, validates the new password against policy,
     hashes and stores it. The caller commits.
     """
+    user = user_repo.lock_by_id(session, user.id, refresh=True)
+    if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
+        raise AuthCredentialsError()
     if user.password_hash is None:
         raise AuthValidationError("this account has no password set")
+    if current_session_id is None or auth_session_repo.get_valid_for_user(
+        session, current_session_id, user.id, now=datetime.now(timezone.utc)
+    ) is None:
+        raise AuthCredentialsError()
     if not security.verify_password(payload.current_password, user.password_hash):
         raise AuthCredentialsError()
 
@@ -670,6 +678,9 @@ def change_password(
         raise AuthValidationError(str(exc)) from exc
 
     user.password_hash = new_hash
+    auth_session_repo.revoke_others_for_user(
+        session, user.id, current_session_id, datetime.now(timezone.utc)
+    )
     auth_event_repo.log_event(
         session,
         user_id=user.id,

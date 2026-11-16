@@ -564,7 +564,9 @@ def api_client(api_app: FastAPI) -> TestClient:
 
 
 def _token(user: User) -> dict:
-    return {"Authorization": f"Bearer {security.create_access_token(user.id, user.role)}"}
+    from tests.auth_token_helpers import bound_access_token
+
+    return {"Authorization": f"Bearer {bound_access_token(user)}"}
 
 
 def _routes(target_user_id: uuid.UUID, teacher_email: str) -> list[tuple[str, str, dict | None]]:

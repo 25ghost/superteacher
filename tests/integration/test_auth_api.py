@@ -334,7 +334,7 @@ def test_expired_token_refused(api_client, auth_db, monkeypatch) -> None:
     user_id = uuid.UUID(
         api_client.get("/api/v1/me", headers=_auth_header(tokens)).json()["user_id"]
     )
-    expired = security.create_access_token(user_id, "student", expires_minutes=-1)
+    expired = security.create_access_token(user_id, "student", uuid.uuid4(), expires_minutes=-1)
     response = api_client.get("/api/v1/me", headers={"Authorization": f"Bearer {expired}"})
     assert response.status_code == 401
 
@@ -358,11 +358,27 @@ def test_refresh_issues_new_pair_and_rotates(api_client, auth_db) -> None:
     assert response.status_code == 200
     fresh = response.json()
     assert fresh["refresh_token"] != tokens["refresh_token"]
+    assert api_client.get("/api/v1/me", headers=_auth_header(tokens)).status_code == 401
+    assert api_client.get("/api/v1/me", headers=_auth_header(fresh)).status_code == 200
     # Replay of the rotated token is refused.
     replay = api_client.post(
         "/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]}
     )
     assert replay.status_code == 401
+
+
+def test_sixth_login_evicts_oldest_access_session(api_client, auth_db) -> None:
+    email = f"cap-{uuid.uuid4().hex[:8]}@example.com"
+    oldest = _register(api_client, email=email)
+    newest = oldest
+    for _ in range(5):
+        login = api_client.post(
+            "/api/v1/auth/login", json={"email": email, "password": PASSWORD}
+        )
+        assert login.status_code == 200, login.text
+        newest = login.json()
+    assert api_client.get("/api/v1/me", headers=_auth_header(oldest)).status_code == 401
+    assert api_client.get("/api/v1/me", headers=_auth_header(newest)).status_code == 200
 
 
 def test_refresh_garbage_refused(api_client, auth_db) -> None:
@@ -399,8 +415,8 @@ def test_logout_requires_authentication(api_client, auth_db) -> None:
     assert after.status_code == 200
 
 
-def test_access_token_still_valid_after_logout(api_client, auth_db) -> None:
-    """Access tokens are not revoked on logout (they simply expire)."""
+def test_access_token_is_revoked_after_logout(api_client, auth_db) -> None:
+    """Revoking the refresh session also revokes its access JWT."""
     email = f"logout-test-{uuid.uuid4().hex[:8]}@example.com"
     tokens = _register(api_client, email=email)
     logout = api_client.post(
@@ -410,8 +426,29 @@ def test_access_token_still_valid_after_logout(api_client, auth_db) -> None:
     )
     assert logout.status_code == 204
     me = api_client.get("/api/v1/me", headers=_auth_header(tokens))
-    assert me.status_code == 200
-    assert me.json()["email"] == email
+    assert me.status_code == 401
+
+
+def test_password_change_preserves_only_the_authenticated_session(api_client, auth_db) -> None:
+    email = f"password-change-{uuid.uuid4().hex[:8]}@example.com"
+    tokens = _register(api_client, email=email)
+    second_login = api_client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": PASSWORD},
+    )
+    assert second_login.status_code == 200, second_login.text
+    second = second_login.json()
+    changed = api_client.post(
+        "/api/v1/me/change-password",
+        headers=_auth_header(tokens),
+        json={"current_password": PASSWORD, "new_password": "ChangedPass789!"},
+    )
+    assert changed.status_code == 204, changed.text
+    assert api_client.get("/api/v1/me", headers=_auth_header(tokens)).status_code == 200
+    assert api_client.get("/api/v1/me", headers=_auth_header(second)).status_code == 401
+    assert api_client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": second["refresh_token"]}
+    ).status_code == 401
 
 
 # --- Step 33: object-level authorization regressions ---------------------------------------

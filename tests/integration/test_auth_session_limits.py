@@ -324,3 +324,57 @@ def test_account_lock_precedes_session_writes_and_is_account_scoped(account, ope
         future.result(timeout=12)
     assert count_valid(engine, other_id) == 1
     assert count_valid(engine, uid) == (0 if operation == 'revoke_all' else 4 if operation == 'logout' else 5)
+
+
+def test_password_change_racing_refresh_uses_account_first_lock(account):
+    engine, uid = account
+    tokens = seed(engine, uid, 4)
+    current_id = uuid.UUID(int=1)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def change_password():
+        from app.schemas.auth import ChangePasswordRequest
+
+        with Session(engine) as db:
+            user = db.get(User, uid)
+            barrier.wait(timeout=10)
+            try:
+                service.change_password(
+                    db,
+                    user,
+                    ChangePasswordRequest(
+                        current_password=PASSWORD,
+                        new_password='ChangedSessionPass123!',
+                    ),
+                    current_session_id=current_id,
+                )
+                db.commit()
+                outcomes.append('password_changed')
+            except service.AuthCredentialsError:
+                db.rollback()
+                outcomes.append('session_rotated_first')
+
+    def refresh():
+        with Session(engine) as db:
+            barrier.wait(timeout=10)
+            try:
+                service.refresh(db, tokens[current_id])
+                db.commit()
+                outcomes.append('refreshed')
+            except service.AuthCredentialsError:
+                db.rollback()
+                outcomes.append('refresh_rejected')
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(change_password), pool.submit(refresh)]
+        for future in futures:
+            future.result(timeout=20)
+
+    assert len(outcomes) == 2
+    assert 'refreshed' in outcomes or 'refresh_rejected' in outcomes
+    assert 'password_changed' in outcomes or 'session_rotated_first' in outcomes
+    assert count_valid(engine, uid) <= 5
+    with Session(engine) as db:
+        rows = list(db.scalars(select(AuthSession).where(AuthSession.user_id == uid)))
+        assert sum(row.revoked_at is None for row in rows) <= 5

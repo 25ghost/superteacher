@@ -388,7 +388,10 @@ def test_forged_role_claim_cannot_reach_admin_routes(api_client, accounts) -> No
     from app.core import security
 
     account = _seed_user(accounts, role="student", with_student=True)
-    forged = security.create_access_token(account["user_id"], "admin")
+    tokens = _login(api_client, account)
+    from app.core.security import decode_token
+    sid = uuid.UUID(decode_token(tokens["access_token"], expected_type="access")["sid"])
+    forged = security.create_access_token(account["user_id"], "admin", sid)
     headers = {"Authorization": f"Bearer {forged}"}
 
     response = api_client.get(

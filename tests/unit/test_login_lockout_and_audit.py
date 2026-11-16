@@ -202,10 +202,11 @@ def _lock(session: Session, user: User) -> None:
 
 
 def test_admin_can_unlock_a_locked_account(session: Session, api_client: TestClient) -> None:
+    from tests.auth_token_helpers import bound_access_token
     admin = _seed_user(session, role=UserRole.ADMIN.value)
     locked_user = _seed_user(session)
     _lock(session, locked_user)
-    header = {"Authorization": f"Bearer {security.create_access_token(admin.id, admin.role)}"}
+    header = {"Authorization": f"Bearer {bound_access_token(admin)}"}
 
     response = api_client.post(
         f"/api/v1/admin/users/{locked_user.id}/unlock", headers=header
@@ -227,6 +228,7 @@ def test_admin_can_unlock_a_locked_account(session: Session, api_client: TestCli
 def test_unlock_refuses_anonymous_and_non_administrators(
     session: Session, api_client: TestClient
 ) -> None:
+    from tests.auth_token_helpers import bound_access_token
     locked_user = _seed_user(session)
     _lock(session, locked_user)
     path = f"/api/v1/admin/users/{locked_user.id}/unlock"
@@ -236,7 +238,7 @@ def test_unlock_refuses_anonymous_and_non_administrators(
     for role in (UserRole.STUDENT.value, UserRole.TEACHER.value):
         caller = _seed_user(session, role=role)
         header = {
-            "Authorization": f"Bearer {security.create_access_token(caller.id, caller.role)}"
+            "Authorization": f"Bearer {bound_access_token(caller)}"
         }
         response = api_client.post(path, headers=header)
         assert response.status_code == 403, f"{role} -> {response.status_code}"
@@ -246,13 +248,15 @@ def test_unlock_refuses_anonymous_and_non_administrators(
 def test_unlock_unknown_id_is_404_and_unlocked_account_is_409(
     session: Session, api_client: TestClient
 ) -> None:
+    from tests.auth_token_helpers import bound_access_token
     admin = _seed_user(session, role=UserRole.ADMIN.value)
-    header = {"Authorization": f"Bearer {security.create_access_token(admin.id, admin.role)}"}
+    header = {"Authorization": f"Bearer {bound_access_token(admin)}"}
 
     unknown = api_client.post(f"/api/v1/admin/users/{uuid.uuid4()}/unlock", headers=header)
     assert unknown.status_code == 404, unknown.text
 
     healthy = _seed_user(session)
+    header = {"Authorization": f"Bearer {bound_access_token(admin)}"}
     conflict = api_client.post(f"/api/v1/admin/users/{healthy.id}/unlock", headers=header)
     assert conflict.status_code == 409, conflict.text
 

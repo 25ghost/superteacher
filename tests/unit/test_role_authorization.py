@@ -130,7 +130,9 @@ def _make_user(
 
 def _header(user: User, *, role: str | None = None) -> dict:
     """A Bearer header for ``user``; ``role`` overrides the JWT claim only."""
-    token = security.create_access_token(user.id, role if role is not None else user.role)
+    from tests.auth_token_helpers import bound_access_token
+
+    token = bound_access_token(user, role=role)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -286,7 +288,7 @@ def test_refresh_token_cannot_call_protected_routes(session: Session, client: Te
 
 def test_token_for_unknown_user_is_401(session: Session, client: TestClient) -> None:
     ghost_id = uuid.uuid4()
-    token = security.create_access_token(ghost_id, UserRole.ADMIN.value)
+    token = security.create_access_token(ghost_id, UserRole.ADMIN.value, uuid.uuid4())
     response = client.get("/admin-only", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
 

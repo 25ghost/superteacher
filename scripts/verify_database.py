@@ -117,7 +117,7 @@ EXPECTED_TABLES = {
     "student_book_progress",
 }
 
-EXPECTED_REVISION = "0022"
+EXPECTED_REVISION = "0023"
 MIGRATION_DIR = BACKEND_DIR / "alembic" / "versions"
 
 # The natural key that makes a program offering identifiable (and seedable)

@@ -67,6 +67,26 @@ def get_by_id(session: Session, auth_session_id: uuid.UUID) -> AuthSession | Non
     return session.get(AuthSession, auth_session_id)
 
 
+def get_valid_for_user(
+    session: Session, auth_session_id: uuid.UUID, user_id: uuid.UUID, *, now: datetime
+) -> AuthSession | None:
+    """Return a live session bound to this subject, or None."""
+    return session.scalar(
+        select(AuthSession).where(
+            AuthSession.id == auth_session_id,
+            AuthSession.user_id == user_id,
+            AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > now,
+        )
+    )
+
+
+def get_by_id_for_user(session: Session, auth_session_id: uuid.UUID, user_id: uuid.UUID) -> AuthSession | None:
+    return session.scalar(select(AuthSession).where(
+        AuthSession.id == auth_session_id, AuthSession.user_id == user_id
+    ))
+
+
 def count_active_for_user(session: Session, user_id: uuid.UUID, *, now: datetime) -> int:
     """How many of one user's sessions can still authenticate right now.
 
@@ -120,6 +140,22 @@ def revoke_all_for_user(session: Session, user_id: uuid.UUID, revoked_at: dateti
         .values(revoked_at=revoked_at)
     )
     result = session.execute(stmt)
+    return result.rowcount
+
+
+def revoke_others_for_user(
+    session: Session, user_id: uuid.UUID, current_session_id: uuid.UUID, revoked_at: datetime
+) -> int:
+    """Revoke every session except the validated session used for password change."""
+    result = session.execute(
+        update(AuthSession)
+        .where(
+            AuthSession.user_id == user_id,
+            AuthSession.id != current_session_id,
+            AuthSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=revoked_at)
+    )
     return result.rowcount
 
 

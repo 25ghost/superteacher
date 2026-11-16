@@ -287,7 +287,9 @@ def api_client(api_app: FastAPI) -> TestClient:
 
 
 def _header(user: User) -> dict:
-    return {"Authorization": f"Bearer {security.create_access_token(user.id, user.role)}"}
+    from tests.auth_token_helpers import bound_access_token
+
+    return {"Authorization": f"Bearer {bound_access_token(user)}"}
 
 
 def test_me_teacher_refuses_anonymous(api_client: TestClient) -> None:

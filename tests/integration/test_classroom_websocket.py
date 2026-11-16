@@ -209,8 +209,10 @@ def classroom(clean_db, api_client: TestClient):
     catalog = _seed_catalog(engine)
     teacher = _seed_account(engine, role="teacher")
     student = _seed_account(engine, role="student")
-    teacher_header = _header(_login(api_client, teacher))
-    student_header = _header(_login(api_client, student))
+    teacher_tokens = _login(api_client, teacher)
+    student_tokens = _login(api_client, student)
+    teacher_header = _header(teacher_tokens)
+    student_header = _header(student_tokens)
 
     session = _session(engine)
     try:
@@ -232,6 +234,8 @@ def classroom(clean_db, api_client: TestClient):
         "student": student,
         "teacher_header": teacher_header,
         "student_header": student_header,
+        "teacher_tokens": teacher_tokens,
+        "student_tokens": student_tokens,
         "offering_id": offering.json()["offering_id"],
         # The catalog the offering was built from: a second teacher may
         # publish ANOTHER offering of the very same subject (§39).
@@ -747,8 +751,10 @@ def test_class_ending_during_the_handshake_is_refused_before_presence(
     published: list[dict] = []
     real_authorize = classroom_ws._authorize
 
-    def _authorize_then_end(user_id, cid, connection_id):
-        identity = real_authorize(user_id, cid, connection_id)  # commits the join
+    def _authorize_then_end(user_id, auth_session_id, cid, connection_id):
+        identity = real_authorize(
+            user_id, auth_session_id, cid, connection_id
+        )  # commits the join
         # The class ends in the window §38 describes: right after the
         # segment opened, before the endpoint could register the socket.
         session = SessionLocal()
@@ -954,12 +960,36 @@ def test_raw_ticket_is_never_persisted(api_client: TestClient, classroom: dict) 
         assert row.token_hash == digest
         assert row.token_hash != raw
         assert len(row.token_hash) == 64
+        from app.core.security import decode_token
+        expected_sid = uuid.UUID(decode_token(
+            classroom["teacher_tokens"]["access_token"], expected_type="access"
+        )["sid"])
+        assert row.auth_session_id == expected_sid
         # No column of any ticket row ever contains the raw value.
         for ticket in rows:
             for value in (ticket.token_hash, str(ticket.id), str(ticket.user_id)):
                 assert raw not in value
     finally:
         session.close()
+
+
+def test_legacy_unbound_ticket_cannot_connect_after_cutover(
+    api_client: TestClient, classroom: dict
+) -> None:
+    engine = classroom["engine"]
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+    raw = _mint_student(api_client, classroom, class_id)["ticket"]
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE class_ws_tickets SET auth_session_id = NULL WHERE token_hash = :hash"),
+            {"hash": digest},
+        )
+    with api_client.websocket_connect(_ws_url(class_id, raw)) as websocket:
+        _expect_close(websocket, 4001)
+    assert _segments(engine, class_id) == []
 
 
 def test_the_raw_ticket_never_reaches_logs_or_audit(
@@ -1098,7 +1128,7 @@ def test_one_ticket_has_exactly_one_concurrent_winner(
             )
             session.commit()
             # list.append is atomic under the GIL: no lock needed here.
-            results.append(holder.id if holder is not None else None)
+            results.append(holder[0].id if holder is not None else None)
         finally:
             session.close()
 
@@ -1710,6 +1740,58 @@ def test_a_deactivated_student_closes_its_socket_and_segment(
     assert segments[0].student_id == student_id
     assert segments[0].left_at is not None
     assert _class_row(engine, class_id).status == "live"
+
+
+def test_session_logout_rejects_ticket_and_closes_live_socket_at_heartbeat(
+    api_client: TestClient, classroom: dict
+) -> None:
+    engine = classroom["engine"]
+    class_id = _create_class(api_client, classroom)
+    _enroll(api_client, classroom)
+    _start_class(api_client, classroom, class_id)
+    student_ref = _ref(class_id, classroom["student"]["user_id"])
+
+    # A ticket minted before revocation cannot authorize a later handshake.
+    ticket = _mint_student(api_client, classroom, class_id)["ticket"]
+    logout = api_client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": classroom["student_tokens"]["refresh_token"]},
+        headers=classroom["student_header"],
+    )
+    assert logout.status_code == 204, logout.text
+    with api_client.websocket_connect(_ws_url(class_id, ticket)) as websocket:
+        _expect_close(websocket, 4001)
+
+    # A separate active session allows entering, then its logout is observed
+    # at the next existing heartbeat checkpoint (no push disconnect service).
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={"email": classroom["student"]["email"], "password": PASSWORD},
+    )
+    assert login.status_code == 200, login.text
+    tokens = login.json()
+    header = _header(tokens)
+    live_ticket = _mint_student(api_client, classroom, class_id, header=header)["ticket"]
+    teacher_ticket = _mint_teacher(api_client, classroom, class_id)["ticket"]
+    teacher_ref = _ref(class_id, classroom["teacher"]["user_id"])
+    with api_client.websocket_connect(_ws_url(class_id, teacher_ticket)) as teacher_ws:
+        assert teacher_ws.receive_json()["participant"]["participant_ref"] == teacher_ref
+        with api_client.websocket_connect(_ws_url(class_id, live_ticket)) as websocket:
+            assert websocket.receive_json()["participant"]["participant_ref"] == teacher_ref
+            assert websocket.receive_json()["participant"]["participant_ref"] == student_ref
+            assert teacher_ws.receive_json()["participant"]["participant_ref"] == student_ref
+            logout = api_client.post(
+                "/api/v1/auth/logout",
+                json={"refresh_token": tokens["refresh_token"]},
+                headers=header,
+            )
+            assert logout.status_code == 204, logout.text
+            websocket.send_json({"type": "presence.heartbeat"})
+            assert websocket.receive_json() == {"type": "error", "code": "NOT_AUTHORIZED"}
+            _expect_close(websocket, 4003)
+            assert teacher_ws.receive_json()["type"] == "presence.left"
+    _wait_gone(class_id, student_ref)
+    assert _segments(engine, class_id)[0].left_at is not None
 
 
 # --- lifecycle (§22/§36/§54) --------------------------------------------------------------------
