@@ -195,19 +195,26 @@ def _issue_session(
     persisted (Step 7).
     """
     settings = _settings()
-    # Enforce max sessions per user: revoke oldest excess sessions first.
-    auth_session_repo.enforce_session_limit(
-        session, user.id, settings.MAX_SESSIONS_PER_USER, now
-    )
+    # Shared issuance boundary: account first, then session writes. Existing
+    # callers may already own this lock; reacquiring it is transaction-local.
+    if user_repo.lock_by_id(session, user.id) is None:
+        raise AuthCredentialsError()
+    now = datetime.now(timezone.utc)
     auth_session = auth_session_repo.create(
         session,
         user_id=user.id,
         token_hash="",  # set below, once the JWT (which names this row) exists
         expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        # PostgreSQL now() is transaction start, which may precede a lock
+        # wait. Order this new session by actual issuance after the lock.
+        created_at=now,
     )
     refresh_jwt = security.create_refresh_token(user.id, auth_session.id)
     auth_session.token_hash = _hash_refresh_secret(refresh_jwt)
     session.flush()
+    auth_session_repo.enforce_session_limit(
+        session, user.id, settings.MAX_SESSIONS_PER_USER, now
+    )
     access_token = security.create_access_token(user.id, user.role)
     return TokenResponse(
         access_token=access_token,
@@ -246,6 +253,9 @@ def _verify_refresh_credentials(
     except (KeyError, ValueError):
         raise AuthCredentialsError() from None
 
+    user = user_repo.lock_by_id(session, jwt_user_id, refresh=True)
+    if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
+        raise AuthCredentialsError()
     auth_session = auth_session_repo.get_by_token_hash_for_update(
         session, _hash_refresh_secret(token_value)
     )
@@ -257,12 +267,14 @@ def _verify_refresh_credentials(
         raise AuthCredentialsError()
     if auth_session.revoked_at is not None:
         raise AuthCredentialsError()
+    # Locks can wait: check expiry against current time, not request start.
+    now = datetime.now(timezone.utc)
     if _as_aware_utc(auth_session.expires_at) <= now:
         raise AuthCredentialsError()
-
-    user = session.get(User, auth_session.user_id)
-    if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
-        raise AuthCredentialsError()
+    try:
+        security.decode_token(token_value, expected_type="refresh")
+    except Exception:
+        raise AuthCredentialsError() from None
     return user, auth_session
 
 
@@ -481,6 +493,9 @@ def login(
     """
     email = str(payload.email).strip().lower()
     user = user_repo.get_by_email(session, email)
+    if user is not None:
+        # Before bookkeeping/audit flushes, and reload after any lock wait.
+        user = user_repo.lock_by_id(session, user.id, refresh=True)
     now = datetime.now(timezone.utc)
 
     if user is not None and user.locked_until is not None:
@@ -561,6 +576,7 @@ def refresh(
     """
     now = datetime.now(timezone.utc)
     user, old_session = _verify_refresh_credentials(session, refresh_token_value, now)
+    now = datetime.now(timezone.utc)
     auth_session_repo.revoke(session, old_session, now)
     auth_event_repo.log_event(
         session,
@@ -609,6 +625,8 @@ def logout(
 
 def revoke_all_sessions(session: Session, user_id: uuid.UUID) -> int:
     """Revoke every active refresh session of one user (status changes)."""
+    # Preserve pending account changes made by password/status/role callers.
+    user_repo.lock_by_id(session, user_id)
     return auth_session_repo.revoke_all_for_user(
         session, user_id, datetime.now(timezone.utc)
     )
@@ -744,6 +762,7 @@ def reset_password(
 
     from app.models.password_reset_token import PasswordResetToken
 
+    user = user_repo.lock_by_id(session, jwt_user_id, refresh=True)
     reset_record = session.scalar(
         select(PasswordResetToken).where(
             PasswordResetToken.token_hash == token_hash,
@@ -757,7 +776,6 @@ def reset_password(
     ):
         raise AuthCredentialsError()
 
-    user = session.get(User, jwt_user_id)
     if user is None or user.status not in _AUTHENTICATABLE_STATUSES:
         raise AuthCredentialsError()
 
@@ -824,6 +842,7 @@ def accept_invite(
 
     from app.models.invite_token import InviteToken
 
+    user = user_repo.lock_by_id(session, jwt_user_id, refresh=True)
     invite_row = session.scalar(
         select(InviteToken).where(
             InviteToken.token_hash == token_hash,
@@ -837,7 +856,6 @@ def accept_invite(
     ):
         raise AuthCredentialsError()
 
-    user = session.get(User, jwt_user_id)
     if (
         user is None
         or user.role != UserRole.TEACHER.value
@@ -889,6 +907,9 @@ def deactivate_account(
     Requires password confirmation. Sets status to 'disabled' and revokes
     all sessions. The caller commits.
     """
+    user = user_repo.lock_by_id(session, user.id, refresh=True)
+    if user is None:
+        raise AuthCredentialsError()
     if user.password_hash is None:
         raise AuthValidationError("this account has no password set")
     if not security.verify_password(payload.password, user.password_hash):

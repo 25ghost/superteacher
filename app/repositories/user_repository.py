@@ -33,6 +33,25 @@ def get_by_phone(session: Session, phone: str) -> User | None:
     return session.scalar(select(User).where(User.phone == phone))
 
 
+def lock_by_id(
+    session: Session, user_id: uuid.UUID, *, refresh: bool = False,
+) -> User | None:
+    """Serialize account/session writes until the caller commits or rolls back.
+
+    PostgreSQL FOR NO KEY UPDATE conflicts with other account writers while
+    allowing foreign-key KEY SHARE checks (including audit actor references).
+    Always acquire this before locking or changing refresh-session rows.
+    Refresh authentication reads after waiting; revocation callers may have
+    pending status/role/password changes, which must not be overwritten or
+    autoflushed before the lock is acquired.
+    """
+    return session.scalar(
+        select(User).where(User.id == user_id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=refresh, autoflush=False)
+    )
+
+
 def _escape_like(needle: str) -> str:
     """Escape the LIKE wildcards (``%``, ``_``) and the escape character itself.
 

@@ -25,6 +25,7 @@ def create(
     user_id: uuid.UUID,
     token_hash: str,
     expires_at: datetime,
+    created_at: datetime | None = None,
 ) -> AuthSession:
     """Insert one refresh session row (flushed, not committed)."""
     auth_session = AuthSession(
@@ -32,6 +33,8 @@ def create(
         token_hash=token_hash,
         expires_at=expires_at,
     )
+    if created_at is not None:
+        auth_session.created_at = created_at
     session.add(auth_session)
     session.flush()
     return auth_session
@@ -56,6 +59,7 @@ def get_by_token_hash_for_update(session: Session, token_hash: str) -> AuthSessi
         select(AuthSession)
         .where(AuthSession.token_hash == token_hash)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
 
 
@@ -122,17 +126,18 @@ def revoke_all_for_user(session: Session, user_id: uuid.UUID, revoked_at: dateti
 def enforce_session_limit(session: Session, user_id: uuid.UUID, max_sessions: int, revoked_at: datetime) -> int:
     """Revoke oldest sessions when the user exceeds ``max_sessions``.
 
-    Counts active (non-revoked) sessions and revokes the excess oldest
-    ones so that at most ``max_sessions`` remain. Returns the number
-    revoked (may be 0).
+    Called after insertion, with the owning user locked by the service.
+    Only unrevoked, unexpired sessions count. Ties use the session UUID.
+    Returns the number revoked (may be 0); historical rows are retained.
     """
     active = session.scalars(
         select(AuthSession)
         .where(
             AuthSession.user_id == user_id,
             AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > revoked_at,
         )
-        .order_by(AuthSession.created_at.asc())
+        .order_by(AuthSession.created_at.asc(), AuthSession.id.asc())
     ).all()
     excess = len(active) - max_sessions
     if excess <= 0:
