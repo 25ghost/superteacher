@@ -138,16 +138,18 @@ def test_policy_rejects_before_any_write(session: Session) -> None:
 
 
 def test_access_token_roundtrip() -> None:
-    token = security.create_access_token(uuid.uuid4(), UserRole.STUDENT.value)
+    session_id = uuid.uuid4()
+    token = security.create_access_token(uuid.uuid4(), UserRole.STUDENT.value, session_id=session_id)
     claims = security.decode_token(token, expected_type="access")
     assert claims["typ"] == "access"
+    assert claims["sid"] == str(session_id)
     assert claims["role"] == UserRole.STUDENT.value
     assert "jti" in claims
     uuid.UUID(claims["jti"])  # valid UUID format
 
 
 def test_expired_token_rejected() -> None:
-    token = security.create_access_token(uuid.uuid4(), "student", expires_minutes=-1)
+    token = security.create_access_token(uuid.uuid4(), "student", uuid.uuid4(), expires_minutes=-1)
     with pytest.raises(pyjwt.PyJWTError):
         security.decode_token(token, expected_type="access")
 
@@ -158,13 +160,13 @@ def test_malformed_token_rejected() -> None:
 
 
 def test_wrong_token_type_rejected() -> None:
-    token = security.create_access_token(uuid.uuid4(), "student")
+    token = security.create_access_token(uuid.uuid4(), "student", uuid.uuid4())
     with pytest.raises(pyjwt.PyJWTError):
         security.decode_token(token, expected_type="refresh")
 
 
 def test_tampered_token_rejected() -> None:
-    token = security.create_access_token(uuid.uuid4(), "student")
+    token = security.create_access_token(uuid.uuid4(), "student", uuid.uuid4())
     header, payload, signature = token.split(".")
     tampered = f"{header}.{payload[:-2]}aa.{signature}"
     with pytest.raises(pyjwt.PyJWTError):
@@ -173,7 +175,7 @@ def test_tampered_token_rejected() -> None:
 
 def test_token_signed_with_other_secret_rejected(monkeypatch) -> None:
     user_id = uuid.uuid4()
-    token = security.create_access_token(user_id, "student")  # noqa: F841 (issue side only)
+    token = security.create_access_token(user_id, "student", uuid.uuid4())  # noqa: F841 (issue side only)
     forged = pyjwt.encode(
         {"sub": str(user_id), "role": "admin", "typ": "access",
          "iat": datetime.now(timezone.utc), "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
@@ -623,10 +625,10 @@ def test_access_token_rejected_after_account_suspension(session: Session) -> Non
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer", credentials=tokens.access_token
     )
-    fake_request = type("R", (), {"headers": {}})()
+    fake_request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
     with pytest.raises(Exception):
         # get_current_user checks status against the database
-        get_current_user(credentials=credentials, session=session)
+        get_current_user(request=fake_request, credentials=credentials, session=session)
 
 
 def test_revoke_all_sessions_does_not_miss_newly_created_session(
@@ -642,6 +644,18 @@ def test_revoke_all_sessions_does_not_miss_newly_created_session(
     count = auth_service.revoke_all_sessions(session, identity.user_id)
     session.flush()
     assert count >= 1
+    from fastapi import HTTPException, Request
+    from fastapi.security import HTTPAuthorizationCredentials
+    from app.core.auth_dependencies import get_current_user
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    with pytest.raises(HTTPException) as error:
+        get_current_user(
+            request,
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=tokens.access_token),
+            session,
+        )
+    assert error.value.status_code == 401
     # Both old tokens should be rejected
     with pytest.raises(auth_service.AuthCredentialsError):
         auth_service.refresh(session, tokens.refresh_token)

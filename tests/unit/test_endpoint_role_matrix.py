@@ -357,7 +357,9 @@ def principals(session: Session) -> dict[str, User]:
 
 
 def _header(user: User) -> dict:
-    return {"Authorization": f"Bearer {security.create_access_token(user.id, user.role)}"}
+    from tests.auth_token_helpers import bound_access_token
+
+    return {"Authorization": f"Bearer {bound_access_token(user)}"}
 
 
 def _path(template: str) -> str:

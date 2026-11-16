@@ -440,7 +440,7 @@ def issue_class_ws_ticket(
 ) -> ClassWsTicketRead:
     try:
         ticket = classroom_service.issue_ws_ticket_for_teacher(
-            session, user, offering_id, class_id
+            session, user, offering_id, class_id, request.state.auth_session_id
         )
     except LearningError as exc:
         session.rollback()

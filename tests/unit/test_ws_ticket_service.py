@@ -41,6 +41,7 @@ from app.core.database import Base
 import app.models  # noqa: F401
 from app.models.academic_year import AcademicYear
 from app.models.auth_event import AuthEvent
+from app.models.auth_session import AuthSession
 from app.models.class_attendance_segment import ClassAttendanceSegment
 from app.models.class_ws_ticket import ClassWsTicket
 from app.models.education_level import EducationLevel
@@ -324,6 +325,48 @@ def _tickets(session: Session) -> list[ClassWsTicket]:
     return list(session.scalars(select(ClassWsTicket)))
 
 
+def _auth_session_id(session: Session, user_id: uuid.UUID) -> uuid.UUID:
+    now = datetime.now(timezone.utc)
+    row = session.scalar(
+        select(AuthSession).where(
+            AuthSession.user_id == user_id,
+            AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > now,
+        ).order_by(AuthSession.id).limit(1)
+    )
+    if row is None:
+        row = AuthSession(
+            user_id=user_id,
+            token_hash=f"ws-test-{uuid.uuid4().hex}",
+            expires_at=now + timedelta(days=1),
+        )
+        session.add(row)
+        session.flush()
+    return row.id
+
+
+def _issue_teacher_ticket(session, user, offering_id, class_id):
+    return classroom_service.issue_ws_ticket_for_teacher(
+        session, user, offering_id, class_id, _auth_session_id(session, user.id)
+    )
+
+
+def _issue_student_ticket(session, student, class_id):
+    return classroom_service.issue_ws_ticket_for_student(
+        session, student, class_id, _auth_session_id(session, student.user_id)
+    )
+
+
+def _authorize_ws(session, user, class_id, connection_id, auth_session_id=None):
+    return classroom_service.authorize_ws_connection(
+        session,
+        user,
+        class_id,
+        connection_id,
+        auth_session_id or _auth_session_id(session, user.id),
+    )
+
+
 # --- issuance (§6) ---------------------------------------------------------------------
 
 
@@ -332,7 +375,7 @@ def test_teacher_mints_an_opaque_ticket_for_a_live_class_of_his_own(
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
 
-    read = classroom_service.issue_ws_ticket_for_teacher(
+    read = _issue_teacher_ticket(
         session, approved_teacher, offering_id, class_id
     )
     session.commit()
@@ -354,7 +397,7 @@ def test_the_raw_ticket_is_never_stored_only_its_sha256_digest(
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
 
-    read = classroom_service.issue_ws_ticket_for_teacher(
+    read = _issue_teacher_ticket(
         session, approved_teacher, offering_id, class_id
     )
     session.commit()
@@ -371,6 +414,49 @@ def test_the_raw_ticket_is_never_stored_only_its_sha256_digest(
     assert _segments(session, class_id) == []
 
 
+def test_revoked_session_invalidates_ticket_and_handshake(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID,
+    enrolled_student: User,
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    student = _student_profile(session, enrolled_student)
+    sid = _auth_session_id(session, student.user_id)
+    read = classroom_service.issue_ws_ticket_for_student(
+        session, student, class_id, sid
+    )
+    session.commit()
+    auth_session = session.get(AuthSession, sid)
+    auth_session.revoked_at = datetime.now(timezone.utc)
+    session.commit()
+
+    assert classroom_service.consume_ws_ticket(session, class_id, read.ticket) is None
+    session.commit()
+    with pytest.raises(classroom_service.ClassroomConnectionRefused):
+        classroom_service.authorize_ws_connection(
+            session, enrolled_student, class_id, "conn-revoked", sid
+        )
+    session.rollback()
+    assert _segments(session, class_id) == []
+
+
+def test_live_connection_revalidation_rejects_revoked_session(
+    session: Session, approved_teacher: User, offering_id: uuid.UUID,
+    enrolled_student: User,
+) -> None:
+    class_id = _start(session, approved_teacher, offering_id)
+    sid = _auth_session_id(session, enrolled_student.id)
+    classroom_service.revalidate_live_connection(
+        session, enrolled_student, class_id, sid
+    )
+    auth_session = session.get(AuthSession, sid)
+    auth_session.revoked_at = datetime.now(timezone.utc)
+    session.commit()
+    with pytest.raises(classroom_service.ClassroomConnectionRefused):
+        classroom_service.revalidate_live_connection(
+            session, enrolled_student, class_id, sid
+        )
+
+
 def test_unapproved_teacher_cannot_mint(
     session: Session, pending_teacher: User, approved_teacher: User,
     offering_id: uuid.UUID,
@@ -378,7 +464,7 @@ def test_unapproved_teacher_cannot_mint(
     class_id = _start(session, approved_teacher, offering_id)
 
     with pytest.raises(LearningForbiddenError) as excinfo:
-        classroom_service.issue_ws_ticket_for_teacher(
+        _issue_teacher_ticket(
             session, pending_teacher, offering_id, class_id
         )
     assert "only an approved teacher may enter the classroom" in str(excinfo.value)
@@ -392,7 +478,7 @@ def test_a_foreign_class_is_the_same_404_as_an_unknown_one(
     foreign_class = _start(session, other_teacher, other_offering_id)
 
     with pytest.raises(LearningNotFoundError) as excinfo:
-        classroom_service.issue_ws_ticket_for_teacher(
+        _issue_teacher_ticket(
             session, approved_teacher, offering_id, foreign_class
         )
     assert str(excinfo.value) == f"no online class with id {foreign_class}"
@@ -405,7 +491,7 @@ def test_a_non_live_class_is_never_ticketed(
     session.commit()
 
     with pytest.raises(LearningConflictError) as excinfo:
-        classroom_service.issue_ws_ticket_for_teacher(
+        _issue_teacher_ticket(
             session, approved_teacher, offering_id, scheduled.class_id
         )
     assert "participant ticket issuance requires a live class" in str(excinfo.value)
@@ -418,7 +504,7 @@ def test_a_non_live_class_is_never_ticketed(
     )
     session.commit()
     with pytest.raises(LearningConflictError):
-        classroom_service.issue_ws_ticket_for_teacher(
+        _issue_teacher_ticket(
             session, approved_teacher, offering_id, scheduled.class_id
         )
     assert _tickets(session) == []
@@ -430,14 +516,14 @@ def test_student_ticket_requires_active_enrollment_and_a_live_class(
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
 
-    read = classroom_service.issue_ws_ticket_for_student(
+    read = _issue_student_ticket(
         session, _student_profile(session, enrolled_student), class_id
     )
     session.commit()
     assert read.ws_path == f"/ws/classes/{class_id}"
 
     with pytest.raises(LearningNotFoundError) as excinfo:
-        classroom_service.issue_ws_ticket_for_student(
+        _issue_student_ticket(
             session, _student_profile(session, other_student), class_id
         )
     assert str(excinfo.value) == f"no online class with id {class_id}"
@@ -445,7 +531,7 @@ def test_student_ticket_requires_active_enrollment_and_a_live_class(
     scheduled = _create(session, approved_teacher, offering_id, *_window(2))
     session.commit()
     with pytest.raises(LearningConflictError):
-        classroom_service.issue_ws_ticket_for_student(
+        _issue_student_ticket(
             session, _student_profile(session, enrolled_student), scheduled.class_id
         )
 
@@ -465,7 +551,7 @@ def test_a_ended_enrollment_loses_ticket_minting_but_keeps_history(
     # §29: leaving is the revocation point — no new capability, even
     # though the participation history from before is untouched.
     with pytest.raises(LearningNotFoundError) as excinfo:
-        classroom_service.issue_ws_ticket_for_student(session, profile, class_id)
+        _issue_student_ticket(session, profile, class_id)
     assert str(excinfo.value) == f"no online class with id {class_id}"
 
 
@@ -484,14 +570,14 @@ def test_a_student_of_another_offering_is_the_same_404_and_never_enters(
     class_id = _start(session, approved_teacher, offering_id)
 
     with pytest.raises(LearningNotFoundError) as excinfo:
-        classroom_service.issue_ws_ticket_for_student(
+        _issue_student_ticket(
             session, _student_profile(session, student), class_id
         )
     assert str(excinfo.value) == f"no online class with id {class_id}"
     assert _tickets(session) == []
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, student, class_id, "conn-foreign-offering"
         )
     session.rollback()
@@ -507,14 +593,14 @@ def test_consumption_is_single_use_and_returns_the_ticket_holder(
     enrolled_student: User,
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
-    read = classroom_service.issue_ws_ticket_for_student(
+    read = _issue_student_ticket(
         session, _student_profile(session, enrolled_student), class_id
     )
     session.commit()
 
     holder = classroom_service.consume_ws_ticket(session, class_id, read.ticket)
     session.commit()
-    assert holder is not None and holder.id == enrolled_student.id
+    assert holder is not None and holder[0].id == enrolled_student.id
 
     again = classroom_service.consume_ws_ticket(session, class_id, read.ticket)
     session.commit()
@@ -530,7 +616,7 @@ def test_consumption_binds_class_expiry_and_identity_together(
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
     other_class = _start(session, approved_teacher, offering_id, offset=4)
-    read = classroom_service.issue_ws_ticket_for_student(
+    read = _issue_student_ticket(
         session, _student_profile(session, enrolled_student), class_id
     )
     session.commit()
@@ -547,7 +633,7 @@ def test_consumption_binds_class_expiry_and_identity_together(
     )
 
     # Expiry: flip the row into the past; the next redemption fails.
-    expired = classroom_service.issue_ws_ticket_for_student(
+    expired = _issue_student_ticket(
         session, _student_profile(session, enrolled_student), other_class
     )
     session.commit()
@@ -568,7 +654,7 @@ def test_an_access_token_is_not_a_ticket(
     session: Session, approved_teacher: User, offering_id: uuid.UUID
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
-    stolen = security.create_access_token(approved_teacher.id, "teacher")
+    stolen = security.create_access_token(approved_teacher.id, "teacher", uuid.uuid4())
 
     assert classroom_service.consume_ws_ticket(session, class_id, stolen) is None
     assert _tickets(session) == []
@@ -599,7 +685,7 @@ def test_teacher_handshake_returns_identity_and_creates_no_segment(
         ).all()
     )
 
-    identity = classroom_service.authorize_ws_connection(
+    identity = _authorize_ws(
         session, approved_teacher, class_id, "conn-teacher"
     )
     session.commit()
@@ -627,7 +713,7 @@ def test_foreign_teacher_and_admin_handshakes_are_refused_not_authorized(
 
     for outsider in (other_teacher, admin):
         with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-            classroom_service.authorize_ws_connection(
+            _authorize_ws(
                 session, outsider, class_id, f"conn-{outsider.role}"
             )
         session.rollback()
@@ -641,7 +727,7 @@ def test_student_handshake_opens_exactly_one_segment_with_one_audit(
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
 
-    identity = classroom_service.authorize_ws_connection(
+    identity = _authorize_ws(
         session, enrolled_student, class_id, "conn-1"
     )
     session.commit()
@@ -667,13 +753,13 @@ def test_a_second_handshake_for_the_same_student_is_a_duplicate(
     enrolled_student: User,
 ) -> None:
     class_id = _start(session, approved_teacher, offering_id)
-    classroom_service.authorize_ws_connection(
+    _authorize_ws(
         session, enrolled_student, class_id, "conn-1"
     )
     session.commit()
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, enrolled_student, class_id, "conn-2"
         )
     session.rollback()
@@ -690,7 +776,7 @@ def test_handshakes_against_a_non_live_class_refuse_with_class_not_live(
     session.commit()
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, approved_teacher, scheduled.class_id, "conn-t"
         )
     session.rollback()
@@ -709,7 +795,7 @@ def test_handshakes_against_a_non_live_class_refuse_with_class_not_live(
         (enrolled_student, "conn-s2"),
     ):
         with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-            classroom_service.authorize_ws_connection(
+            _authorize_ws(
                 session, user, scheduled.class_id, cid
             )
         session.rollback()
@@ -727,7 +813,7 @@ def test_student_handshake_survives_the_overdue_sweep_as_class_not_live(
     row = session.get(OnlineClassSession, class_id)
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, enrolled_student, class_id, "conn-late"
         )
     assert excinfo.value.reason == cc.REASON_CLASS_NOT_LIVE
@@ -748,7 +834,7 @@ def test_role_without_a_profile_never_enters(
     session.commit()
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, student, class_id, "conn-ghost"
         )
     session.rollback()
@@ -765,7 +851,7 @@ def test_an_inactive_account_never_enters(
     suspension between mint and connect never opens a segment.
     """
     class_id = _start(session, approved_teacher, offering_id)
-    read = classroom_service.issue_ws_ticket_for_student(
+    read = _issue_student_ticket(
         session, _student_profile(session, enrolled_student), class_id
     )
     session.commit()
@@ -778,7 +864,7 @@ def test_an_inactive_account_never_enters(
     session.commit()
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, enrolled_student, class_id, "conn-disabled"
         )
     session.rollback()
@@ -795,7 +881,7 @@ def test_a_suspended_teacher_never_enters(
     session.commit()
 
     with pytest.raises(classroom_service.ClassroomConnectionRefused) as excinfo:
-        classroom_service.authorize_ws_connection(
+        _authorize_ws(
             session, approved_teacher, class_id, "conn-suspended"
         )
     session.rollback()
@@ -970,6 +1056,7 @@ def _fake_connection(class_id: uuid.UUID, user_id: uuid.UUID, **overrides) -> Li
         "websocket": None,
         "class_id": class_id,
         "user_id": user_id,
+        "auth_session_id": uuid.uuid4(),
         "role": "student",
         "display_name": "Fake",
         "participant_ref": participant_ref(class_id, user_id),

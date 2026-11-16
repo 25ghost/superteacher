@@ -139,6 +139,7 @@ from app.models.student import Student
 from app.models.teacher import Teacher
 from app.models.user import User
 from app.repositories import auth_event_repository as auth_event_repo
+from app.repositories import auth_session_repository as auth_session_repo
 from app.repositories import class_attendance_repository as segment_repo
 from app.repositories import class_message_repository as message_repo
 from app.repositories import learning_enrollment_repository as enrollment_repo
@@ -612,6 +613,7 @@ class WsHandshakeIdentity:
     """Plain data a registered connection needs (no ORM objects)."""
 
     user_id: uuid.UUID
+    auth_session_id: uuid.UUID
     role: str
     display_name: str
     teaching_offering_id: uuid.UUID
@@ -623,7 +625,8 @@ def _ws_path(class_id: uuid.UUID) -> str:
 
 
 def _mint_ws_ticket(
-    session: Session, *, class_id: uuid.UUID, user_id: uuid.UUID
+    session: Session, *, class_id: uuid.UUID, user_id: uuid.UUID,
+    auth_session_id: uuid.UUID,
 ) -> ClassWsTicketRead:
     """Create one ticket row and hand back the raw value exactly once.
 
@@ -633,6 +636,10 @@ def _mint_ws_ticket(
     row keeps its SHA-256 digest alone; the raw value never appears in
     logs, audits or any later response.
     """
+    if auth_session_repo.get_valid_for_user(
+        session, auth_session_id, user_id, now=_now()
+    ) is None:
+        raise LearningForbiddenError("an active authentication session is required")
     raw = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     expires_at = _now() + timedelta(seconds=get_settings().WS_TICKET_TTL_SECONDS)
@@ -640,6 +647,7 @@ def _mint_ws_ticket(
         session,
         class_session_id=class_id,
         user_id=user_id,
+        auth_session_id=auth_session_id,
         token_hash=token_hash,
         expires_at=expires_at,
     )
@@ -653,7 +661,8 @@ def _mint_ws_ticket(
 
 
 def issue_ws_ticket_for_teacher(
-    session: Session, user: User, offering_id: uuid.UUID, class_id: uuid.UUID
+    session: Session, user: User, offering_id: uuid.UUID, class_id: uuid.UUID,
+    auth_session_id: uuid.UUID,
 ) -> ClassWsTicketRead:
     """Mint a handshake ticket for the owning, approved teacher (§6).
 
@@ -689,11 +698,11 @@ def issue_ws_ticket_for_teacher(
             "only approved contexts may be used to enter the classroom"
         )
     _require_live(class_session, "ticket issuance")
-    return _mint_ws_ticket(session, class_id=read.class_id, user_id=user.id)
+    return _mint_ws_ticket(session, class_id=read.class_id, user_id=user.id, auth_session_id=auth_session_id)
 
 
 def issue_ws_ticket_for_student(
-    session: Session, student: Student, class_id: uuid.UUID
+    session: Session, student: Student, class_id: uuid.UUID, auth_session_id: uuid.UUID
 ) -> ClassWsTicketRead:
     """Mint a handshake ticket for an actively enrolled student (§6).
 
@@ -715,12 +724,12 @@ def issue_ws_ticket_for_student(
 
     online_class_service.ensure_not_overdue(session, class_id)
     _require_live(class_session, "ticket issuance")
-    return _mint_ws_ticket(session, class_id=class_id, user_id=student.user_id)
+    return _mint_ws_ticket(session, class_id=class_id, user_id=student.user_id, auth_session_id=auth_session_id)
 
 
 def consume_ws_ticket(
     session: Session, class_id: uuid.UUID, raw_ticket: str
-) -> User | None:
+) -> tuple[User, uuid.UUID] | None:
     """Atomically redeem one ticket for this class → its user, or ``None``.
 
     The repository's single UPDATE does class-scope, expiry and
@@ -741,7 +750,12 @@ def consume_ws_ticket(
     user = session.get(User, ticket.user_id)
     if user is None:  # account deleted between issuance and handshake
         return None
-    return user
+    auth_session = auth_session_repo.get_valid_for_user(
+        session, ticket.auth_session_id, user.id, now=_now()
+    ) if ticket.auth_session_id is not None else None
+    if auth_session is None:
+        return None
+    return user, auth_session.id
 
 
 def _handshake_conflict_reason(message: str) -> str:
@@ -754,7 +768,8 @@ def _handshake_conflict_reason(message: str) -> str:
 
 
 def authorize_ws_connection(
-    session: Session, user: User, class_id: uuid.UUID, connection_id: str
+    session: Session, user: User, class_id: uuid.UUID, connection_id: str,
+    auth_session_id: uuid.UUID,
 ) -> WsHandshakeIdentity:
     """Revalidate a redeemed ticket against the LIVE class (§11 step 3+).
 
@@ -783,6 +798,10 @@ def authorize_ws_connection(
     # §11 step 5 first: the identity behind the ticket must still be an
     # account that is allowed to participate at all.
     if user.status != UserStatus.ACTIVE.value:
+        raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
+    if auth_session_repo.get_valid_for_user(
+        session, auth_session_id, user.id, now=_now()
+    ) is None:
         raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
 
     # Sweep first: a class whose window closed while the ticket sat must
@@ -813,6 +832,7 @@ def authorize_ws_connection(
             raise ClassroomConnectionRefused(REASON_CLASS_NOT_LIVE)
         return WsHandshakeIdentity(
             user_id=user.id,
+            auth_session_id=auth_session_id,
             role="teacher",
             display_name=profile.full_name,
             teaching_offering_id=class_session.teaching_offering_id,
@@ -833,6 +853,7 @@ def authorize_ws_connection(
             ) from exc
         return WsHandshakeIdentity(
             user_id=user.id,
+            auth_session_id=auth_session_id,
             role="student",
             display_name=student.full_name,
             teaching_offering_id=class_session.teaching_offering_id,
@@ -844,7 +865,7 @@ def authorize_ws_connection(
 
 
 def revalidate_live_connection(
-    session: Session, user: User, class_id: uuid.UUID
+    session: Session, user: User, class_id: uuid.UUID, auth_session_id: uuid.UUID
 ) -> None:
     """Recheck an OPEN socket's entitlement — mid-session revocation.
 
@@ -869,6 +890,10 @@ def revalidate_live_connection(
     # §11 step 5 again, mid-session: an account revoked after the
     # handshake never keeps its socket.
     if user.status != UserStatus.ACTIVE.value:
+        raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
+    if auth_session_repo.get_valid_for_user(
+        session, auth_session_id, user.id, now=_now()
+    ) is None:
         raise ClassroomConnectionRefused(REASON_NOT_AUTHORIZED)
 
     if user.role != UserRole.TEACHER.value:

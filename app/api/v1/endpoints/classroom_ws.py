@@ -144,6 +144,7 @@ import logging
 import secrets
 import time
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket
 from pydantic import ValidationError
@@ -154,6 +155,7 @@ from app.core.database import SessionLocal
 from app.models.enums import OnlineClassStatus
 from app.models.online_class_session import OnlineClassSession
 from app.models.user import User
+from app.repositories import auth_session_repository as auth_session_repo
 from app.realtime import close_codes as cc
 from app.realtime.connections import LiveConnection, participant_ref, registry
 from app.realtime.event_bus import get_event_bus
@@ -176,16 +178,16 @@ _SEGMENT_ID_BYTES = 24
 # --- thread workers (own Session per phase; the endpoint commits/rolls back) ----------
 
 
-def _consume_ticket(class_id: uuid.UUID, raw_ticket: str) -> User | None:
+def _consume_ticket(class_id: uuid.UUID, raw_ticket: str) -> tuple[User, uuid.UUID] | None:
     """Redeem one ticket, committing its single use (§10)."""
     session = SessionLocal()
     try:
-        user = classroom_service.consume_ws_ticket(session, class_id, raw_ticket)
-        if user is None:
+        principal = classroom_service.consume_ws_ticket(session, class_id, raw_ticket)
+        if principal is None:
             session.rollback()
             return None
         session.commit()
-        return user
+        return principal
     except Exception:
         session.rollback()
         raise
@@ -194,7 +196,7 @@ def _consume_ticket(class_id: uuid.UUID, raw_ticket: str) -> User | None:
 
 
 def _authorize(
-    user_id: uuid.UUID, class_id: uuid.UUID, connection_id: str
+    user_id: uuid.UUID, auth_session_id: uuid.UUID, class_id: uuid.UUID, connection_id: str
 ) -> classroom_service.WsHandshakeIdentity:
     """Revalidate + join, committing the segment (or the swept end)."""
     session = SessionLocal()
@@ -206,7 +208,7 @@ def _authorize(
             )
         try:
             identity = classroom_service.authorize_ws_connection(
-                session, user, class_id, connection_id
+                session, user, class_id, connection_id, auth_session_id
             )
         except classroom_service.ClassroomConnectionRefused as exc:
             if exc.reason == cc.REASON_CLASS_NOT_LIVE:
@@ -308,13 +310,18 @@ def _heartbeat_worker(connection: LiveConnection) -> str:
         if user is None:
             connection.revoked = True
             return "not_authorized"
+        if auth_session_repo.get_valid_for_user(
+            session, connection.auth_session_id, user.id, now=datetime.now(timezone.utc)
+        ) is None:
+            connection.revoked = True
+            return "not_authorized"
         # §11 step 5 again, mid-session: the account (and, for a teacher,
         # the teaching authorization behind this socket) may have been
         # revoked since the handshake — the probe re-reads the durable
         # state instead of trusting connection-time authentication.
         try:
             classroom_service.revalidate_live_connection(
-                session, user, connection.class_id
+                session, user, connection.class_id, connection.auth_session_id
             )
         except classroom_service.ClassroomConnectionRefused:
             session.rollback()
@@ -370,9 +377,14 @@ def _revalidate_worker(connection: LiveConnection) -> str:
         if user is None:
             connection.revoked = True
             return "not_authorized"
+        if auth_session_repo.get_valid_for_user(
+            session, connection.auth_session_id, user.id, now=datetime.now(timezone.utc)
+        ) is None:
+            connection.revoked = True
+            return "not_authorized"
         try:
             classroom_service.revalidate_live_connection(
-                session, user, connection.class_id
+                session, user, connection.class_id, connection.auth_session_id
             )
         except classroom_service.ClassroomConnectionRefused:
             connection.revoked = True
@@ -756,20 +768,21 @@ async def classroom_websocket(websocket: WebSocket, class_id: uuid.UUID) -> None
 
     # §11 steps 1-2: redeem (one atomic UPDATE — commit the single use).
     try:
-        user = await asyncio.to_thread(_consume_ticket, class_id, raw_ticket)
+        principal = await asyncio.to_thread(_consume_ticket, class_id, raw_ticket)
     except Exception:
         logger.exception("ticket redemption failed", extra={"class_id": str(class_id)})
         await _refuse(websocket, cc.INTERNAL_ERROR, "ticket redemption error")
         return
-    if user is None:
+    if principal is None:
         await _refuse(websocket, cc.WS_TICKET_INVALID, "invalid ticket")
         return
 
     # §11 steps 3-6: revalidate identity/class; students join here.
     connection_id = secrets.token_urlsafe(_SEGMENT_ID_BYTES)
     try:
+        user, auth_session_id = principal
         identity = await asyncio.to_thread(
-            _authorize, user.id, class_id, connection_id
+            _authorize, user.id, auth_session_id, class_id, connection_id
         )
     except classroom_service.ClassroomConnectionRefused as exc:
         await _refuse(websocket, cc.CLOSE_BY_REASON[exc.reason], exc.reason)
@@ -786,6 +799,7 @@ async def classroom_websocket(websocket: WebSocket, class_id: uuid.UUID) -> None
         websocket=websocket,
         class_id=class_id,
         user_id=identity.user_id,
+        auth_session_id=identity.auth_session_id,
         role=identity.role,
         display_name=identity.display_name,
         participant_ref=participant_ref(class_id, identity.user_id),

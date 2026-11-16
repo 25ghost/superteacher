@@ -497,7 +497,9 @@ def change_password(
 ) -> None:
     try:
         auth_service.change_password(
-            session, user, payload, **_request_meta(request)
+            session, user, payload,
+            current_session_id=request.state.auth_session_id,
+            **_request_meta(request)
         )
     except auth_service.AuthError as exc:
         session.rollback()

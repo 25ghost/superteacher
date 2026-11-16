@@ -34,6 +34,9 @@ class ClassWsTicket(TimestampMixin, Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    auth_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("auth_sessions.id", ondelete="SET NULL"), nullable=True
+    )
     token_hash: Mapped[str] = mapped_column(nullable=False, unique=True)
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -45,6 +48,7 @@ class ClassWsTicket(TimestampMixin, Base):
     __table_args__ = (
         Index("class_ws_tickets_class_session_id_idx", "class_session_id"),
         Index("class_ws_tickets_user_id_idx", "user_id"),
+        Index("class_ws_tickets_auth_session_id_idx", "auth_session_id"),
         Index("class_ws_tickets_expires_at_idx", "expires_at"),
     )
 

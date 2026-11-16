@@ -62,6 +62,7 @@ class LiveConnection:
     websocket: Any
     class_id: uuid.UUID
     user_id: uuid.UUID
+    auth_session_id: uuid.UUID
     role: str  # "teacher" | "student"
     display_name: str
     participant_ref: str

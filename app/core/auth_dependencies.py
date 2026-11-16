@@ -25,7 +25,9 @@ from __future__ import annotations
 import uuid
 
 import jwt as pyjwt
-from fastapi import Depends, HTTPException, status
+from datetime import datetime, timezone
+
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -34,6 +36,7 @@ from app.core.security import decode_token
 from app.models.enums import UserRole, UserStatus
 from app.models.student import Student
 from app.models.user import User
+from app.repositories import auth_session_repository as auth_session_repo
 from app.services import auth_service
 
 # auto_error=False so a *missing* header produces our own 401 contract
@@ -44,6 +47,7 @@ _CREDENTIALS_DETAIL = "Not authenticated"
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     session: Session = Depends(get_db),
 ) -> User:
@@ -65,8 +69,13 @@ def get_current_user(
         ) from None
 
     try:
-        user_id = uuid.UUID(claims["sub"])
-    except (KeyError, ValueError):
+        subject = claims["sub"]
+        session_claim = claims["sid"]
+        if not isinstance(subject, str) or not isinstance(session_claim, str):
+            raise ValueError("invalid identity claims")
+        user_id = uuid.UUID(subject)
+        session_id = uuid.UUID(session_claim)
+    except (KeyError, TypeError, ValueError, AttributeError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=_CREDENTIALS_DETAIL,
@@ -82,6 +91,16 @@ def get_current_user(
             detail=_CREDENTIALS_DETAIL,
             headers={"WWW-Authenticate": "Bearer"},
         )
+    auth_session = auth_session_repo.get_valid_for_user(
+        session, session_id, user_id, now=datetime.now(timezone.utc)
+    )
+    if auth_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_CREDENTIALS_DETAIL,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    request.state.auth_session_id = session_id
     return user
 
 

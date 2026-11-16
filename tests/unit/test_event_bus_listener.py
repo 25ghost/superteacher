@@ -111,6 +111,7 @@ def _connection(
         websocket=None,
         class_id=class_id,
         user_id=uuid.uuid4(),
+        auth_session_id=uuid.uuid4(),
         role="student" if student_id else "teacher",
         display_name="Test Participant",
         participant_ref=uuid.uuid4().hex[:32],

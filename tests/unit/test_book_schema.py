@@ -682,7 +682,7 @@ def test_book_tables_appear_in_verify_database_expectations() -> None:
     for table in _NEW_TABLES:
         assert table in verify_database.EXPECTED_TABLES
         assert table in verify_database.LATER_MIGRATION_TABLES
-    assert verify_database.EXPECTED_REVISION == "0022"
+    assert verify_database.EXPECTED_REVISION == "0023"
     assert verify_database.EXPECTED_REVISION in {
         p.stem.split("_")[0]
         for p in (verify_database.MIGRATION_DIR).glob("0*.py")

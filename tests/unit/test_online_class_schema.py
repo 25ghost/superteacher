@@ -112,6 +112,7 @@ def test_class_tables_are_registered_with_expected_columns() -> None:
         "id",
         "class_session_id",
         "user_id",
+        "auth_session_id",
         "token_hash",
         "expires_at",
         "used_at",
@@ -140,6 +141,7 @@ def test_class_foreign_keys_follow_the_naming_convention() -> None:
         "class_ws_tickets": {
             "class_ws_tickets_class_session_id_fkey": "online_class_sessions.id",
             "class_ws_tickets_user_id_fkey": "users.id",
+            "class_ws_tickets_auth_session_id_fkey": "auth_sessions.id",
         },
     }
     for table_name, expected in expectations.items():
@@ -240,6 +242,7 @@ def test_ws_tickets_stay_single_use_through_a_unique_digest() -> None:
         "class_ws_tickets_class_session_id_idx",
         "class_ws_tickets_user_id_idx",
         "class_ws_tickets_expires_at_idx",
+        "class_ws_tickets_auth_session_id_idx",
     } <= index_names
 
 

@@ -101,6 +101,7 @@ def validate_password_policy(password: str) -> str:
 def create_access_token(
     user_id: uuid.UUID,
     role: str,
+    session_id: uuid.UUID,
     expires_minutes: int | None = None,
 ) -> str:
     """Issue a short-lived access token for one user.
@@ -119,6 +120,7 @@ def create_access_token(
     lifetime = expires_minutes if expires_minutes is not None else settings.ACCESS_TOKEN_EXPIRE_MINUTES
     claims: dict[str, Any] = {
         "sub": str(user_id),
+        "sid": str(session_id),
         "role": role,
         "typ": "access",
         "jti": str(uuid.uuid4()),
