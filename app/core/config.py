@@ -11,6 +11,7 @@ import re
 from functools import lru_cache
 from urllib.parse import quote
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Matches the localhost/127.0.0.1 development origins that must never leak
@@ -117,9 +118,9 @@ class Settings(BaseSettings):
     LOGIN_LOCKOUT_THRESHOLD: int = 5
     LOGIN_LOCKOUT_MINUTES: int = 15
 
-    # Maximum active refresh sessions per user. When exceeded, the oldest
-    # session is revoked before creating a new one.
-    MAX_SESSIONS_PER_USER: int = 10
+    # Maximum valid refresh sessions per user; issuance evicts oldest excess
+    # sessions in the same transaction. Deployments may choose a lower cap.
+    MAX_SESSIONS_PER_USER: int = Field(default=5, ge=1, le=5)
 
     # Email (Resend API) — used for password reset and account notifications.
     RESEND_API_KEY: str = ""
