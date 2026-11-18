@@ -35,6 +35,7 @@ from app.core.config import get_settings
 _password_hasher = PasswordHasher()
 
 TokenType = Literal["access", "refresh", "reset", "invite"]
+JWT_LEEWAY_SECONDS = 30
 
 
 def hash_password(password: str) -> str:
@@ -158,7 +159,8 @@ def create_refresh_token(
 def decode_token(token: str, expected_type: TokenType) -> dict[str, Any]:
     """Decode and validate a JWT, returning its claims.
 
-    Enforces signature, expiry, algorithm and the expected ``typ`` claim.
+    Enforces signature, required claims, UUID identity fields, temporal
+    validity with a 30-second clock-skew allowance, algorithm and ``typ``.
     Raises :class:`InvalidTokenError` (a ValueError) on any failure —
     callers translate that into the generic 401 contract; the raw decoding
     internals never reach a client.
@@ -169,6 +171,8 @@ def decode_token(token: str, expected_type: TokenType) -> dict[str, Any]:
             token,
             settings.jwt_secret,
             algorithms=["HS256"],  # pin the algorithm — never trust token headers
+            options={"require": ["sub", "typ", "jti", "iat", "exp", *(["sid"] if expected_type in {"access", "refresh"} else [])]},
+            leeway=JWT_LEEWAY_SECONDS,
         )
     except jwt.ExpiredSignatureError as exc:
         raise jwt.InvalidTokenError("token has expired") from exc
@@ -177,8 +181,17 @@ def decode_token(token: str, expected_type: TokenType) -> dict[str, Any]:
 
     if claims.get("typ") != expected_type:
         raise jwt.InvalidTokenError("unexpected token type")
-    if not claims.get("sub"):
-        raise jwt.InvalidTokenError("token has no subject")
+    uuid_claims = ["sub", "jti"]
+    if expected_type in {"access", "refresh"}:
+        uuid_claims.append("sid")
+    for claim in uuid_claims:
+        value = claims.get(claim)
+        if not isinstance(value, str):
+            raise jwt.InvalidTokenError(f"token has invalid {claim} claim")
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise jwt.InvalidTokenError(f"token has invalid {claim} claim") from None
     return claims
 
 

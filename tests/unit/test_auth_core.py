@@ -186,6 +186,96 @@ def test_token_signed_with_other_secret_rejected(monkeypatch) -> None:
         security.decode_token(forged, expected_type="access")
 
 
+@pytest.mark.parametrize("token_type", ["access", "refresh", "reset", "invite"])
+def test_all_issued_token_types_have_strict_common_claims(token_type: str) -> None:
+    user_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    creators = {
+        "access": lambda: security.create_access_token(user_id, "student", session_id),
+        "refresh": lambda: security.create_refresh_token(user_id, session_id),
+        "reset": lambda: security.create_reset_token(user_id),
+        "invite": lambda: security.create_invite_token(user_id),
+    }
+    claims = security.decode_token(creators[token_type](), expected_type=token_type)
+    assert claims["sub"] == str(user_id)
+    assert uuid.UUID(claims["jti"])
+    assert ("sid" in claims) is (token_type in {"access", "refresh"})
+
+
+@pytest.mark.parametrize("missing", ["sub", "typ", "jti", "iat", "exp"])
+def test_signed_token_missing_common_claim_is_rejected(missing: str) -> None:
+    claims = {
+        "sub": str(uuid.uuid4()), "typ": "access", "jti": str(uuid.uuid4()),
+        "sid": str(uuid.uuid4()), "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    claims.pop(missing)
+    token = pyjwt.encode(claims, security.get_settings().jwt_secret, algorithm="HS256")
+    with pytest.raises(pyjwt.PyJWTError):
+        security.decode_token(token, expected_type="access")
+
+
+@pytest.mark.parametrize("claim,value", [
+    ("sub", "not-a-uuid"), ("jti", "not-a-uuid"), ("sid", "not-a-uuid"),
+    ("sub", 17), ("jti", 17), ("sid", 17),
+])
+def test_signed_token_invalid_uuid_claim_is_rejected(claim: str, value: object) -> None:
+    claims = {
+        "sub": str(uuid.uuid4()), "typ": "access", "jti": str(uuid.uuid4()),
+        "sid": str(uuid.uuid4()), "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    claims[claim] = value
+    token = pyjwt.encode(claims, security.get_settings().jwt_secret, algorithm="HS256")
+    with pytest.raises(pyjwt.PyJWTError):
+        security.decode_token(token, expected_type="access")
+
+
+def test_access_token_missing_sid_is_rejected() -> None:
+    claims = {
+        "sub": str(uuid.uuid4()), "typ": "access", "jti": str(uuid.uuid4()),
+        "iat": datetime.now(timezone.utc), "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    token = pyjwt.encode(claims, security.get_settings().jwt_secret, algorithm="HS256")
+    with pytest.raises(pyjwt.PyJWTError):
+        security.decode_token(token, expected_type="access")
+
+
+def test_refresh_token_missing_sid_is_rejected() -> None:
+    claims = {
+        "sub": str(uuid.uuid4()), "typ": "refresh", "jti": str(uuid.uuid4()),
+        "iat": datetime.now(timezone.utc), "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    token = pyjwt.encode(claims, security.get_settings().jwt_secret, algorithm="HS256")
+    with pytest.raises(pyjwt.PyJWTError):
+        security.decode_token(token, expected_type="refresh")
+
+
+def test_jwt_temporal_validation_uses_30_second_leeway(monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(pyjwt.api_jwt, "datetime", FrozenDateTime)
+    base = {"sub": str(uuid.uuid4()), "typ": "reset", "jti": str(uuid.uuid4())}
+    secret = security.get_settings().jwt_secret
+    epoch = int(now.timestamp())
+    # PyJWT represents NumericDate as integer seconds and expires when
+    # exp <= now - leeway. Thus -29 seconds is still within leeway, while
+    # exactly -30 seconds is already expired by its documented comparison.
+    accepted = pyjwt.encode({**base, "iat": epoch + 30, "exp": epoch - 29}, secret, algorithm="HS256")
+    security.decode_token(accepted, expected_type="reset")
+    future = pyjwt.encode({**base, "iat": epoch + 31, "exp": epoch + 60}, secret, algorithm="HS256")
+    for exp_offset in (-30, -31):
+        expired = pyjwt.encode({**base, "iat": epoch - 60, "exp": epoch + exp_offset}, secret, algorithm="HS256")
+        with pytest.raises(security.InvalidTokenError, match="token has expired"):
+            security.decode_token(expired, expected_type="reset")
+    with pytest.raises(pyjwt.ImmatureSignatureError):
+        security.decode_token(future, expected_type="reset")
+
+
 # --- production secret validation (Step 8) ----------------------------------------------
 
 
