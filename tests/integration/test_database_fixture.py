@@ -13,6 +13,8 @@ No seed data is inserted; the disposable row is rolled back.
 """
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 from sqlalchemy import select, text
 
@@ -54,6 +56,46 @@ def test_guard_accepts_test_database(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "")
     url = _guarded_test_url()
     assert "super_teacher_db_test" in url
+
+
+def test_guard_accepts_matching_postgresql_url(monkeypatch) -> None:
+    from tests.conftest import _guarded_test_url
+
+    url = "postgresql+psycopg://tester@localhost/super_teacher_db_test?sslmode=require"
+    monkeypatch.setenv("ENVIRONMENT", "testing")
+    monkeypatch.setenv("DB_NAME", "super_teacher_db_test")
+    monkeypatch.setenv("DATABASE_URL", url)
+
+    assert _guarded_test_url() == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+psycopg://tester@localhost/super_teacher_db",
+        "postgresql+psycopg://tester@localhost/another_test",
+        "postgresql+psycopg://tester@localhost/SUPER_TEACHER_DB_test",
+        "postgresql+psycopg://tester@localhost/",
+        "postgresql+psycopg://tester:dummy-password@localhost:bad/super_teacher_db_test",
+        "sqlite:///super_teacher_db_test",
+        "postgresql+unknown://tester@localhost/super_teacher_db_test",
+        "postgresql+psycopg://tester@localhost/super_teacher_db_test?dbname=another_test",
+    ],
+)
+def test_guard_rejects_unsafe_url_before_creating_an_engine(monkeypatch, url: str) -> None:
+    from tests import conftest
+
+    monkeypatch.setenv("ENVIRONMENT", "testing")
+    monkeypatch.setenv("DB_NAME", "super_teacher_db_test")
+    monkeypatch.setenv("DATABASE_URL", url)
+    create_engine = Mock()
+    monkeypatch.setattr(conftest, "create_engine", create_engine)
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        next(conftest.pg_engine.__wrapped__())
+
+    assert "dummy-password" not in str(exc_info.value)
+    create_engine.assert_not_called()
 
 
 def test_transaction_rollback_leaves_no_rows(db_session) -> None:

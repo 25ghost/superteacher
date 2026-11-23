@@ -33,7 +33,8 @@ from datetime import datetime, timezone
 import pytest
 from pypdf import PdfReader, PdfWriter
 from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session
 
 # app.main refuses to import when ENVIRONMENT is not set explicitly (startup
@@ -371,10 +372,8 @@ def approve_teacher_for_payloads(
 def _guarded_test_url() -> str:
     """Return the SQLAlchemy URL for integration tests, or raise.
 
-    The rule is intentionally simple and strict:
-      ENVIRONMENT == "testing"  AND  DB_NAME ends with "_test"
-    (an explicit DATABASE_URL is honored but must also point at a *_test
-    database; production is always refused).
+    Require the testing environment and an explicit PostgreSQL database
+    ending in "_test" that matches DB_NAME exactly.
     """
     # Read config fresh, without the cached app settings, so environment
     # overrides set by tests/CI apply deterministically.
@@ -390,16 +389,28 @@ def _guarded_test_url() -> str:
     if environment == "production":
         raise UnsafeTestDatabase("ENVIRONMENT=production — integration tests are refused.")
     if environment != "testing":
-        raise UnsafeTestDatabase(
-            f"ENVIRONMENT must be 'testing' for integration tests (got {environment!r})."
-        )
+        raise UnsafeTestDatabase("ENVIRONMENT must be 'testing' for integration tests.")
     db_name = settings.DB_NAME
     if not db_name.endswith("_test"):
         raise UnsafeTestDatabase(
-            f"DB_NAME must end with '_test' for integration tests (got {db_name!r}). "
+            "DB_NAME must end with '_test' for integration tests. "
             "Create a dedicated test database, e.g.: CREATE DATABASE super_teacher_db_test;"
         )
-    return settings.database_url
+    database_url = settings.database_url
+    try:
+        url = make_url(database_url)
+        if url.get_backend_name() != "postgresql" or url.get_dialect().is_async:
+            raise UnsafeTestDatabase("Integration tests require a synchronous PostgreSQL URL.")
+    except (ArgumentError, ValueError):
+        raise UnsafeTestDatabase("The integration test database URL is invalid.") from None
+
+    # PostgreSQL drivers accept connection parameters from the query string.
+    # Keep the URL path as the sole source of the database name.
+    if "dbname" in url.query or "database" in url.query:
+        raise UnsafeTestDatabase("Specify the test database in the URL path only.")
+    if url.database != db_name or any(char in db_name for char in ("\x00", "=", "/")):
+        raise UnsafeTestDatabase("The PostgreSQL URL must name the same test database as DB_NAME.")
+    return database_url
 
 
 @pytest.fixture(scope="session")
