@@ -632,11 +632,12 @@ python -m pytest -m ""              # everything
 ```
 
 Integration tests require a dedicated **test database** and refuse to run
-otherwise: `ENVIRONMENT=testing` and `DB_NAME` ending in `_test` (e.g.
-`super_teacher_db_test`) must both hold, and the test database must already
-have the schema applied (`alembic upgrade head` against it). The suite never
-creates or destroys databases, truncates only the test database, and rolls
-back every transaction it opens. The development database
+otherwise. Set `ENVIRONMENT=testing` and a `DB_NAME` ending in `_test` (e.g.
+`super_teacher_db_test`). The effective PostgreSQL URL must name that exact
+database in its path, including when `DATABASE_URL` is set. The test database
+must already have the schema applied (`alembic upgrade head` against it).
+The suite never creates or destroys databases, truncates only the test
+database, and rolls back every transaction it opens. The development database
 `super_teacher_db` can never be targeted by tests.
 
 ## Database
