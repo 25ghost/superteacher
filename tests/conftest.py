@@ -29,6 +29,7 @@ import os
 import uuid as uuid_module
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from pypdf import PdfReader, PdfWriter
@@ -416,28 +417,96 @@ def _guarded_test_url() -> str:
 @pytest.fixture(scope="session")
 def pg_engine() -> Iterator[Engine]:
     """Session-scoped engine for the guarded PostgreSQL test database."""
+    engine = _verified_pg_engine()
+    try:
+        yield engine
+    finally:
+        try:
+            from app.realtime.event_bus import get_event_bus
+
+            bus = get_event_bus()
+            if bus._thread is not None:
+                bus._stop.set()
+                bus._thread.join(timeout=5)
+                if bus._thread.is_alive():
+                    raise RuntimeError("The PostgreSQL test listener did not stop.")
+        finally:
+            engine.dispose()
+
+
+def _verified_pg_engine(*, check_schema: bool = True) -> Engine:
+    """Open the approved test target and verify it before yielding any fixture."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    from app.core.config import get_settings
+
     try:
         url = _guarded_test_url()
-    except UnsafeTestDatabase as exc:
-        pytest.skip(f"integration test database not configured: {exc}")
-    engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-    # The test database must already have the schema applied (alembic upgrade head).
+        target = make_url(url)
+        if make_url(get_settings().database_url) != target:
+            raise UnsafeTestDatabase("Application and fixture database targets differ.")
+    except UnsafeTestDatabase:
+        raise
+    except Exception:
+        raise UnsafeTestDatabase("The test database configuration is invalid.") from None
+
+    system_id = os.environ.get("SUPERTEACHER_TEST_PG_SYSTEM_ID", "")
+    if not system_id.isascii() or not system_id.isdecimal():
+        raise UnsafeTestDatabase("Set SUPERTEACHER_TEST_PG_SYSTEM_ID from disposable PostgreSQL provisioning.")
+    if not target.username:
+        raise UnsafeTestDatabase("The PostgreSQL test URL must specify a dedicated role.")
+
+    engine = None
     try:
-        inspector = inspect(engine)
-        missing = [t for t in APPLICATION_TABLES if t not in set(inspector.get_table_names())]
+        engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        with engine.connect() as connection:
+            database, role, actual_id = connection.execute(text("""
+                SELECT current_database(), session_user, system_identifier::text
+                FROM pg_catalog.pg_control_system()
+            """)).one()
+            if (database, role, actual_id) != (target.database, target.username, system_id):
+                raise UnsafeTestDatabase("Connected PostgreSQL database, role, or server identity differs from the approved target.")
+
+            restricted = connection.execute(text("""
+                SELECT NOT (rolsuper OR rolcreatedb OR rolcreaterole OR
+                            rolreplication OR rolbypassrls)
+                       AND NOT EXISTS (
+                           SELECT FROM pg_catalog.pg_auth_members WHERE member = pg_roles.oid
+                       )
+                       AND NOT EXISTS (
+                           SELECT FROM pg_catalog.pg_database
+                           WHERE datallowconn AND datname <> current_database()
+                             AND pg_catalog.has_database_privilege(session_user, oid, 'CONNECT')
+                       )
+                FROM pg_catalog.pg_roles WHERE rolname = session_user
+            """)).scalar_one()
+            if not restricted:
+                raise UnsafeTestDatabase("The PostgreSQL test role has privileges outside the test database.")
+
+            if check_schema:
+                root = Path(__file__).resolve().parents[1]
+                config = Config()
+                config.set_main_option("script_location", str(root / "alembic"))
+                expected_revisions = set(ScriptDirectory.from_config(config).get_heads())
+                inspector = inspect(connection)
+                tables = set(inspector.get_table_names())
+                if "alembic_version" not in tables:
+                    raise UnsafeTestDatabase("The PostgreSQL test database has no Alembic revision.")
+                revisions = set(connection.execute(text("SELECT version_num FROM alembic_version")).scalars())
+                if revisions != expected_revisions:
+                    raise UnsafeTestDatabase("The PostgreSQL test database is not at the expected Alembic head.")
+                if set(APPLICATION_TABLES) - tables:
+                    raise UnsafeTestDatabase("The PostgreSQL test database schema is incomplete.")
     except Exception as exc:
-        engine.dispose()
-        pytest.skip(
-            f"test database not reachable ({exc}); create it and apply the schema first"
-        )
-    if missing:
-        engine.dispose()
-        pytest.skip(
-            f"test database schema incomplete (missing {missing}); "
-            "run 'alembic upgrade head' against it first"
-        )
-    yield engine
-    engine.dispose()
+        if engine is not None:
+            engine.dispose()
+        if isinstance(exc, UnsafeTestDatabase):
+            raise
+        raise UnsafeTestDatabase(
+            "PostgreSQL test setup failed. Check connectivity and permission to read the server identity."
+        ) from None
+    return engine
 
 
 @pytest.fixture()
@@ -449,13 +518,20 @@ def clean_db(pg_engine: Engine) -> Iterator[Engine]:
     failed, so a failing assertion can neither leak rows into the next
     test nor trigger a teardown error of its own.
     """
-    with pg_engine.begin() as connection:
-        for table in APPLICATION_TABLES:
-            connection.execute(text(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE'))
-    yield pg_engine
-    with pg_engine.begin() as connection:
-        for table in APPLICATION_TABLES:
-            connection.execute(text(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE'))
+    _truncate_test_tables(pg_engine)
+    try:
+        yield pg_engine
+    finally:
+        _truncate_test_tables(pg_engine)
+
+
+def _truncate_test_tables(engine: Engine) -> None:
+    try:
+        with engine.begin() as connection:
+            for table in APPLICATION_TABLES:
+                connection.execute(text(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE'))
+    except Exception:
+        raise RuntimeError("PostgreSQL test table cleanup failed.") from None
 
 
 @pytest.fixture()
@@ -465,21 +541,17 @@ def db_session(pg_engine: Engine) -> Iterator[Session]:
     Everything the test does through this session — including ``commit()``
     on the nested SAVEPOINT — is discarded at teardown.
     """
-    connection = pg_engine.connect()
-    transaction = connection.begin()
-    # autoflush=False matches app.core.database.SessionLocal: production code
-    # must not depend on SQLAlchemy silently pushing pending rows mid-query.
-    session = Session(
-        bind=connection,
-        join_transaction_mode="create_savepoint",
-        autoflush=False,
-    )
-    try:
-        yield session
-    finally:
-        session.close()
-        transaction.rollback()
-        connection.close()
+    with pg_engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            with Session(
+                bind=connection,
+                join_transaction_mode="create_savepoint",
+                autoflush=False,
+            ) as session:
+                yield session
+        finally:
+            transaction.rollback()
 
 
 @pytest.fixture(autouse=True)
