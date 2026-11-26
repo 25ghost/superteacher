@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock
 
 import pytest
+from argon2 import PasswordHasher, Type, extract_parameters
+from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -37,6 +40,7 @@ from app.core.rate_limit import limiter
 from app.models.auth_event import AuthEvent
 from app.models.enums import UserRole, UserStatus
 from app.models.user import User
+from app.services import auth_service
 import app.models  # noqa: F401  (registers every table)
 
 PASSWORD = "correct horse battery staple"
@@ -327,3 +331,111 @@ def test_health_endpoint_is_rate_limited(session: Session, api_client: TestClien
 
     throttled = api_client.get("/api/v1/health")
     assert throttled.status_code == 429, throttled.text
+
+
+def test_dummy_hash_runs_argon2id_verification() -> None:
+    hasher = PasswordHasher()
+    assert extract_parameters(auth_service._DUMMY_HASH).type is Type.ID
+    assert not hasher.check_needs_rehash(auth_service._DUMMY_HASH)
+    with pytest.raises(VerifyMismatchError):
+        hasher.verify(auth_service._DUMMY_HASH, PASSWORD)
+
+
+@pytest.mark.parametrize(
+    ("account", "failure_count"),
+    [("unknown", 0), ("wrong_password", 1), ("suspended", 0), ("missing_hash", 1)],
+)
+def test_login_refusal_verifies_once_without_disclosing_credentials(
+    session: Session, api_client: TestClient, monkeypatch, caplog, account, failure_count,
+) -> None:
+    user = None
+    if account != "unknown":
+        user = _seed_user(
+            session,
+            status=UserStatus.SUSPENDED.value if account == "suspended" else UserStatus.ACTIVE.value,
+            password=None if account == "missing_hash" else PASSWORD,
+        )
+    password = "incorrect test password" if account == "wrong_password" else PASSWORD
+    stored_hash = user.password_hash if user is not None else None
+    expected_hash = stored_hash if account == "wrong_password" else auth_service._DUMMY_HASH
+    verify = Mock(wraps=security.verify_password)
+    monkeypatch.setattr(security, "verify_password", verify)
+
+    with caplog.at_level("INFO", logger=auth_service.__name__):
+        response = api_client.post(
+            "/api/v1/auth/login",
+            json={"email": user.email if user else "unknown@lockout.example.com", "password": password},
+        )
+
+    verify.assert_called_once_with(password, expected_hash)
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid email or password"}
+    for material in (password, stored_hash, auth_service._DUMMY_HASH):
+        if material:
+            assert material not in response.text
+            assert material not in caplog.text
+    if user is None:
+        assert session.scalars(select(AuthEvent)).all() == []
+    else:
+        session.refresh(user)
+        assert user.failed_login_count == failure_count
+        assert len(_events(session, user, "login_failed")) == 1
+        assert not _events(session, user, "login_locked")
+
+
+def test_matching_dummy_verification_cannot_authorize_login(
+    session: Session, api_client: TestClient, monkeypatch,
+) -> None:
+    user = _seed_user(session, password=None)
+    verify = Mock(return_value=True)
+    monkeypatch.setattr(security, "verify_password", verify)
+
+    response = _login(api_client, user)
+
+    verify.assert_called_once_with(PASSWORD, auth_service._DUMMY_HASH)
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid email or password"}
+
+
+def test_active_login_verifies_stored_hash_and_issues_valid_tokens(
+    session: Session, api_client: TestClient, monkeypatch,
+) -> None:
+    user = _seed_user(session)
+    verify = Mock(wraps=security.verify_password)
+    monkeypatch.setattr(security, "verify_password", verify)
+
+    response = _login(api_client, user)
+
+    verify.assert_called_once_with(PASSWORD, user.password_hash)
+    assert response.status_code == 200
+    tokens = response.json()
+    me = api_client.get("/api/v1/me", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    assert me.status_code == 200
+    rotated = api_client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert rotated.status_code == 200
+    assert len(_events(session, user, "login")) == 1
+
+
+def test_locked_login_does_not_verify_or_change_the_lock(
+    session: Session, api_client: TestClient, monkeypatch,
+) -> None:
+    user = _seed_user(session)
+    threshold = get_settings().LOGIN_LOCKOUT_THRESHOLD
+    user.failed_login_count = threshold
+    user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    session.commit()
+    session.refresh(user)
+    locked_until = user.locked_until
+    verify = Mock(wraps=security.verify_password)
+    monkeypatch.setattr(security, "verify_password", verify)
+
+    response = _login(api_client, user)
+
+    verify.assert_not_called()
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid email or password"}
+    session.refresh(user)
+    assert user.locked_until == locked_until
+    assert user.failed_login_count == threshold
+    assert len(_events(session, user, "login_failed")) == 1
+    assert not _events(session, user, "login_locked")
