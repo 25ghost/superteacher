@@ -460,6 +460,36 @@ CATALOG_LOAD_CONFIRM=APPLY python scripts/load_catalog.py \
 - Protected tables (`users`, `students`, `student_enrollments`,
   `student_subjects`) are never written.
 
+### Synthetic registration demo
+
+`examples/mvp_demo_catalog/` contains all 12 CSVs for one registration
+scenario. The `DEMO-*` codes, school, program, and academic-year dates are
+invented examples. The TVET files contain headers only. This dataset is
+unsuitable for production or authoritative catalog use.
+
+Use a fresh, disposable PostgreSQL test database and the restricted test role.
+Set `ENVIRONMENT=testing`, set `DB_NAME` to its exact `_test` database name,
+and set `SUPERTEACHER_TEST_PG_SYSTEM_ID` from that disposable cluster's
+provisioning output. If you use `DATABASE_URL`, point it at the same target.
+Apply the existing migrations on the verified disposable database, then check
+its identity, role, and schema before loading any demo rows.
+
+```bash
+python -c 'from tests.conftest import _verified_pg_engine; _verified_pg_engine().dispose()'
+python scripts/load_catalog.py --csv-dir examples/mvp_demo_catalog
+python scripts/load_catalog.py --csv-dir examples/mvp_demo_catalog --apply
+```
+
+Review the dry-run output before typing `APPLY`. An empty test catalog should
+project ten writes. Repeating an identical apply reports zero writes. Keep
+these commands scoped to the disposable target and omit `--allow-production`.
+
+Use the catalog endpoints to find `DEMO-2099/2100`, `DEMO-SCHOOL`, and
+`DEMO-PROGRAM-V1`. Register a synthetic student account and submit a
+registration using those IDs with pathway `DEMO-PATHWAY` and education level
+`DEMO-LEVEL-1`. The pending registration includes `DEMO-MATH`. Readiness
+for this dataset verifies this specific demonstration scenario.
+
 ### CSV format
 
 - Exactly one file per dataset, named `<dataset>.csv` — all 12 files are
