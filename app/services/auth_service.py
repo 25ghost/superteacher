@@ -87,10 +87,12 @@ _REGISTER_EMAIL_TAKEN_DETAIL = "email cannot be used to create an account"
 # modifies user status.
 _AUTHENTICATABLE_STATUSES = frozenset({UserStatus.ACTIVE.value})
 
-# Dummy Argon2id hash used to prevent timing side-channel on login: when the
-# email is not found we still run verify_password against this hash so the
-# comparison takes the same wall-clock time as a real password check.
-_DUMMY_HASH = "$argon2id$v=19$m=65536,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA$" + "A" * 84
+# Precomputed Argon2id hash with the same costs as newly stored passwords.
+# Its verification result never authorizes a login.
+_DUMMY_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$ru9/rdy35rx0vCIaltq8Qw$"
+    "ZskmDYuu2GBFe7EZJZreZeL6MVqXVc9blZKH3wnXyqM"
+)
 
 
 class AuthError(Exception):
@@ -482,8 +484,8 @@ def login(
     password; never mutates the user except for the lockout bookkeeping
     (Phase B, slice 7).
 
-    A dummy hash is always compared even when the user is not found, so the
-    timing is identical for both existing and non-existing emails.
+    Unknown and non-authenticatable accounts still run Argon2id verification
+    against a dummy hash, as do active accounts without a stored password.
 
     Lockout: the ``LOGIN_LOCKOUT_THRESHOLD``-th refused attempt locks the
     account for ``LOGIN_LOCKOUT_MINUTES`` minutes; while locked (even with
@@ -520,10 +522,9 @@ def login(
         user.locked_until = None
 
     authenticatable = user is not None and user.status in _AUTHENTICATABLE_STATUSES
-    password_hash = user.password_hash if user is not None else _DUMMY_HASH
-    password_ok = authenticatable and security.verify_password(
-        payload.password, password_hash
-    )
+    stored_hash = user.password_hash if authenticatable else None
+    verified = security.verify_password(payload.password, stored_hash or _DUMMY_HASH)
+    password_ok = bool(stored_hash) and verified
     if not password_ok:
         logger.info("failed login attempt for an email (result not disclosed)")
         if user is not None:
