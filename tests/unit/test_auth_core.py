@@ -661,3 +661,115 @@ def test_revoke_all_sessions_does_not_miss_newly_created_session(
         auth_service.refresh(session, tokens.refresh_token)
     with pytest.raises(auth_service.AuthCredentialsError):
         auth_service.refresh(session, second.refresh_token)
+
+
+@pytest.fixture
+def claim_signing_key(monkeypatch):
+    key = "synthetic-jwt-claim-validation-test-key"
+    settings = Settings(ENVIRONMENT="testing", SECRET_KEY=key)
+    monkeypatch.setattr(security, "get_settings", lambda: settings)
+    return key
+
+
+def _issued_token(token_type, user_id, session_id):
+    if token_type == "access":
+        return security.create_access_token(user_id, UserRole.STUDENT.value, session_id)
+    if token_type == "refresh":
+        return security.create_refresh_token(user_id, session_id)
+    if token_type == "reset":
+        return security.create_reset_token(user_id)
+    return security.create_invite_token(user_id)
+
+
+@pytest.mark.parametrize("token_type", ["access", "refresh", "reset", "invite"])
+def test_issued_jwt_satisfies_claim_contract(claim_signing_key, token_type):
+    user_id, session_id = uuid.uuid4(), uuid.uuid4()
+    token = _issued_token(token_type, user_id, session_id)
+    claims = security.decode_token(token, expected_type=token_type)
+
+    assert uuid.UUID(claims["sub"]) == user_id
+    uuid.UUID(claims["jti"])
+    assert claims["typ"] == token_type
+    assert type(claims["iat"]) is int
+    assert type(claims["exp"]) is int
+    assert claims["iat"] < claims["exp"]
+    if token_type in {"access", "refresh"}:
+        assert uuid.UUID(claims["sid"]) == session_id
+    else:
+        assert "sid" not in claims
+    if token_type == "access":
+        assert claims["role"] == UserRole.STUDENT.value
+    else:
+        assert "role" not in claims
+
+
+@pytest.mark.parametrize(
+    ("token_type", "claim"),
+    [
+        (token_type, claim)
+        for token_type in ("access", "refresh", "reset", "invite")
+        for claim in ("sub", "typ", "jti", "iat", "exp")
+    ] + [("access", "sid"), ("access", "role"), ("refresh", "sid")],
+)
+def test_signed_jwt_rejects_each_missing_required_claim(claim_signing_key, token_type, claim):
+    issued = _issued_token(token_type, uuid.uuid4(), uuid.uuid4())
+    claims = security.decode_token(issued, expected_type=token_type)
+    del claims[claim]
+    missing = pyjwt.encode(claims, claim_signing_key, algorithm="HS256")
+
+    with pytest.raises(security.InvalidTokenError, match="missing required claims"):
+        security.decode_token(missing, expected_type=token_type)
+
+
+@pytest.mark.parametrize(
+    ("claim", "value"),
+    [
+        ("sub", ""), ("sub", "invalid-uuid"), ("sub", 42),
+        ("jti", ""), ("jti", "invalid-uuid"), ("jti", []),
+        ("sid", ""), ("sid", "invalid-uuid"), ("sid", {}),
+        ("role", ""), ("role", "unknown-role"), ("role", ["student"]),
+        ("typ", ""), ("typ", ["access"]), ("typ", "refresh"),
+        ("iat", ""), ("iat", False), ("iat", []), ("iat", 1.5),
+        ("exp", ""), ("exp", None), ("exp", {}), ("exp", float("inf")),
+        ("nbf", False),
+    ],
+)
+def test_signed_jwt_rejects_invalid_claim_values(claim_signing_key, claim, value):
+    issued = _issued_token("access", uuid.uuid4(), uuid.uuid4())
+    claims = security.decode_token(issued, expected_type="access")
+    claims[claim] = value
+    malformed = pyjwt.encode(claims, claim_signing_key, algorithm="HS256")
+
+    with pytest.raises(security.InvalidTokenError):
+        security.decode_token(malformed, expected_type="access")
+
+
+@pytest.mark.parametrize(
+    ("claim", "offset"),
+    [("iat", 300), ("exp", -300), ("nbf", 300),
+     ("iat", "numeric_string"), ("exp", "numeric_string")],
+)
+def test_signed_jwt_rejects_invalid_timestamp(claim_signing_key, claim, offset):
+    issued = _issued_token("access", uuid.uuid4(), uuid.uuid4())
+    claims = security.decode_token(issued, expected_type="access")
+    claims[claim] = (
+        str(claims[claim]) if offset == "numeric_string"
+        else int(datetime.now(timezone.utc).timestamp()) + offset
+    )
+    malformed = pyjwt.encode(claims, claim_signing_key, algorithm="HS256")
+
+    with pytest.raises(security.InvalidTokenError):
+        security.decode_token(malformed, expected_type="access")
+
+
+def test_jwt_valid_claims_cannot_override_signature_or_algorithm(claim_signing_key):
+    issued = _issued_token("access", uuid.uuid4(), uuid.uuid4())
+    claims = security.decode_token(issued, expected_type="access")
+    unsupported = pyjwt.encode(claims, claim_signing_key, algorithm="HS384")
+    header, payload, signature = issued.split(".")
+    changed = ("A" if signature[0] != "A" else "B") + signature[1:]
+    tampered = f"{header}.{payload}.{changed}"
+
+    for token in (unsupported, tampered):
+        with pytest.raises(security.InvalidTokenError):
+            security.decode_token(token, expected_type="access")
