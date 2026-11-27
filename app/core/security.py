@@ -26,6 +26,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 from app.core.config import get_settings
+from app.models.enums import UserRole
 
 # --- password hashing (Argon2id) -------------------------------------------------
 
@@ -35,6 +36,15 @@ from app.core.config import get_settings
 _password_hasher = PasswordHasher()
 
 TokenType = Literal["access", "refresh", "reset", "invite"]
+
+_REQUIRED_TOKEN_CLAIMS = ("sub", "typ", "jti", "iat", "exp")
+_TOKEN_SPECIFIC_CLAIMS: dict[TokenType, tuple[str, ...]] = {
+    "access": ("sid", "role"),
+    "refresh": ("sid",),
+    "reset": (),
+    "invite": (),
+}
+_TOKEN_ROLES = frozenset(role.value for role in UserRole)
 
 
 def hash_password(password: str) -> str:
@@ -158,27 +168,52 @@ def create_refresh_token(
 def decode_token(token: str, expected_type: TokenType) -> dict[str, Any]:
     """Decode and validate a JWT, returning its claims.
 
-    Enforces signature, expiry, algorithm and the expected ``typ`` claim.
-    Raises :class:`InvalidTokenError` (a ValueError) on any failure —
-    callers translate that into the generic 401 contract; the raw decoding
-    internals never reach a client.
+    Enforces HS256, the expected token type, and the claims emitted by its
+    issuer. Invalid tokens raise :class:`InvalidTokenError` for callers to
+    translate into their existing generic authentication errors.
     """
     settings = get_settings()
+    required = _REQUIRED_TOKEN_CLAIMS + _TOKEN_SPECIFIC_CLAIMS[expected_type]
     try:
         claims: dict[str, Any] = jwt.decode(
             token,
             settings.jwt_secret,
             algorithms=["HS256"],  # pin the algorithm — never trust token headers
+            options={"require": list(required)},
         )
     except jwt.ExpiredSignatureError as exc:
         raise jwt.InvalidTokenError("token has expired") from exc
     except jwt.MissingRequiredClaimError as exc:
         raise jwt.InvalidTokenError("token is missing required claims") from exc
+    except (TypeError, OverflowError):
+        # Some malformed NumericDates fail conversion before PyJWT can wrap
+        # the error. Keep the decoder's exception contract in those cases.
+        raise jwt.InvalidTokenError("invalid token claims") from None
 
-    if claims.get("typ") != expected_type:
+    if claims["typ"] != expected_type:
         raise jwt.InvalidTokenError("unexpected token type")
-    if not claims.get("sub"):
-        raise jwt.InvalidTokenError("token has no subject")
+
+    for name in ("sub", "jti", "sid"):
+        if name not in required:
+            continue
+        value = claims[name]
+        if not isinstance(value, str):
+            raise jwt.InvalidTokenError("invalid token identity claim")
+        try:
+            uuid.UUID(value)
+        except ValueError:
+            raise jwt.InvalidTokenError("invalid token identity claim") from None
+
+    # Issuers emit integer epoch seconds. PyJWT also accepts values that
+    # merely coerce to integers, such as strings and booleans.
+    for name in ("iat", "exp", "nbf"):
+        if name in claims and type(claims[name]) is not int:
+            raise jwt.InvalidTokenError("invalid token timestamp")
+
+    if expected_type == "access":
+        role = claims["role"]
+        if not isinstance(role, str) or role not in _TOKEN_ROLES:
+            raise jwt.InvalidTokenError("invalid token role")
     return claims
 
 

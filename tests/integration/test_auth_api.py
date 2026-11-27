@@ -709,3 +709,56 @@ def test_login_rate_limit_returns_429(api_client, auth_db) -> None:
         json={"email": "rate-limit@example.com", "password": "wrong-password"},
     )
     assert resp.status_code == 429
+
+
+def test_jwt_claim_failures_keep_existing_http_errors(api_client, auth_db, monkeypatch, caplog):
+    import jwt
+
+    from app.core import security
+
+    settings = security.get_settings()
+    signing_key = "synthetic-http-jwt-claim-validation-key"
+    monkeypatch.setattr(settings, "SECRET_KEY", signing_key)
+    issued = _register(api_client)
+    identity = api_client.get("/api/v1/me", headers=_auth_header(issued))
+    assert identity.status_code == 200
+
+    user_id = uuid.UUID(identity.json()["user_id"])
+    tokens = {
+        "access": issued["access_token"],
+        "refresh": issued["refresh_token"],
+        "reset": security.create_reset_token(user_id),
+        "invite": security.create_invite_token(user_id),
+    }
+    caplog.clear()
+    for token_type, token in tokens.items():
+        claims = security.decode_token(token, expected_type=token_type)
+        del claims["exp"]
+        malformed = jwt.encode(claims, signing_key, algorithm="HS256")
+
+        if token_type == "access":
+            response = api_client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {malformed}"}
+            )
+            assert response.headers["WWW-Authenticate"] == "Bearer"
+            detail = "Not authenticated"
+        else:
+            path, payload = {
+                "refresh": ("/refresh", {"refresh_token": malformed}),
+                "reset": ("/reset-password", {"token": malformed, "new_password": PASSWORD}),
+                "invite": ("/accept-invite", {"token": malformed, "new_password": PASSWORD}),
+            }[token_type]
+            response = api_client.post(f"/api/v1/auth{path}", json=payload)
+            detail = "invalid email or password"
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": detail}
+        for material in (token, malformed, signing_key, PASSWORD):
+            assert material not in response.text
+            assert material not in caplog.text
+
+    wrong_type = api_client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {tokens['refresh']}"}
+    )
+    assert wrong_type.status_code == 401
+    assert wrong_type.json() == {"detail": "Not authenticated"}
