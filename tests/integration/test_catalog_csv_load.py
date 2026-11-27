@@ -755,3 +755,39 @@ def test_catalog_api_filter_and_unknown_value_pins(
             response = client.get(f"/api/v1/catalog{path}")
             assert response.status_code == 200, path
             assert response.json() == [], path
+
+
+def test_catalog_apply_keeps_the_verified_connection_through_confirmation(
+    clean_db, tmp_path, monkeypatch, capsys,
+) -> None:
+    from app.core.config import Settings
+    from scripts import load_catalog
+
+    url = clean_db.url
+    settings = Settings(
+        _env_file=None, ENVIRONMENT="testing", DB_NAME=url.database,
+        DATABASE_URL=url.render_as_string(hide_password=False),
+    )
+    monkeypatch.setattr(load_catalog, "get_settings", lambda: settings)
+    checkouts = []
+
+    def record_checkout(dbapi_connection, _record, _proxy):
+        checkouts.append(dbapi_connection)
+
+    def confirm():
+        output = capsys.readouterr().out
+        assert f"Database: {url.database!r}" in output
+        assert f"user {url.username!r}" in output
+        assert len(checkouts) == 1
+        return True
+
+    monkeypatch.setattr(load_catalog, "_confirm", confirm)
+    event.listen(clean_db, "checkout", record_checkout)
+    try:
+        csv_dir = _write_catalog(tmp_path / "csv", SYNTHETIC)
+        rc, output = _run_cli(clean_db, csv_dir, monkeypatch, capsys)
+        assert rc == 0, output
+        assert "Database writes: 15" in output
+        assert len(checkouts) == 1
+    finally:
+        event.remove(clean_db, "checkout", record_checkout)

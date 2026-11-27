@@ -441,6 +441,16 @@ CATALOG_LOAD_CONFIRM=APPLY python scripts/load_catalog.py \
   structural validation problems (duplicate natural keys, unresolvable
   references, wrong order) exit with code 1 and zero database writes —
   on a parse or validation error the session is never even opened.
+- **Verified database target.** Before reading catalog rows, the loader
+  reports the effective URL's host and port, the connected database and
+  role, and the server endpoint PostgreSQL reports. Review the target
+  before confirming. When `DATABASE_URL` is set, its database name must
+  match `DB_NAME` for apply. Dry-run reports the effective target without
+  writing. Use a single explicit PostgreSQL host or socket directory and
+  connection user. Ambiguous settings, an unreachable server, or a target
+  mismatch stop the load. Target verification, preview, and apply share
+  one checked-out connection. Server-reported identity provides an
+  operational cross-check. Configure TLS separately where required.
 - **One transaction for the whole apply.** The engine runs flush-only;
   the script owns the single `commit()`/`rollback()` (the same explicit
   exception `scripts/create_admin.py` documents). Any failure rolls the
