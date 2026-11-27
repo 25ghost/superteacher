@@ -331,8 +331,14 @@ def api_client(api_app: FastAPI) -> TestClient:
     return TestClient(api_app)
 
 
+@pytest.fixture(scope="module")
+def principal_password_hash() -> str:
+    """Hash the matrix password once for the independently created users."""
+    return security.hash_password(PASSWORD)
+
+
 @pytest.fixture()
-def principals(session: Session) -> dict[str, User]:
+def principals(session: Session, principal_password_hash: str) -> dict[str, User]:
     """One active account per role; the teacher has a profile row."""
     users: dict[str, User] = {}
     for role in (UserRole.STUDENT, UserRole.TEACHER, UserRole.ADMIN):
@@ -340,7 +346,7 @@ def principals(session: Session) -> dict[str, User]:
             email=f"{role.value}-{uuid.uuid4().hex[:8]}@matrix.example.com",
             role=role.value,
             status=UserStatus.ACTIVE.value,
-            password_hash=security.hash_password(PASSWORD),
+            password_hash=principal_password_hash,
         )
         session.add(user)
         users[role.value] = user
