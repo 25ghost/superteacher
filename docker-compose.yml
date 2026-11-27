@@ -3,10 +3,13 @@
 #
 #   docker compose up --build
 #
-# Migrations/seeding/first admin are explicit steps, never automatic:
+# Set ENVIRONMENT=development in .env and ADMIN_EMAIL in the invoking shell.
+# Local bootstrap steps are explicit:
 #   docker compose exec api python -m alembic upgrade head
-#   docker compose exec api python scripts/seed_reference_data.py
-#   docker compose exec api python scripts/create_admin.py --email you@example.com
+#   docker compose exec api python -m alembic current
+#   docker compose exec api python scripts/create_admin.py --email "$ADMIN_EMAIL"
+# Production uses separately approved infrastructure and the README's
+# production bootstrap procedure, including production CLI authorization.
 #
 # FORWARDED_ALLOW_IPS: must be the REVERSE PROXY's address in production
 # (comma separated for several proxies). The 127.0.0.1 default is only

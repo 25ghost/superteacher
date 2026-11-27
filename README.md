@@ -886,12 +886,11 @@ There is deliberately no HTTP endpoint that creates an administrator.
 Mint the first one from the CLI (it needs database access):
 
 ```bash
-python scripts/create_admin.py --email admin@school.rw
-# non-interactive (no TTY, e.g. a server bootstrap):
-ADMIN_PASSWORD=... python scripts/create_admin.py --email admin@school.rw
+python scripts/create_admin.py --email "$ADMIN_EMAIL"
 ```
 
-The password is read from the terminal (confirmed twice) or from the
+Set `ADMIN_EMAIL` to the operator-selected account address. The password
+is read from the terminal (confirmed twice) or from the
 `ADMIN_PASSWORD` environment variable — never echoed, never accepted as an
 argument — and checked against the shared password policy; an existing email
 is **refused**, never overwritten. In `ENVIRONMENT=production` the script
@@ -910,7 +909,7 @@ Settings are read from environment variables and/or a local `.env` file (see
 | --- | --- |
 | `ENVIRONMENT` | Must be set explicitly to `production`. A missing or blank value refuses to start — the development default is never applied implicitly (`app/core/config.py:184`). |
 | `SECRET_KEY` | A real random secret of at least 32 characters. Placeholders (`change-me`, `secret`, …) and shorter keys are hard configuration errors outside development/testing (`app/core/config.py:150-164`). Generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
-| `DB_NAME`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | Production PostgreSQL. Alternatively set a single `DATABASE_URL`, which overrides all `DB_*` values (`app/core/config.py:226`). |
+| `DB_NAME`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | Production PostgreSQL settings. `DATABASE_URL` overrides the connection settings when supplied. Keep `DB_NAME` aligned with the URL database for catalog apply. |
 | `CORS_ORIGINS` | Explicit, comma-separated origins (e.g. `https://portal.school.rw`). A `*` wildcard is refused and localhost origins are dropped in production, so CORS closes rather than trusting dev-machine origins (`app/core/config.py:217`). |
 | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | Transactional email (invitations, password resets). |
 | `FRONTEND_URL` | Base URL that outgoing email links point to. |
@@ -921,28 +920,65 @@ Startup is fail-fast: missing `ENVIRONMENT`, an unsafe or too-short
 `SECRET_KEY`, or unsafe CORS all refuse to boot before the first request
 (`app/main.py:57`).
 
-### Ordered bootstrap commands
+### Production database initialization
 
-```bash
-# 1. apply all migrations
-python -m alembic upgrade head
+1. Use the separately approved production infrastructure and its secret
+   injection procedure. Keep `ENVIRONMENT=production` throughout bootstrap.
+   Review the effective connection settings with the database owner.
+   `DATABASE_URL` takes precedence when set. From a read-only PostgreSQL
+   session using the same effective target and role, check the connected
+   database and endpoint against the approved deployment:
 
-# 2. seed shared reference data (academic years, pathways, programs, …)
-python scripts/seed_reference_data.py
+   ```sql
+   SELECT current_database(), session_user, inet_server_addr(), inet_server_port();
+   ```
 
-# 3. mint the first administrator (there is no HTTP endpoint for this)
-python scripts/create_admin.py --email admin@school.rw
-```
+   Complete your organization's backup or recovery readiness checks before
+   making any changes.
 
-Existing guards, by design:
+2. Apply the existing migrations and compare the current revision with the
+   migration head. Run the read-only schema and connectivity checks against
+   the selected database. Resolve any mismatch or failed check before
+   proceeding.
 
-- `seed_reference_data.py` **refuses to apply when `ENVIRONMENT=production`**
-  (`scripts/seed_reference_data.py:62`); `--dry-run` produces a read-only
-  report. Seed the database while preparing the release — before the app is
-  switched to `production` — or inspect with `--dry-run` afterwards.
-- `create_admin.py` requires `--allow-production` to run when
-  `ENVIRONMENT=production` (`scripts/create_admin.py:149`); the password is
-  read from the terminal or `ADMIN_PASSWORD`, never as an argument.
+   ```bash
+   python -m alembic upgrade head
+   python -m alembic current
+   python -m alembic heads
+   python scripts/verify_database.py --live
+   ```
+
+3. Set `CATALOG_CSV_DIR` to the operator-supplied directory containing
+   reviewed, authoritative CSVs. Run the catalog loader in dry-run mode.
+   Review its reported database, role, server endpoint, and proposed changes.
+   The loader requires `DB_NAME` to match the effective database for apply.
+
+   ```bash
+   python scripts/load_catalog.py --csv-dir "$CATALOG_CSV_DIR"
+   python scripts/load_catalog.py --csv-dir "$CATALOG_CSV_DIR" --apply --allow-production
+   ```
+
+   Run the second command only for the approved import. Type `APPLY` when
+   prompted. For non-interactive use, `CATALOG_LOAD_CONFIRM=APPLY` records
+   explicit operator confirmation and still requires `--allow-production`.
+   The bundled reference-data seeder refuses production writes. Production
+   imports require authoritative records reviewed for the selected target.
+
+4. Set `ADMIN_EMAIL` to the operator-provided email for the first
+   administrator. Enter and confirm the password at the terminal, or inject
+   `ADMIN_PASSWORD` through the approved secret mechanism for non-interactive
+   use. Keep passwords and connection secrets out of command arguments and
+   tracked files.
+
+   ```bash
+   python scripts/create_admin.py --email "$ADMIN_EMAIL" --allow-production
+   ```
+
+   Check that the CLI reports successful creation for the selected email.
+   After starting the API, confirm `GET /api/v1/health/ready` returns 200.
+   Sign in through the approved client and confirm `GET /api/v1/me` identifies
+   the account with role `admin`. Keep passwords and tokens out of verification
+   output and shared logs.
 
 ### Run the API
 
@@ -964,21 +1000,29 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 \
   Point load balancers and orchestrator probes here; the route is
   deliberately not rate-limited.
 
-### Docker
+### Local Docker Compose
+
+The checked-in Compose stack is for local development. Use separately
+approved infrastructure for production and follow the production bootstrap
+procedure above.
+
+Copy `.env.example` to an untracked `.env`, configure it for local
+development with `ENVIRONMENT=development`, and set `ADMIN_EMAIL` in the
+invoking shell to the selected local account address.
 
 ```bash
-cp .env.example .env        # fill in real values; ENVIRONMENT=production
 docker compose up --build -d
 docker compose exec api python -m alembic upgrade head
-docker compose exec api python scripts/seed_reference_data.py
-docker compose exec api python scripts/create_admin.py --email admin@school.rw
+docker compose exec api python -m alembic current
+docker compose exec api python scripts/create_admin.py --email "$ADMIN_EMAIL"
 ```
 
-`docker-compose.yml` sets `DB_HOST=db` (the compose service name) and
-publishes PostgreSQL on host port `5433` so it cannot clash with an existing
-local PostgreSQL on `5432`. Set `FORWARDED_ALLOW_IPS` in `.env` to your
-reverse proxy's address (see the table above). The image never runs
-migrations or seeding on start — those are the explicit steps above.
+Compose sets `DB_HOST=db` inside the API container and publishes PostgreSQL
+on host port `5433`. Check any `DATABASE_URL` override against the intended
+local target before running migrations or bootstrap commands. Migrations
+and administrator creation are explicit. To load a catalog locally, use the
+catalog loader with an operator-reviewed CSV directory accessible to the
+process that runs it.
 
 ### Production guards already built in
 
