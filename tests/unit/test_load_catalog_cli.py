@@ -31,6 +31,9 @@ def sqlite_engine(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "scripts.load_catalog.SessionLocal", sessionmaker(bind=engine)
     )
+    # These tests cover CLI behavior with SQLite. PostgreSQL target
+    # verification is exercised separately against mocks and the live fixture.
+    monkeypatch.setattr("scripts.load_catalog._verify_target", Mock())
     try:
         yield engine
     finally:
@@ -155,10 +158,8 @@ def test_unexpected_dry_run_exception_exits_1_with_counts_only_output(
 
     out = capsys.readouterr().out
     assert rc == 1
-    assert (
-        "DRY RUN FAILED — no database writes performed: "
-        "unexpected dry-run failure" in out
-    )
+    assert "DRY RUN FAILED — no database writes performed." in out
+    assert "unexpected dry-run failure" not in out
     assert "Dataset validation: OK" in out
     # counts-only output: no row contents anywhere, including the message
     assert "TEST-OL" not in out
@@ -403,3 +404,112 @@ def test_production_dry_run_is_allowed_without_any_flag(
     assert rc == 0
     assert "Dry run complete" in out
     assert _count(sqlite_engine, "pathways") == 0
+
+
+@pytest.mark.parametrize(
+    ("failure", "diagnostic"),
+    [
+        ("conflicting_name", "DB_NAME and the effective database name differ"),
+        ("wrong_binding", "session binding differs"),
+        ("wrong_database", "connected database or role differs"),
+        ("wrong_role", "connected database or role differs"),
+        ("unreachable", "PostgreSQL availability"),
+        ("invalid_url", "effective connection configuration"),
+        ("ambiguous_hosts", "single explicit PostgreSQL host"),
+        ("routing_override", "connection routing overrides"),
+    ],
+)
+def test_target_refusal_precedes_catalog_access(
+    monkeypatch, tmp_path, capsys, failure, diagnostic,
+) -> None:
+    from sqlalchemy.engine import URL, make_url
+
+    from app.core.config import Settings
+    from scripts import load_catalog
+
+    secret = "synthetic-password@:/?#"
+    target = URL.create(
+        "postgresql+psycopg", username="fixture", password=secret,
+        host="configured-host", port=5545, database="intended_test",
+    )
+    url = target.render_as_string(hide_password=False)
+    if failure == "conflicting_name":
+        url = target.set(database="different_test").render_as_string(hide_password=False)
+    elif failure == "invalid_url":
+        url = url.replace(":5545/", ":invalid/")
+    elif failure == "ambiguous_hosts":
+        url = target.set(host="first,second").render_as_string(hide_password=False)
+    elif failure == "routing_override":
+        url += "?dbname=different_test"
+    settings = Settings(_env_file=None, DB_NAME="intended_test", DATABASE_URL=url)
+
+    session = Mock()
+    session.get_bind.return_value.url = target
+    connection = session.connection.return_value
+    connection.execute.return_value.one.return_value = (
+        "different_test" if failure == "wrong_database" else "intended_test",
+        "fixture",
+        "different_role" if failure == "wrong_role" else "fixture",
+        "192.0.2.1", 5545,
+    )
+    if failure == "wrong_binding":
+        session.get_bind.return_value.url = make_url(url).set(database="drift_test")
+    if failure == "unreachable":
+        session.connection.side_effect = RuntimeError(url)
+
+    monkeypatch.setattr(load_catalog, "get_settings", lambda: settings)
+    monkeypatch.setattr(load_catalog, "SessionLocal", Mock(return_value=session))
+    run_load = Mock()
+    monkeypatch.setattr(load_catalog, "run_load", run_load)
+    monkeypatch.setenv("CATALOG_LOAD_CONFIRM", "APPLY")
+
+    assert main(["--csv-dir", str(_valid_dir(tmp_path)), "--apply"]) == 1
+    output = capsys.readouterr().out
+    assert "Database target verification failed" in output
+    assert diagnostic in output
+    assert secret not in output
+    assert target.render_as_string(hide_password=False) not in output
+    assert "synthetic-password" not in output
+    run_load.assert_not_called()
+    session.commit.assert_not_called()
+    session.close.assert_called_once()
+    if failure in {"wrong_database", "wrong_role"}:
+        connection.execute.assert_called_once()
+        assert str(connection.execute.call_args.args[0]).startswith("SELECT ")
+    elif failure != "unreachable":
+        session.connection.assert_not_called()
+
+
+def test_dry_run_displays_the_effective_target_with_encoded_password(monkeypatch, tmp_path, capsys):
+    from sqlalchemy.engine import URL
+
+    from app.core.config import Settings
+    from scripts import load_catalog
+
+    target = URL.create(
+        "postgresql+psycopg", username="fixture", password="synthetic@:/?#",
+        host="effective-host", port=5545, database="effective_test",
+    )
+    settings = Settings(
+        _env_file=None, DB_NAME="legacy_test", DB_HOST="legacy-host",
+        DATABASE_URL=target.render_as_string(hide_password=False),
+    )
+    session = Mock()
+    session.get_bind.return_value.url = target
+    session.connection.return_value.execute.return_value.one.return_value = (
+        "effective_test", "fixture", "fixture", "192.0.2.1", 5545,
+    )
+    monkeypatch.setattr(load_catalog, "get_settings", lambda: settings)
+    monkeypatch.setattr(load_catalog, "SessionLocal", Mock(return_value=session))
+    monkeypatch.setattr(load_catalog, "run_load", Mock(return_value=[]))
+    monkeypatch.setattr(load_catalog, "missing_from_input", Mock(return_value=[]))
+
+    assert main(["--csv-dir", str(_valid_dir(tmp_path))]) == 0
+    output = capsys.readouterr().out
+    assert "Database: 'effective_test' via 'effective-host':5545" in output
+    assert "user 'fixture', server endpoint 192.0.2.1:5545" in output
+    assert "legacy-host" not in output
+    assert "legacy_test" not in output
+    assert "synthetic" not in output
+    session.connection.assert_called_once()
+    session.commit.assert_not_called()

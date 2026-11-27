@@ -48,8 +48,22 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import SessionLocal  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from app.core.config import Settings, get_settings  # noqa: E402
+
+_TARGET_FAILURE = "Database target verification failed"
+
+# The application's engine evaluates database settings at import time.
+try:
+    from app.core.database import SessionLocal  # noqa: E402
+except Exception:
+    if __name__ != "__main__":
+        raise
+    sys.exit(f"{_TARGET_FAILURE}: invalid database configuration.")
+
 from app.data.csv_input import (  # noqa: E402
     CsvParseError,
     load_csv_datasets,
@@ -142,6 +156,53 @@ def _print_protected_note() -> None:
     print(f"Protected tables (never written): {', '.join(sorted(PROTECTED_TABLES))}")
 
 
+class CatalogTargetError(Exception):
+    """An operator-facing target refusal containing no connection secrets."""
+
+
+def _verify_target(session: Session, settings: Settings, *, apply: bool) -> None:
+    """Check the configured URL, engine binding and checked-out connection."""
+    target = make_url(settings.database_url)
+    if target.get_backend_name() != "postgresql" or not target.database or not target.username:
+        raise CatalogTargetError("Specify a PostgreSQL database and connection user.")
+    if apply and target.database != settings.DB_NAME:
+        raise CatalogTargetError("DB_NAME and the effective database name differ. Align them before applying.")
+    if (
+        {"service", "hostaddr", "dbname", "database", "user"} & target.query.keys()
+        or os.environ.get("PGSERVICE")
+        or os.environ.get("PGHOSTADDR")
+    ):
+        raise CatalogTargetError("Specify a single database target without connection routing overrides.")
+    if (target.host and "host" in target.query) or (target.port is not None and "port" in target.query):
+        raise CatalogTargetError("Specify the connection host and port only once.")
+    host = target.host or target.query.get("host")
+    port = target.port if target.port is not None else target.query.get("port")
+    if not isinstance(host, str) or not host.strip() or "," in host:
+        raise CatalogTargetError("Specify a single explicit PostgreSQL host or socket directory.")
+    if port is not None:
+        port_text = str(port)
+        if not port_text.isascii() or not port_text.isdecimal() or not 1 <= int(port_text) <= 65535:
+            raise CatalogTargetError("Specify a valid PostgreSQL port.")
+    if session.get_bind().url != target:
+        raise CatalogTargetError("The catalog session binding differs from the configured target.")
+
+    # Catalog reads and writes share this checked-out connection and
+    # transaction until commit or close.
+    connection = session.connection()
+    database, login, role, address, server_port = connection.execute(text(
+        "SELECT pg_catalog.current_database(), session_user, current_user, "
+        "pg_catalog.inet_server_addr()::text, pg_catalog.inet_server_port()"
+    )).one()
+    if database != target.database or login != target.username or role != login:
+        raise CatalogTargetError("The connected database or role differs from the configured target.")
+    configured_port = port if port is not None else "driver default"
+    server_endpoint = f"{address}:{server_port}" if address is not None else "Unix socket"
+    print(
+        f"Database: {database!r} via {host!r}:{configured_port}, "
+        f"user {login!r}, server endpoint {server_endpoint}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     csv_dir = Path(args.csv_dir)
@@ -150,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
     print("SuperTeacher catalog CSV loader")
     print(f"Mode: {mode}")
     print(f"Environment: {settings.ENVIRONMENT}")
-    print(f"Database: {settings.DB_NAME} on {settings.DB_HOST}:{settings.DB_PORT}")
     print(f"CSV directory: {csv_dir}")
 
     # Production safety (predicate and wording shared with the seeder).
@@ -187,31 +247,44 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(datasets)} datasets)"
     )
 
-    session = SessionLocal()
     try:
+        session = SessionLocal()
+    except Exception:
+        print(f"{_TARGET_FAILURE}: could not open the catalog session.")
+        return 1
+    try:
+        try:
+            _verify_target(session, settings, apply=args.apply)
+        except CatalogTargetError as exc:
+            print(f"{_TARGET_FAILURE}: {exc}")
+            return 1
+        except Exception:
+            print(f"{_TARGET_FAILURE}: check the effective connection configuration and PostgreSQL availability.")
+            return 1
+
         # 3. Dry-run summary first, in both modes (read-only SELECTs).
         try:
             dry_reports = run_load(session, datasets, dry_run=True, single_transaction=True)
+            dry_missing = missing_from_input(session, datasets)
         except ValidationError as exc:
             print(f"\nVALIDATION FAILED — no database writes performed:\n{exc}")
             return 1
-        except Exception as exc:
-            print(f"\nDRY RUN FAILED — no database writes performed: {exc}")
+        except Exception:
+            print("\nDRY RUN FAILED — no database writes performed.")
             return 1
         projected = _print_reports(
             dry_reports,
-            missing_from_input(session, datasets),
+            dry_missing,
             suffix=" (dry run — no statements issued)",
         )
         print(f"Projected writes: {projected} (dry run — no statements issued)")
-        session.rollback()
 
         if not args.apply:
             print("Dry run complete — the database was not modified.")
             _print_protected_note()
             return 0
 
-        # 4. Confirmation before the one transaction opens.
+        # 4. Confirm before the first write, on the verified connection.
         if not _confirm():
             print(
                 f"\nNot confirmed — no database writes performed. Type "
@@ -222,22 +295,21 @@ def main(argv: list[str] | None = None) -> int:
         # 5. Apply: one transaction for the whole run, committed here.
         try:
             reports = run_load(session, datasets, single_transaction=True)
+            remaining = missing_from_input(session, datasets)
             session.commit()
         except ValidationError as exc:
             session.rollback()
             print(f"\nVALIDATION FAILED — no database writes performed:\n{exc}")
             return 1
-        except Exception as exc:
+        except Exception:
             session.rollback()
             print(
                 "\nLOAD FAILED — transaction rolled back, "
-                f"no database writes performed: {exc}"
+                "no database writes performed."
             )
             return 1
 
-        total_writes = _print_reports(
-            reports, missing_from_input(session, datasets)
-        )
+        total_writes = _print_reports(reports, remaining)
         print(f"Database writes: {total_writes}")
         _print_protected_note()
         return 0
